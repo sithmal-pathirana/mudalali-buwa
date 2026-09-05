@@ -56,7 +56,8 @@ HELP = """MONITOR
 /pnl        today's realised P&L against the target
 /target     the daily target schedule
 /config     the settings that decide behaviour
-/scan       what the scanner ranks right now
+/scan       the last scan result
+/scan now   run a fresh scan (about a minute)
 
 CONTROL  (each asks for confirmation)
 /strategy             how the strategy is being chosen
@@ -215,7 +216,7 @@ class TelegramControl:
             "/target": self._send_target,
             "/positions": self._send_position_book,
             "/config": self._send_config,
-            "/scan": self._send_scan,
+            "/scan": lambda: self._scan(arg),
             "/strategy": lambda: self._strategy(arg),
             "/close": lambda: self._ask("close", "Close the open position at market?",
                                         value=arg.upper()),
@@ -256,6 +257,15 @@ class TelegramControl:
         lines += [f"{k:<22}{v}" for k, v in cfg.items()]
         self.send("\n".join(lines))
 
+    def _scan(self, arg: str) -> None:
+        """`/scan` reports the last result; `/scan now` asks for a fresh one."""
+        if arg in ("now", "run", "refresh"):
+            self.commands.put(Command("scan", note="via telegram"))
+            self.send("Scan requested. It runs on the trading thread and takes "
+                      "about a minute; you will get the result here.")
+            return
+        self._send_scan()
+
     def _send_scan(self) -> None:
         s = self.read()
         scan = s.get("scan") or {}
@@ -267,7 +277,8 @@ class TelegramControl:
             return
         lines = [s.get("mode_line", ""), "",
                  f"scanned {scan.get('considered', 0)}, "
-                 f"{scan.get('passed', 0)} passed  ({scan.get('age', '?')} ago)"]
+                 f"{scan.get('passed', 0)} passed  ({scan.get('age', '?')} ago)",
+                 "send /scan now for a fresh one"]
         for row in scan.get("top", [])[:10]:
             lines.append(f"  {row['symbol']:<12} {row['score']:.3f}")
         self.send("\n".join(lines))

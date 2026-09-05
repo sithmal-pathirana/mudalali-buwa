@@ -387,3 +387,97 @@ class TestConfigAndScanDiagnostics(unittest.TestCase):
         self.assertIn("self.scanner.scan(", block)
         self.assertIn("initial scan failed", block,
                       "a failed initial scan must not stop startup")
+
+
+class TestForcedScan(unittest.TestCase):
+    """
+    /scan reports the last result. Asking for a fresh one has to go through the
+    command queue: the Telegram thread never calls the exchange, and a scan is
+    ~101 REST calls that would block the poller for a minute.
+    """
+
+    class Queue:
+        def __init__(self, cmd=None):
+            self.c = [cmd] if cmd else []
+
+        def pop_commands(self):
+            out, self.c = self.c, []
+            return out
+
+        def publish(self, snap):
+            pass
+
+        def stop(self):
+            pass
+
+    def _engine(self, enabled=True, last=None):
+        from bot.config import PortfolioConfig
+        e = held([])
+        e.cfg.portfolio = PortfolioConfig(enabled=enabled)
+        e.equity = 43.0
+        e.rules_for = lambda s: None
+        e.scanner = None
+        if enabled:
+            e.scanner = type("S", (), {
+                "last": last,
+                "cfg": type("C", (), {"max_symbols": 100, "rescan_seconds": 300})(),
+                "scan": lambda self_, **kw: last})()
+        return e
+
+    def test_telegram_queues_rather_than_scanning_itself(self):
+        import inspect
+        from bot import telegram_control
+        src = inspect.getsource(telegram_control.TelegramControl._scan)
+        self.assertIn('Command("scan"', src)
+        self.assertNotIn("klines", src)
+        self.assertNotIn("ticker_24hr", src)
+
+    def test_engine_executes_a_queued_scan(self):
+        import inspect
+        from bot.engine import Engine
+        self.assertIn('cmd.action == "scan"',
+                      inspect.getsource(Engine.process_commands))
+
+    def test_refuses_when_portfolio_is_off(self):
+        e = self._engine(enabled=False)
+        msg = Engine.run_scan_now(e)
+        self.assertIn("Portfolio mode is off", msg)
+
+    def test_rate_limited_against_spamming(self):
+        import time as t
+        from bot.scanner import ScanResult
+        recent = ScanResult(considered=100)
+        recent.scanned_at = t.time()
+        e = self._engine(last=recent)
+        msg = Engine.run_scan_now(e)
+        self.assertIn("limited to once every", msg)
+
+    def test_an_old_result_does_not_block_a_rescan(self):
+        import time as t
+        from bot.scanner import ScanResult
+        old = ScanResult(considered=100)
+        old.scanned_at = t.time() - 3600
+        e = self._engine(last=old)
+        msg = Engine.run_scan_now(e)
+        self.assertNotIn("limited to once every", msg)
+
+    def test_a_failing_scan_reports_rather_than_raises(self):
+        from bot.config import PortfolioConfig
+        e = held([])
+        e.cfg.portfolio = PortfolioConfig(enabled=True)
+        e.equity = 43.0
+        e.rules_for = lambda s: None
+
+        def boom(**kw):
+            raise RuntimeError("exchange unreachable")
+
+        e.scanner = type("S", (), {
+            "last": None,
+            "cfg": type("C", (), {"max_symbols": 100, "rescan_seconds": 300})(),
+            "scan": staticmethod(boom)})()
+        msg = Engine.run_scan_now(e)
+        self.assertIn("scan failed", msg)
+
+    def test_help_documents_both_forms(self):
+        from bot.telegram_control import HELP
+        self.assertIn("/scan now", HELP)

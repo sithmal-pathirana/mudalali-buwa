@@ -378,6 +378,8 @@ class Engine:
                     self.state.halt(f"halted manually ({origin})")
                     self.notify.send(Event.HALT, f"Halted ({origin}). "
                                                  f"Open positions are untouched.")
+                elif cmd.action == "scan":
+                    self.run_scan_now(origin)
                 elif cmd.action == "strategy":
                     self.set_strategy(cmd.value, origin)
                 elif cmd.action == "resume":
@@ -387,6 +389,53 @@ class Engine:
                     self.state.save()
                     self.notify.send(Event.STARTUP,
                                      f"Resumed ({origin}).\nCleared halt: {previous}")
+
+    #: A scan is ~101 REST calls and 40-60s of work. Cheap enough to ask for,
+    #: expensive enough that it should not be spammable.
+    MIN_SCAN_INTERVAL = 60
+
+    def run_scan_now(self, origin: str = "") -> str:
+        """
+        Force a scan on the engine thread.
+
+        The control surfaces cannot do this themselves -- they never call the
+        exchange -- so they queue it and the engine runs it here, the same way
+        /close works.
+        """
+        if not self.cfg.portfolio.enabled or self.scanner is None:
+            msg = ("Portfolio mode is off, so there is nothing to scan. "
+                   "Set portfolio.enabled: true in config.yaml and restart.")
+            self.notify.send(Event.ERROR, msg)
+            return msg
+
+        last = getattr(self.scanner, "last", None)
+        if last is not None:
+            age = time.time() - last.scanned_at
+            if age < self.MIN_SCAN_INTERVAL:
+                msg = (f"A scan finished {age:.0f}s ago. Rescanning is limited "
+                       f"to once every {self.MIN_SCAN_INTERVAL}s -- send /scan "
+                       f"to see that result.")
+                self.notify.send(Event.DAILY_SUMMARY, msg)
+                return msg
+
+        self.notify.send(Event.DAILY_SUMMARY,
+                         f"Scanning up to {self.scanner.cfg.max_symbols} symbols "
+                         f"({origin or 'local'})... this takes about a minute.")
+        try:
+            budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
+                      / self.cfg.portfolio.stop_distance)
+            res = self.scanner.scan(risk_budget_notional=budget,
+                                    rules_for=self.rules_for)
+        except Exception as e:
+            log.exception("forced scan failed")
+            self.notify.send(Event.ERROR, f"Scan failed: {e}")
+            return f"scan failed: {e}"
+
+        top = ", ".join(c.symbol for c in res.ranked[:5]) or "nothing passed"
+        msg = (f"Scan complete: {len(res.ranked)}/{res.considered} passed "
+               f"in {res.elapsed:.0f}s\nTop: {top}\n\nSend /scan for the full list.")
+        self.notify.send(Event.DAILY_SUMMARY, msg)
+        return msg
 
     def set_strategy(self, name: str, origin: str = "") -> str:
         """
