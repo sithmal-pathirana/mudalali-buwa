@@ -190,17 +190,12 @@ class Engine:
 
     def snapshot(self) -> dict:
         prog = self.schedule.progress(self.state.realized_today)
-        pos = None
-        if self.active is not None:
-            p = self.active
-            pos = {
-                "side": p.side, "qty": p.qty, "entry": p.entry,
-                "stop": p.stop, "take_profit": p.take_profit,
-                "price": (self.last_prices or {}).get(sym, self.last_price),
-                "unrealized": p.unrealized(px) if px else 0.0,
-                "to_tp": p.progress_to_tp(px) if px else 0.0,
-                "to_sl": p.progress_to_stop(px) if px else 0.0,
-            }
+        # One source of truth. The old duplicate here referenced `sym` and `px`
+        # from _position_book's loop, so snapshot() raised NameError the moment
+        # any position opened -- freezing the dashboard and /status on the
+        # shipped single-symbol config. (QA S1)
+        book = self._position_book()
+        pos = book[0] if book else None
         return {
             "symbol": self.cfg.symbol, "mode": self.cfg.mode,
             "strategy": self.strategy.name, "dry_run": self.cfg.dry_run,
@@ -221,7 +216,7 @@ class Engine:
             "strategy_mode": getattr(self.strategy, "mode", "fixed"),
             "strategy_choices": getattr(self.strategy, "choices", []),
             "mode_line": self.mode_line(),
-            "positions": self._position_book(),
+            "positions": book,
             "config": self._config_summary(),
             "scan": self._scan_summary(),
         }
@@ -383,8 +378,10 @@ class Engine:
         closed, failed = 0, []
         for sym in symbols:
             try:
-                self.close_position(reason, symbol=sym)
-                closed += 1
+                if self.close_position(reason, symbol=sym):
+                    closed += 1
+                else:
+                    failed.append(f"{sym}: refused by the exchange")
             except Exception as e:
                 failed.append(f"{sym}: {e}")
                 log.exception("close_all: %s failed", sym)
@@ -398,26 +395,33 @@ class Engine:
                              f"closed {closed} position(s): {reason}")
         return closed
 
-    def close_position(self, reason: str, symbol: str | None = None) -> None:
-        """Cancel resting orders, then flatten with a reduce-only market order."""
+    def close_position(self, reason: str, symbol: str | None = None) -> bool:
+        """
+        Flatten one position. Returns True only if it actually closed.
+
+        close_all used to count every call as a success, because this caught
+        BinanceError and returned rather than raising -- so a refused close
+        still reported "closed 3 position(s)". The safety behaviour was right;
+        the number reaching the operator was not. (QA S5)
+        """
         symbol = symbol or (self.active.symbol if self.active else self.cfg.symbol)
         if self.cfg.dry_run:
             log.info("dry_run: would close %s (%s)", symbol, reason)
             self.notify.send(Event.SL_HIT, f"DRY RUN -- would close {symbol}: {reason}")
             self.release(symbol)
-            return
+            return True
         try:
             live = self.api.positions(symbol)
         except BinanceError as e:
             log.error("could not read position to close: %s", e)
             self.notify.send(Event.ERROR, f"Close failed reading position: {e}")
-            return
+            return False
 
         if not live:
             log.info("close requested but %s is already flat", symbol)
             self.notify.send(Event.DAILY_SUMMARY, f"Close requested; {symbol} already flat.")
             self.release(symbol)
-            return
+            return True
 
         amt = float(live[0]["positionAmt"])
         side = "SELL" if amt > 0 else "BUY"
@@ -445,7 +449,7 @@ class Engine:
             self.notify.send(Event.ERROR,
                              f"CLOSE FAILED: {e}\nPosition is still open and its "
                              f"protective orders have NOT been touched.")
-            return
+            return False
 
         try:
             self.api.cancel_all(symbol)
@@ -458,6 +462,7 @@ class Engine:
         # of twenty-five positions would drop tracking for the other
         # twenty-four while they were still open on the exchange.
         self.release(symbol)
+        return True
 
     # ------------------------------------------------------------------ boot
     def startup(self) -> bool:
@@ -771,49 +776,57 @@ class Engine:
 
     def cancel_orders_safely(self, keep_protective: bool = True) -> None:
         """
-        Never remove a stop from a position that is still open.
+        Cancel across EVERY held symbol, not just the configured one.
 
-        Flat account -> cancel everything, nothing is at risk. Position open
-        and keep_protective -> pull only the resting entry, so the stop and
-        take-profit stay on the book with no bot watching them. That is the
-        whole point of exchange-side protective orders. (QA R1)
+        This read positions(cfg.symbol) only. In portfolio mode that symbol is
+        usually flat, so it took the "flat -> cancel everything" branch, acted
+        on one symbol and returned -- leaving resting entries on every
+        scanner-opened symbol alive through `systemctl stop`. That is R3
+        reappearing through a different door. (QA S4)
         """
+        for symbol in sorted(set(self.book) | {self.cfg.symbol}):
+            self._cancel_symbol(symbol, keep_protective)
+
+    def _cancel_symbol(self, symbol: str, keep_protective: bool) -> None:
+        """Never remove a stop from a position that is still open."""
         try:
-            live = self.api.positions(self.cfg.symbol)
+            live = self.api.positions(symbol)
         except BinanceError as e:
-            log.error("could not read position before cancelling: %s", e)
+            log.error("%s: could not read position before cancelling: %s", symbol, e)
             return
 
         if not live:
             try:
-                self.api.cancel_all(self.cfg.symbol)
-                log.info("flat: all open orders cancelled")
+                self.api.cancel_all(symbol)
+                log.info("%s flat: all open orders cancelled", symbol)
             except BinanceError as e:
-                log.error("cancel failed: %s", e)
+                log.error("%s cancel failed: %s", symbol, e)
             return
 
         if not keep_protective:
             try:
-                self.api.cancel_all(self.cfg.symbol)
-                log.info("all open orders cancelled")
+                self.api.cancel_all(symbol)
+                log.info("%s: all open orders cancelled", symbol)
             except BinanceError as e:
-                log.error("cancel failed: %s", e)
+                log.error("%s cancel failed: %s", symbol, e)
             return
 
-        if self.active is None:
-            log.warning("position open but untracked -- leaving all orders in place")
+        pos = self.book.get(symbol)
+        if pos is None:
+            log.warning("%s open but untracked -- leaving all orders in place", symbol)
             return
         try:
-            self.api.cancel_order(self.cfg.symbol, self.active.entry_order_id)
-            log.info("pulled resting entry %s; protective orders left on the book",
-                     self.active.entry_order_id)
+            self.api.cancel_order(symbol, pos.entry_order_id)
+            log.info("%s: pulled resting entry; protective orders left on the book",
+                     symbol)
         except BinanceError as e:
-            log.info("entry %s not cancellable (%s) -- likely already filled or gone",
-                     self.active.entry_order_id, e)
+            log.info("%s entry not cancellable (%s) -- likely filled or gone",
+                     symbol, e)
         self.notify.send(Event.HALT,
-                         "Bot stopping with a position still open.\n"
-                         "The stop and take-profit are LEFT ON THE EXCHANGE so the "
-                         "position stays protected while the bot is down.")
+                         f"Stopping with {symbol} still open.\n"
+                         f"Its stop and take-profit are LEFT ON THE EXCHANGE so "
+                         f"the position stays protected while the bot is down.")
+
 
     # -------------------------------------------------------------- handlers
     def handle(self, ev) -> None:
@@ -955,7 +968,11 @@ class Engine:
         self.decide()
 
     def on_order(self, upd: OrderUpdate) -> None:
-        if upd.symbol != self.cfg.symbol:
+        # Look the position up by symbol. Filtering on cfg.symbol dropped every
+        # fill on a scanner-opened symbol -- so realized_today never moved, the
+        # daily target could never fire, and slots were never freed. (QA S2)
+        pos = self.position_for(upd.symbol)
+        if pos is None:
             return
         log.info("order update %s %s %s rp=%.4f",
                  upd.client_order_id, upd.order_type, upd.status, upd.realized_pnl)
@@ -963,22 +980,22 @@ class Engine:
         # A partially filled entry means the real position is smaller than the
         # size we asked for. Track it rather than dropping the event. (QA F10)
         if upd.status == "PARTIALLY_FILLED":
-            if self.active is not None and upd.client_order_id == self.active.entry_order_id:
-                self.active.qty = upd.cumulative_qty or self.active.qty
+            if upd.client_order_id == pos.entry_order_id:
+                pos.qty = upd.cumulative_qty or pos.qty
                 if upd.avg_price:
-                    self.active.entry = upd.avg_price
-                log.info("entry partially filled: %s of %s at %s",
-                         upd.cumulative_qty, self.active.qty, upd.avg_price)
+                    pos.entry = upd.avg_price
+                log.info("%s entry partially filled: %s at %s",
+                         upd.symbol, upd.cumulative_qty, upd.avg_price)
             return
 
         if upd.status != "FILLED":
             return
 
         # A stop or take-profit filling means the position is closed.
-        closing = upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET") or \
-            (self.active is not None and upd.client_order_id == self.active.stop_order_id)
+        closing = (upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+                   or upd.client_order_id == pos.stop_order_id)
 
-        if closing and self.active is not None:
+        if closing:
             pnl = upd.realized_pnl
             self.state.realized_today += pnl
             self.state.save()
@@ -986,29 +1003,28 @@ class Engine:
             prog = self.schedule.progress(self.state.realized_today)
             self.notify.send(
                 event,
-                f"closed at {upd.avg_price:,.4f} for {pnl:+.2f} USDT\n"
-                f"{prog}\nequity ${self.equity:,.2f}")
-            self.notify.clear_position_alerts(self.active.tag)
-            self.active = None
+                f"{upd.symbol} closed at {upd.avg_price:,.4f} for "
+                f"{pnl:+.2f} USDT\n{prog}\nequity ${self.equity:,.2f}")
+            self.release(upd.symbol)
             self.check_target_reached()
 
-        elif self.active is not None and upd.client_order_id == self.active.entry_order_id:
+        elif upd.client_order_id == pos.entry_order_id:
             # Adopt the ACTUAL fill. Everything downstream -- unrealised P&L,
             # both progress bars, the 80% proximity thresholds -- was being
             # computed against the limit price we asked for rather than the
             # price we got. (QA F9)
-            asked = self.active.entry          # capture BEFORE overwriting (QA R6)
+            asked = pos.entry                  # capture BEFORE overwriting (QA R6)
             if upd.avg_price:
-                self.active.entry = upd.avg_price
+                pos.entry = upd.avg_price
             if upd.cumulative_qty:
-                self.active.qty = upd.cumulative_qty
+                pos.qty = upd.cumulative_qty
             self.risk.record_fill()
             slip = (upd.avg_price - asked) if upd.avg_price else 0.0
             self.notify.send(
                 Event.TRADE_OPEN,
-                f"entry filled at {upd.avg_price:,.4f} (asked {asked:,.4f}, "
-                f"slippage {slip:+.4f})\n"
-                f"{self.active.status_line(upd.avg_price)}")
+                f"{upd.symbol} entry filled at {upd.avg_price:,.4f} "
+                f"(asked {asked:,.4f}, slippage {slip:+.4f})\n"
+                f"{pos.status_line(upd.avg_price)}")
 
     # -------------------------------------------------------------- periodic
     def periodic(self) -> None:
@@ -1036,6 +1052,8 @@ class Engine:
 
         self.position_amt = snap["position_amt"]
         self.reconcile_position(snap)
+        if self.cfg.portfolio.enabled and self.book:
+            self.reconcile_book()
 
         hb = self.cfg.alerts.heartbeat_minutes
         if hb and now - self._last_heartbeat > hb * 60:
@@ -1047,70 +1065,97 @@ class Engine:
                              f"position: {'yes' if self.active else 'flat'}  "
                              f"trades today {self.state.trades_today}")
 
-    def reconcile_position(self, snap: dict) -> None:
+    def reconcile_position(self, snap: dict, symbol: str | None = None) -> None:
         """
-        Decide whether a tracked position is really gone.
+        Decide whether ONE tracked position is really gone.
 
-        A flat `positionAmt` is NOT proof of that: entries are LIMIT GTC, so
-        between placement and fill the exchange legitimately reports zero while
-        our entry rests in the book. Clearing `active` there let the next bar
-        open a SECOND entry on top of the first, doubling the position the risk
-        layer approved. So we only forget a trade when the account is flat AND
-        none of that trade's orders are still open. (QA F1)
+        Symbol-scoped throughout. It previously ended each branch with
+        `self.active = None`, which routes through the property setter and
+        replaces the whole book -- so reconciling the configured symbol dropped
+        tracking for every scanner-opened position while they were still open
+        on the exchange. Exactly the lesson close_position already carried, not
+        applied here. (QA S3)
         """
-        if self.active is None or self.cfg.dry_run:
+        symbol = symbol or self.cfg.symbol
+        pos = self.book.get(symbol)
+        if pos is None or self.cfg.dry_run:
             return                      # dry-run positions are simulated locally
+
         if snap["position_amt"] != 0.0:
             self._entry_placed_at = self._entry_placed_at or time.time()
+            self._flat_reconciles = 0
             return
 
-        ours = {self.active.entry_order_id, self.active.stop_order_id,
-                self.active.tp_order_id}
+        ours = {pos.entry_order_id, pos.stop_order_id, pos.tp_order_id}
         still_open = ours & snap.get("open_order_ids", set())
 
         # A resting ENTRY is a live trade waiting to happen -- keep tracking it,
         # subject to its own expiry.
-        if self.active.entry_order_id in still_open:
-            self.expire_stale_entry(snap)
+        if pos.entry_order_id in still_open:
+            self.expire_stale_entry(snap, symbol)
             return
 
-        # Anything else still listed is a leftover STOP or TAKE_PROFIT. Both
-        # carry closePosition:true, so with the account flat the trade is over
-        # and the order is stale. Holding `active` here used to park the bot
-        # forever: it believed it held a position it did not have and quietly
-        # stopped trading, with no halt, no alert and nothing in the logs.
+        # Anything else still listed is a leftover STOP or TAKE_PROFIT, which
+        # carry closePosition:true -- with the account flat the trade is over
+        # and the order is stale. Holding it here used to park the bot forever.
         # (QA R5)
         if still_open:
-            log.warning("flat but protective order(s) %s still listed; "
-                        "cancelling them and releasing tracking", sorted(still_open))
-            if not self.cfg.dry_run:
-                try:
-                    self.api.cancel_all(self.cfg.symbol)
-                except BinanceError as e:
-                    log.error("could not cancel stale protective orders: %s", e)
+            log.warning("%s flat but protective order(s) %s still listed; "
+                        "cancelling and releasing", symbol, sorted(still_open))
+            try:
+                self.api.cancel_all(symbol)
+            except BinanceError as e:
+                log.error("could not cancel stale protective orders: %s", e)
             self.notify.send(
                 Event.DAILY_SUMMARY,
-                f"Account is flat but {len(still_open)} protective order(s) were "
-                f"still listed. Cancelled them and released tracking, so the bot "
-                f"does not sit idle believing it holds a position.")
-            self.notify.clear_position_alerts(self.active.tag)
-            self.active = None
+                f"{symbol} is flat but {len(still_open)} protective order(s) "
+                f"were still listed. Cancelled them and released tracking.")
+            self.release(symbol)
             self._entry_placed_at = 0.0
             return
 
-        log.info("position closed exchange-side and no orders remain; clearing")
-        self.notify.clear_position_alerts(self.active.tag)
-        self.active = None
+        log.info("%s closed exchange-side and no orders remain; clearing", symbol)
+        self.release(symbol)
         self._entry_placed_at = 0.0
 
-    def expire_stale_entry(self, snap: dict) -> None:
+    def reconcile_book(self) -> dict:
+        """
+        Reconcile EVERY held symbol in two REST calls, as the plan specified.
+
+        positions() and open_orders() with no symbol each return everything,
+        so this costs the same two calls whether one position is open or forty
+        -- and it is what makes "you closed it on Binance yourself" actually
+        get noticed for a scanner symbol.
+        """
+        try:
+            live = {r["symbol"]: r for r in self.api.positions()}
+            orders = self.api.open_orders()
+        except BinanceError as e:
+            log.error("book reconcile failed: %s", e)
+            return {}
+
+        by_symbol: dict[str, set] = {}
+        for o in orders:
+            by_symbol.setdefault(o["symbol"], set()).add(o["clientOrderId"])
+
+        for symbol in list(self.book):
+            row = live.get(symbol)
+            self.reconcile_position(
+                {"position_amt": float(row["positionAmt"]) if row else 0.0,
+                 "open_order_ids": by_symbol.get(symbol, set())},
+                symbol=symbol)
+        return live
+
+    def expire_stale_entry(self, snap: dict, symbol: str | None = None) -> None:
         """
         An entry that never fills would otherwise hold a slot forever and keep
         the bot out of the market. Cancel it after entry_expiry_minutes.
         """
-        if self.active is None or not self._entry_placed_at:
+        symbol = symbol or self.cfg.symbol
+        pos = self.book.get(symbol)
+        if pos is None or not self._entry_placed_at:
             return
-        if self.active.entry_order_id not in snap.get("open_order_ids", set()):
+        if pos.entry_order_id not in snap.get("open_order_ids", set()):
             return
         minutes = self.cfg.risk.entry_expiry_minutes
         if minutes <= 0:
@@ -1118,18 +1163,18 @@ class Engine:
         age = (time.time() - self._entry_placed_at) / 60.0
         if age < minutes:
             return
-        log.info("entry %s unfilled after %.1f min -- cancelling",
-                 self.active.entry_order_id, age)
+        log.info("%s entry %s unfilled after %.1f min -- cancelling",
+                 symbol, pos.entry_order_id, age)
         if not self.cfg.dry_run:
             try:
-                self.api.cancel_all(self.cfg.symbol)
+                self.api.cancel_all(symbol)
             except BinanceError as e:
                 log.error("could not cancel stale entry: %s", e)
                 return
         self.notify.send(Event.DAILY_SUMMARY,
-                         f"Entry expired unfilled after {age:.0f} min; cancelled.")
-        self.notify.clear_position_alerts(self.active.tag)
-        self.active = None
+                         f"{symbol} entry expired unfilled after {age:.0f} min; "
+                         f"cancelled.")
+        self.release(symbol)
         self._entry_placed_at = 0.0
 
     def emergency_check(self) -> bool:

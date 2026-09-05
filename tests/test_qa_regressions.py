@@ -31,12 +31,13 @@ class TestF1PositionTracking(unittest.TestCase):
         e.active = ActivePosition("BTCUSDT", "BUY", 100.0, 90.0, 120.0, 1.0,
                                   entry_order_id="e-1", stop_order_id="s-1",
                                   tp_order_id="t-1", tag="e-1")
-        from bot.config import RiskConfig
-        e.cfg = type("C", (), {"dry_run": False, "risk": RiskConfig()})()
+        from bot.config import Config
+        e.cfg = Config(symbol="BTCUSDT", dry_run=False)
         e.notify = type("N", (), {"clear_position_alerts": lambda *a: None,
                                   "send": lambda *a, **k: None})()
         e._entry_placed_at = 0.0
-        e.api = type("A", (), {"cancel_all": lambda *a: None})()
+        e.api = type("A", (), {"cancel_all": lambda *a, **k: None})()
+        e.stream = None
         return e
 
     def test_flat_with_our_entry_still_resting_keeps_the_position(self):
@@ -148,10 +149,23 @@ class TestF8DryRun(unittest.TestCase):
 
 class TestF9F10Fills(unittest.TestCase):
     def test_entry_price_is_updated_from_the_fill(self):
-        import inspect
+        """Behavioural now: the source moved when on_order became per-symbol."""
+        import sys
+        sys.path.insert(0, str(ROOT / "tests"))
         from bot.engine import Engine
-        src = inspect.getsource(Engine.on_order)
-        self.assertIn("self.active.entry = upd.avg_price", src)
+        from bot.stream import OrderUpdate
+        from test_r2_regressions import StubAPI, engine
+        from test_book import pos as make_pos
+
+        e = engine(api=StubAPI())
+        e.book = {"AUSDT": make_pos("AUSDT", entry=100.0)}
+        e.schedule = type("S", (), {"progress": lambda s, r: "prog"})()
+        Engine.on_order(e, OrderUpdate(
+            symbol="AUSDT", client_order_id="e-AUSDT", side="BUY",
+            status="FILLED", order_type="LIMIT", last_filled_qty=1.0,
+            cumulative_qty=1.0, avg_price=101.5, realized_pnl=0.0, raw={}))
+        self.assertAlmostEqual(e.book["AUSDT"].entry, 101.5,
+                               msg="the real fill price was not adopted")
 
     def test_partial_fills_are_handled(self):
         import inspect

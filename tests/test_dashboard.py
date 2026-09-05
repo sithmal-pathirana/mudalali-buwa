@@ -149,9 +149,26 @@ class TestEngineSnapshotShape(unittest.TestCase):
         self.assertEqual(missing, set(), f"snapshot() is missing keys: {missing}")
 
     def test_position_block_declares_its_keys(self):
-        import inspect
-        from bot import engine
-        src = inspect.getsource(engine.Engine.snapshot)
+        """
+        The keys moved into _position_book when snapshot() stopped carrying a
+        duplicate copy -- which is what made it raise NameError. Assert against
+        a real snapshot instead of source text, so it cannot pass while the
+        function is broken. (QA S1)
+        """
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from bot.engine import Engine
+        from test_book import pos as make_pos
+        from test_r2_regressions import StubAPI, engine as build_engine
+
+        e = build_engine(api=StubAPI())
+        e.strategy = type("S", (), {"name": "x", "mode": "auto"})()
+        e.book = {"AUSDT": make_pos("AUSDT")}
+        e.last_prices = {"AUSDT": 105.0}
+        snap = Engine.snapshot(e)
+        self.assertEqual(len(snap["positions"]), 1)
         for k in ("side", "qty", "entry", "stop", "take_profit",
                   "unrealized", "to_tp", "to_sl"):
-            self.assertIn(f'"{k}"', src)
+            self.assertIn(k, snap["positions"][0])
+        self.assertIsNotNone(snap["position"], "single-position view is empty")
