@@ -205,3 +205,104 @@ class TestNoDuplicateMethods(unittest.TestCase):
                 dupes = {n: c for n, c in names.items() if c > 1}
                 self.assertEqual(dupes, {},
                                  f"{path.name}:{node.name} defines {dupes} twice")
+
+
+class TestClockOffsetMeasurement(unittest.TestCase):
+    """
+    Reported drift crept 207 -> 768 ms across a day of QA runs, which looked
+    like a failing clock. Most of it was measurement error: the offset was read
+    as `server - local_before`, so about half the round trip counted as drift,
+    and the correction then pushed timestamps into the future -- rejected just
+    as readily as stale ones.
+    """
+
+    def _api(self, server_time, latency_ms):
+        from bot.binanceapi import Binance
+        api = Binance(testnet=True)
+        clock = {"t": 1_000_000.0}
+
+        def fake_request(method, path, params=None, signed=False):
+            clock["t"] += latency_ms / 1000.0      # the round trip elapses
+            return {"serverTime": server_time}
+
+        api._request = fake_request
+        import bot.binanceapi as mod
+        self._real_time = mod.time.time
+        mod.time.time = lambda: clock["t"]
+        self.addCleanup(setattr, mod.time, "time", self._real_time)
+        return api
+
+    def test_round_trip_is_not_counted_as_drift(self):
+        """Clocks agree exactly; a 400 ms round trip must not look like drift."""
+        api = self._api(server_time=1_000_000_200, latency_ms=400)
+        offset = api.sync_clock()
+        self.assertLess(abs(offset), 50,
+                        f"a perfectly synced clock reported {offset} ms of drift")
+
+    def test_records_the_round_trip(self):
+        api = self._api(server_time=1_000_000_200, latency_ms=400)
+        api.sync_clock()
+        self.assertAlmostEqual(api.last_rtt_ms, 400, delta=5)
+
+    def test_a_genuine_offset_is_still_detected(self):
+        api = self._api(server_time=1_000_002_200, latency_ms=400)
+        self.assertAlmostEqual(api.sync_clock(), 2000, delta=50)
+
+    def test_thresholds_sit_below_the_recv_window(self):
+        from bot.binanceapi import Binance, RECV_WINDOW
+        self.assertLess(Binance.DRIFT_WARN_MS, Binance.DRIFT_DANGER_MS)
+        self.assertLess(Binance.DRIFT_DANGER_MS, RECV_WINDOW)
+
+    def test_sync_time_is_recorded_for_the_resync_clock(self):
+        api = self._api(server_time=1_000_000_200, latency_ms=100)
+        api.sync_clock()
+        self.assertGreater(api.last_sync, 0)
+
+
+class TestPeriodicResync(unittest.TestCase):
+    def test_engine_resyncs_on_a_schedule_not_only_at_startup(self):
+        src = inspect.getsource(Engine.periodic)
+        self.assertIn("resync_clock_if_due", src)
+
+    def test_resync_is_skipped_while_recent(self):
+        e = held([])
+        e.api = type("A", (), {"last_sync": __import__("time").time(),
+                               "_offset_ms": 0, "DRIFT_WARN_MS": 500,
+                               "sync_clock": lambda s: self.fail("resynced too soon")})()
+        Engine.resync_clock_if_due(e)
+
+    def test_offset_is_published_for_the_control_surfaces(self):
+        e = held(["AUSDT"])
+        snap = Engine.snapshot(e)
+        self.assertIn("clock_offset_ms", snap)
+        self.assertIn("clock_rtt_ms", snap)
+
+
+class TestClockCheckCannotBreakTheLoop(unittest.TestCase):
+    """
+    resync_clock_if_due runs inside periodic(), which is the reconciliation
+    path. Reaching for attributes the API object may not have made a clock
+    check able to stop the bot noticing that a position closed.
+    """
+
+    def test_an_api_without_clock_support_is_tolerated(self):
+        e = held([])
+        e.api = object()
+        Engine.resync_clock_if_due(e)        # must not raise
+
+    def test_a_failing_sync_does_not_propagate(self):
+        e = held([])
+
+        def boom():
+            raise RuntimeError("network gone")
+
+        e.api = type("A", (), {"sync_clock": staticmethod(boom),
+                               "last_sync": 0, "_offset_ms": 0})()
+        Engine.resync_clock_if_due(e)        # must not raise
+
+    def test_periodic_survives_a_broken_clock_api(self):
+        api = MultiAPI()
+        e = held(["AUSDT"], api=api)
+        e.api = api
+        e._last_reconcile = 0                # force the periodic body to run
+        Engine.periodic(e)                   # must not raise

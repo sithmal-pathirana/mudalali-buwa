@@ -68,7 +68,10 @@ def cmd_doctor(cfg: Config, equity_override: float | None = None) -> int:
     print(f"\n  endpoint      {api.base}")
     try:
         drift = api.sync_clock()
-        print(f"  clock drift   {drift} ms  {'OK' if abs(drift) < 1000 else 'FIX YOUR NTP'}")
+        verdict = ("OK" if abs(drift) < api.DRIFT_WARN_MS
+                   else "CHECK NTP" if abs(drift) < api.DRIFT_DANGER_MS
+                   else "FIX NTP -- signed requests will fail")
+        print(f"  clock offset  {drift:+d} ms (rtt {api.last_rtt_ms} ms)  {verdict}")
         info = api.exchange_info()
         print(f"  symbols       {len(info['symbols'])} tradable")
     except BinanceError as e:

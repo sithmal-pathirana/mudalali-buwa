@@ -84,6 +84,11 @@ class BinanceError(RuntimeError):
 
 
 class Binance:
+    #: Warn well before the window, because drift is gradual and the failure
+    #: mode -- every signed request rejected -- is total.
+    DRIFT_WARN_MS = 500
+    DRIFT_DANGER_MS = 900
+
     def __init__(self, key: str = "", secret: str = "", testnet: bool = True,
                  timeout: int = 10, base: str | None = None):
         import os
@@ -99,6 +104,8 @@ class Binance:
         self.testnet = testnet
         self.timeout = timeout
         self._offset_ms = 0
+        self.last_rtt_ms = 0
+        self.last_sync = 0.0
 
     # ---------------------------------------------------------------- plumbing
     def _request(self, method: str, path: str, params: dict | None = None, signed: bool = False):
@@ -141,12 +148,36 @@ class Binance:
 
     # ----------------------------------------------------------------- public
     def sync_clock(self) -> int:
-        """Signed requests are rejected if the local clock drifts. Measure and correct."""
-        local = int(time.time() * 1000)
+        """
+        Measure the offset between this host's clock and the exchange's.
+
+        Corrected for round-trip time, as NTP does. Reading the local clock
+        BEFORE the request and comparing it to a server time that arrives a
+        full round trip later counts about half the network latency as drift:
+        from a laptop ~320 ms from Binance that inflated a true ~100 ms offset
+        into ~294 ms, with four times the spread. It then over-corrected,
+        pushing our timestamps into the FUTURE -- which Binance rejects just as
+        readily as stale ones.
+        """
+        t0 = time.time() * 1000
         server = self._request("GET", "/fapi/v1/time")["serverTime"]
-        self._offset_ms = server - local
-        if abs(self._offset_ms) > 1000:
-            log.warning("clock drift %d ms -- correcting locally, but fix NTP", self._offset_ms)
+        t1 = time.time() * 1000
+        self.last_rtt_ms = int(t1 - t0)
+        # The reply describes a moment roughly rtt/2 before it reached us.
+        self._offset_ms = int(server - (t0 + self.last_rtt_ms / 2))
+        self.last_sync = time.time()
+
+        if abs(self._offset_ms) > self.DRIFT_DANGER_MS:
+            log.error("clock offset %d ms exceeds the %d ms recvWindow -- signed "
+                      "requests WILL be rejected. Fix NTP (chrony).",
+                      self._offset_ms, RECV_WINDOW)
+        elif abs(self._offset_ms) > self.DRIFT_WARN_MS:
+            log.warning("clock offset %d ms (rtt %d ms) -- correcting locally, "
+                        "but check NTP before it reaches %d ms",
+                        self._offset_ms, self.last_rtt_ms, RECV_WINDOW)
+        else:
+            log.info("clock offset %d ms, rtt %d ms", self._offset_ms,
+                     self.last_rtt_ms)
         return self._offset_ms
 
     def exchange_info(self):

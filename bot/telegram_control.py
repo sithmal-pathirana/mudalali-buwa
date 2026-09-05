@@ -347,6 +347,11 @@ class TelegramControl:
             f"trades      {s.get('trades_today', 0)} today",
             f"stream      {'live' if s.get('stream_ok') else 'DOWN'}",
         ]
+        off = s.get("clock_offset_ms")
+        if off is not None:
+            flag = "" if abs(off) < 500 else "  <-- CHECK NTP"
+            lines.append(f"clock       {off:+d} ms (rtt {s.get('clock_rtt_ms', 0)} ms)"
+                         f"{flag}")
         if s.get("regime"):
             lines += ["", f"regime      {s['regime']}"]
         if s.get("halted"):

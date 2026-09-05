@@ -22,10 +22,21 @@ from bot.strategies.base import Signal                         # noqa: E402
 class StubAPI:
     """Records calls instead of making them."""
 
+    DRIFT_WARN_MS = 500
+    DRIFT_DANGER_MS = 900
+
     def __init__(self, position_amt=0.0, open_ids=()):
         self.calls = []
         self.position_amt = position_amt
         self.open_ids = list(open_ids)
+        self._offset_ms = 0
+        self.last_rtt_ms = 0
+        # Recent, so periodic() does not try to resync against a stub.
+        self.last_sync = __import__("time").time()
+
+    def sync_clock(self):
+        self.calls.append(("sync_clock", None))
+        return 0
 
     def positions(self, symbol):
         self.calls.append(("positions", symbol))

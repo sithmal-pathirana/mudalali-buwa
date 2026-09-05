@@ -213,7 +213,35 @@ def layer_static(report, args):
         return not missing, (f"undeclared: {missing}" if missing
                              else "declares PyYAML and websockets")
 
+    def no_method_is_defined_twice():
+        """
+        A slice-based edit once duplicated five engine methods. Python binds
+        the LAST definition, so a fix can sit in the file as dead code while a
+        stale copy keeps running -- and nothing about that is visible in a diff
+        or a test run. Cheap to check, invisible otherwise.
+        """
+        import ast
+        dupes = []
+        for path in sorted((ROOT / "bot").rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                seen = set()
+                for item in node.body:
+                    if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    decorators = {getattr(d, "attr", getattr(d, "id", ""))
+                                  for d in item.decorator_list}
+                    if decorators & {"setter", "deleter"}:
+                        continue
+                    if item.name in seen:
+                        dupes.append(f"{path.name}:{node.name}.{item.name}")
+                    seen.add(item.name)
+        return not dupes, "; ".join(dupes) or "no shadowed definitions in bot/"
+
     check(report, "static", "all sources compile", compiles)
+    check(report, "static", "no method is defined twice", no_method_is_defined_twice,
+          severity="high")
     check(report, "static", "config.yaml parses with no unknown keys", config_loads)
     check(report, "static", "committed config is not armed", shipped_config_is_safe,
           severity="blocker")
@@ -666,16 +694,20 @@ def layer_audit(report, args):
         this is asserted by CALLING it, never by reading its source.
         """
         for book in ([], ["DOGEUSDT"], [f"S{i:02d}USDT" for i in range(25)]):
-            e = _engine(book=book or None, portfolio=bool(book))
-            try:
-                snap = e.snapshot()
-            except Exception as exc:
-                return False, (f"snapshot() raised {type(exc).__name__}: {exc} "
-                               f"with {len(book)} position(s) open")
-            if len(snap.get("positions", [])) != len(book):
-                return False, (f"{len(book)} open but snapshot reported "
-                               f"{len(snap.get('positions', []))}")
-        return True, "renders flat, one position, and a 25-position book"
+            for priced in (True, False):
+                e = _engine(book=book or None, portfolio=bool(book))
+                if not priced:
+                    e.last_prices = {}       # the stream has not ticked yet
+                try:
+                    snap = e.snapshot()
+                except Exception as exc:
+                    return False, (f"snapshot() raised {type(exc).__name__}: {exc} "
+                                   f"with {len(book)} position(s) open"
+                                   + ("" if priced else " and no price yet"))
+                if len(snap.get("positions", [])) != len(book):
+                    return False, (f"{len(book)} open but snapshot reported "
+                                   f"{len(snap.get('positions', []))}")
+        return True, "flat, one, and 25 positions -- priced and unpriced"
 
     probes = [
         ("snapshot renders with a position open",
@@ -1042,6 +1074,89 @@ def layer_portfolio(report, args):
         return True, (f"moderate {mod[0]*100:.0f}%/{mod[1]:.0f}d, "
                       f"maximum {mx[0]*100:.0f}%/{mx[1]:.0f}d at $43")
 
+    # ------------------------------------------- robustness of the S2/S4/S5 fixes
+    def an_unheld_symbol_is_ignored_not_crashed():
+        """The user stream carries the whole account, including symbols we
+        never opened and ones we released a moment ago."""
+        from bot.stream import OrderUpdate
+        e = _engine(book=["AAAUSDT"], portfolio=True, api=_MultiAPI())
+        before = (dict(e.book), e.state.realized_today)
+        e.on_order(OrderUpdate(symbol="ZZZUSDT", client_order_id="s-ZZZUSDT",
+                               side="SELL", status="FILLED",
+                               order_type="STOP_MARKET", last_filled_qty=10.0,
+                               cumulative_qty=10.0, avg_price=1.0,
+                               realized_pnl=-99.0, raw={}))
+        after = (dict(e.book), e.state.realized_today)
+        return before == after, (
+            f"book and P&L unchanged (realized {after[1]})" if before == after
+            else "an update for a symbol we do not hold changed state")
+
+    def a_replayed_fill_is_not_booked_twice():
+        """Websocket redelivery must not double-count a realised loss."""
+        from bot.stream import OrderUpdate
+
+        def stop(symbol):
+            return OrderUpdate(symbol=symbol, client_order_id=f"s-{symbol}",
+                               side="SELL", status="FILLED",
+                               order_type="STOP_MARKET", last_filled_qty=10.0,
+                               cumulative_qty=10.0, avg_price=0.98,
+                               realized_pnl=-2.0, raw={})
+
+        e = _engine(book=["AAAUSDT", "BBBUSDT"], portfolio=True, api=_MultiAPI())
+        e.on_order(stop("AAAUSDT"))
+        once = e.state.realized_today
+        e.on_order(stop("AAAUSDT"))
+        twice = e.state.realized_today
+        return abs(once - twice) < 1e-9 and abs(once + 2.0) < 1e-9, (
+            f"realized_today {once} -> {twice} after the replay")
+
+    def one_symbol_failing_does_not_abort_the_rest():
+        """A read failure on one symbol must not strand the other 24."""
+        from bot.binanceapi import BinanceError
+        held = ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+
+        class Partial(_MultiAPI):
+            def positions(self, symbol=None):
+                if symbol == "BBBUSDT":
+                    raise BinanceError(-1001, "read failed", "/positionRisk")
+                return super().positions(symbol)
+
+        api = Partial(open_symbols=held,
+                      open_orders={s: [f"e-{s}"] for s in held})
+        e = _engine(book=held, portfolio=True, api=api)
+        e.cancel_orders_safely(keep_protective=False)
+        touched = {c[1] for c in api.calls}
+        return {"AAAUSDT", "CCCUSDT"} <= touched, (
+            f"handled {sorted(touched)} despite one symbol failing to read")
+
+    def close_all_survives_an_exception_not_just_a_refusal():
+        """S5 made close_position return False. An unexpected raise must also
+        be counted as a failure, not silently as a close."""
+        held = ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+
+        class Exploding(_MultiAPI):
+            def positions(self, symbol=None):
+                if symbol == "BBBUSDT":
+                    raise RuntimeError("boom")
+                return super().positions(symbol)
+
+        e = _engine(book=held, portfolio=True, api=Exploding(open_symbols=held))
+        alerts = []
+        e.notify.send = lambda ev, body, dedupe_key=None: alerts.append(ev.name)
+        closed = e.close_all("qa")
+        return closed == 2 and "BBBUSDT" in e.book and "ERROR" in alerts, (
+            f"closed={closed}, still tracked {sorted(e.book)}, "
+            f"alerted={'ERROR' in alerts}")
+
+    def releasing_one_position_keeps_the_others_dedupe():
+        """Alert de-duplication is per position; releasing one must not reset
+        the thresholds already fired for another."""
+        e = _engine(book=["AAAUSDT", "BBBUSDT"], portfolio=True, api=_MultiAPI())
+        e.notify._fired = {"sl:e-AAAUSDT", "sl:e-BBBUSDT"}
+        e.release("AAAUSDT")
+        return e.notify._fired == {"sl:e-BBBUSDT"}, (
+            f"remaining keys {sorted(e.notify._fired)}")
+
     probes = [
         ("risk is conserved at every account size",
          risk_is_conserved_at_every_account_size, "blocker"),
@@ -1077,6 +1192,16 @@ def layer_portfolio(report, args):
          aggressive_cannot_disable_the_hard_invariants, "blocker"),
         ("the ruin warning is computed, not hardcoded",
          the_ruin_warning_is_computed_not_hardcoded, "medium"),
+        ("an unheld symbol is ignored, not crashed",
+         an_unheld_symbol_is_ignored_not_crashed, "high"),
+        ("a replayed fill is not booked twice",
+         a_replayed_fill_is_not_booked_twice, "blocker"),
+        ("one symbol failing does not abort the rest",
+         one_symbol_failing_does_not_abort_the_rest, "high"),
+        ("close_all survives an exception, not just a refusal",
+         close_all_survives_an_exception_not_just_a_refusal, "high"),
+        ("releasing one position keeps the others' de-duplication",
+         releasing_one_position_keeps_the_others_dedupe, "medium"),
     ]
     for name, fn, sev in probes:
         check(report, "portfolio", name, fn, severity=sev)

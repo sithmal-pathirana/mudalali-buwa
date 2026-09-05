@@ -44,6 +44,7 @@ log = logging.getLogger("engine")
 # inline and checked by the loop. (QA R2)
 
 RECONCILE_SECONDS = 60
+CLOCK_RESYNC_SECONDS = 1800   # a long-running process drifts; startup-only was not enough
 
 
 class Engine:
@@ -209,6 +210,8 @@ class Engine:
             "trades_today": self.state.trades_today,
             "position": pos, "events": list(self.events),
             "stream_ok": bool(self.stream and self.stream.connected.is_set()),
+            "clock_offset_ms": getattr(self.api, "_offset_ms", 0),
+            "clock_rtt_ms": getattr(self.api, "last_rtt_ms", 0),
             "regime": self._regime_note(),
             "aggressive": bool(self.cfg.aggressive.enabled),
             "aggressive_profile": (self.aggressive_profile.name
@@ -1034,6 +1037,7 @@ class Engine:
         self._last_reconcile = now
 
         self.emergency_check()
+        self.resync_clock_if_due()
 
         snap = reconcile(self.api, self.cfg.symbol)
         self.equity = snap["equity"]
@@ -1205,6 +1209,41 @@ class Engine:
                              dedupe_key=f"halt:{self.state.halt_reason[:40]}")
             return True
         return False
+
+    def resync_clock_if_due(self) -> None:
+        """
+        Re-measure the clock offset periodically.
+
+        It was measured once at startup and then only after a -1021 rejection,
+        i.e. after requests had already begun failing. A process that runs for
+        weeks drifts, so measure before it bites rather than after.
+        """
+        # Defensive throughout: this runs inside periodic(), which is the
+        # reconciliation path. A clock check must never be the reason the bot
+        # stops noticing that a position closed.
+        sync = getattr(self.api, "sync_clock", None)
+        if not callable(sync):
+            return
+        if time.time() - (getattr(self.api, "last_sync", 0) or 0) < CLOCK_RESYNC_SECONDS:
+            return
+        before = getattr(self.api, "_offset_ms", 0)
+        try:
+            after = sync()
+        except Exception as e:
+            log.warning("clock resync failed: %s", e)
+            return
+        if after is None:
+            return
+        warn_at = getattr(self.api, "DRIFT_WARN_MS", 500)
+        if abs(after) > warn_at:
+            self.notify.send(
+                Event.ERROR,
+                f"Clock offset is {after} ms against a {5000} ms window.\n"
+                f"Signed requests fail once this grows. Check chrony on the host.",
+                dedupe_key=f"drift:{abs(after) // 200}")
+        if abs(after - before) > 200:
+            log.info("clock offset moved %+d ms since the last check",
+                     after - before)
 
     def poll_once(self) -> None:
         """Fallback path when realtime is disabled."""
