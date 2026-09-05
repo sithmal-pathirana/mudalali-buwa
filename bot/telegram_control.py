@@ -50,19 +50,23 @@ JOIN_TIMEOUT = 5
 CONFIRM_TTL = 60           # seconds a pending confirmation stays valid
 BACKOFF_MAX = 60
 
-HELP = """Commands
+HELP = """MONITOR
+/status     equity, position, regime, and what is running
+/positions  every open position
+/pnl        today's realised P&L against the target
+/target     the daily target schedule
+/config     the settings that decide behaviour
+/scan       what the scanner ranks right now
 
-/status  — equity, day target, position, market regime
-/strategy — show how the strategy is being chosen
-/strategy auto|trend_atr|mean_reversion|none — override it
-/pnl     — today's realised P&L and progress
-/target  — the schedule and what it asks of the account
-/close   — close the open position (confirm)
-/halt    — stop opening new trades (confirm)
-/resume  — clear a halt (confirm)
-/help    — this message
+CONTROL  (each asks for confirmation)
+/strategy             how the strategy is being chosen
+/strategy <name>      pin one: auto, trend_atr, mean_reversion, none
+/close                close everything
+/close <SYMBOL>       close just that one
+/halt                 stop opening new trades
+/resume               clear a halt
 
-Monitoring is read-only. The three actions ask for confirmation first."""
+Every message shows the active mode and strategy on its second line."""
 
 
 @dataclass
@@ -209,8 +213,12 @@ class TelegramControl:
             "/status": self._send_status,
             "/pnl": self._send_pnl,
             "/target": self._send_target,
+            "/positions": self._send_position_book,
+            "/config": self._send_config,
+            "/scan": self._send_scan,
             "/strategy": lambda: self._strategy(arg),
-            "/close": lambda: self._ask("close", "Close the open position at market?"),
+            "/close": lambda: self._ask("close", "Close the open position at market?",
+                                        value=arg.upper()),
             "/halt": lambda: self._ask("halt", "Stop opening new trades?"),
             "/resume": lambda: self._ask("resume", "Clear the halt and resume trading?"),
         }
@@ -220,7 +228,48 @@ class TelegramControl:
             return
         handler()
 
-    def _ask(self, action: str, question: str) -> None:
+    def _send_position_book(self) -> None:
+        s = self.read()
+        book = s.get("positions") or ([s["position"]] if s.get("position") else [])
+        if not book:
+            self.send(f"{s.get('mode_line','')}\n\nflat -- no open positions")
+            return
+        lines = [s.get("mode_line", ""), "", f"{len(book)} open"]
+        total = 0.0
+        for p in book:
+            total += p.get("unrealized", 0.0)
+            lines.append(
+                f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}"
+                f"\n  entry {p['entry']:,.4f}  now {s.get('price', 0):,.4f}"
+                f"\n  unrealised {p['unrealized']:+.2f}"
+                f"\n  TP {p['to_tp']*100:.0f}%  SL {p['to_sl']*100:.0f}%")
+        lines.append(f"\ntotal unrealised {total:+.2f} USDT")
+        self.send("\n".join(lines))
+
+    def _send_config(self) -> None:
+        s = self.read()
+        cfg = s.get("config") or {}
+        if not cfg:
+            self.send("no configuration published yet")
+            return
+        lines = [s.get("mode_line", ""), ""]
+        lines += [f"{k:<22}{v}" for k, v in cfg.items()]
+        self.send("\n".join(lines))
+
+    def _send_scan(self) -> None:
+        s = self.read()
+        scan = s.get("scan") or {}
+        if not scan:
+            self.send("no scan yet -- the scanner may not be enabled")
+            return
+        lines = [s.get("mode_line", ""), "",
+                 f"scanned {scan.get('considered', 0)}, "
+                 f"{scan.get('passed', 0)} passed  ({scan.get('age', '?')} ago)"]
+        for row in scan.get("top", [])[:10]:
+            lines.append(f"  {row['symbol']:<12} {row['score']:.3f}")
+        self.send("\n".join(lines))
+
+    def _ask(self, action: str, question: str, value: str = "") -> None:
         """Destructive actions are two-step: ask, then act on the button press."""
         snap = self.read()
         if action == "close" and not snap.get("position"):
@@ -235,8 +284,8 @@ class TelegramControl:
 
         self._sweep_pending()
         nonce = secrets.token_urlsafe(8)
-        self._pending[nonce] = Pending(action)
-        detail = ""
+        self._pending[nonce] = Pending(action, value=value)
+        detail = f"\n\ntarget: {value}" if value else ""
         if action == "close" and snap.get("position"):
             p = snap["position"]
             detail = (f"\n\n{p['side']} {p['qty']:g} @ {p['entry']:,.4f}\n"

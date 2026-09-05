@@ -93,8 +93,27 @@ class Engine:
         self.dashboard: Dashboard | None = None
         self.telegram: TelegramControl | None = None
         self.notify.listener = self._record_event
+        self.notify.context = self.mode_line
 
     # ------------------------------------------------------------ dashboard
+    def mode_line(self) -> str:
+        """
+        One line naming what is running: risk profile, strategy, and how the
+        strategy was chosen. Prefixed to every alert so no message is ambiguous
+        about which configuration produced it.
+        """
+        profile = "AGGRESSIVE" if getattr(self.cfg, "aggressive_on", False) else "safe"
+        name = self.strategy.name
+        mode = getattr(self.strategy, "mode", None)
+        if mode and mode != "auto":
+            name = f"{name}/{mode.replace('manual/', '')}"
+        elif mode == "auto":
+            name = f"{name}/auto"
+        bits = [profile, name, self.cfg.mode]
+        if self.cfg.dry_run:
+            bits.append("dry-run")
+        return "[" + " · ".join(bits) + "]"
+
     def _record_event(self, event, subject, body) -> None:
         self.events.append({
             "t": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -129,6 +148,62 @@ class Engine:
             "regime": self._regime_note(),
             "strategy_mode": getattr(self.strategy, "mode", "fixed"),
             "strategy_choices": getattr(self.strategy, "choices", []),
+            "mode_line": self.mode_line(),
+            "positions": self._position_book(),
+            "config": self._config_summary(),
+            "scan": self._scan_summary(),
+        }
+
+    def _position_book(self) -> list[dict]:
+        """Every open position. A list even when there is one, so the control
+        surfaces need no special case once portfolio mode lands."""
+        book = []
+        for sym, p in self._positions().items():
+            book.append({
+                "symbol": sym, "side": p.side, "qty": p.qty, "entry": p.entry,
+                "stop": p.stop, "take_profit": p.take_profit,
+                "unrealized": p.unrealized(self.last_price) if self.last_price else 0.0,
+                "to_tp": p.progress_to_tp(self.last_price) if self.last_price else 0.0,
+                "to_sl": p.progress_to_stop(self.last_price) if self.last_price else 0.0,
+            })
+        return book
+
+    def _positions(self) -> dict:
+        """Single position today, a keyed book once portfolio mode lands."""
+        if isinstance(self.active, dict):
+            return self.active
+        return {self.cfg.symbol: self.active} if self.active else {}
+
+    def _config_summary(self) -> dict:
+        """The settings that actually decide behaviour, for /config."""
+        r = self.cfg.risk
+        return {
+            "mode": self.cfg.mode,
+            "dry_run": self.cfg.dry_run,
+            "symbol": self.cfg.symbol,
+            "interval": self.cfg.interval,
+            "strategy": self.cfg.strategy,
+            "max_leverage": f"{r.max_leverage}x",
+            "risk_per_trade": f"{r.risk_per_trade_pct}%",
+            "daily_loss_limit": f"{r.daily_loss_limit_pct}%",
+            "kill_action": r.kill_action,
+            "portfolio": ("on" if self.cfg.portfolio.enabled else "off"),
+            "target": (f"${self.schedule.today_target():.2f}/day"
+                       if self.schedule.stop_when_reached else "not enforced"),
+        }
+
+    def _scan_summary(self) -> dict:
+        scanner = getattr(self, "scanner", None)
+        last = getattr(scanner, "last", None) if scanner else None
+        if last is None:
+            return {}
+        age = int(time.time() - last.scanned_at)
+        return {
+            "considered": last.considered,
+            "passed": len(last.ranked),
+            "age": f"{age // 60}m" if age >= 60 else f"{age}s",
+            "top": [{"symbol": c.symbol, "score": round(c.score, 3)}
+                    for c in last.ranked[:10]],
         }
 
     def _regime_note(self) -> str:

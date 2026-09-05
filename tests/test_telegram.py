@@ -242,3 +242,59 @@ class TestControlDisabledIsDiscoverable(unittest.TestCase):
         block = src.split("control surfaces")[1][:900]
         self.assertIn("TELEGRAM_CHAT_ID missing", block)
         self.assertIn("allowlist", block)
+
+
+class TestModeVisibility(unittest.TestCase):
+    """Every message must answer 'what is it running' without a follow-up."""
+
+    def test_notifier_prefixes_the_mode_line(self):
+        from bot.notify import Event, Notifier
+        n = Notifier(symbol="BTCUSDT")
+        n.context = lambda: "[safe · switcher/auto · testnet · dry-run]"
+        seen = []
+        n._safe = staticmethod(lambda ch, subj, body: seen.append(subj))
+        n.telegram = type("T", (), {"enabled": True, "send": lambda *a: None})()
+        n.send(Event.TRADE_OPEN, "body")
+        self.assertTrue(seen)
+        self.assertIn("switcher/auto", seen[0])
+
+    def test_a_failing_context_never_blocks_the_alert(self):
+        from bot.notify import Event, Notifier
+        n = Notifier(symbol="BTCUSDT")
+        n.context = lambda: 1 / 0
+        n.send(Event.TRADE_OPEN, "body")     # must not raise
+
+    def test_engine_mode_line_names_profile_strategy_and_mode(self):
+        import inspect
+        from bot.engine import Engine
+        src = inspect.getsource(Engine.mode_line)
+        for term in ("AGGRESSIVE", "safe", "dry-run"):
+            self.assertIn(term, src)
+
+    def test_engine_publishes_the_mode_line(self):
+        import inspect
+        from bot.engine import Engine
+        self.assertIn('"mode_line"', inspect.getsource(Engine.snapshot))
+
+
+class TestExpandedControl(unittest.TestCase):
+    def test_help_lists_monitor_and_control_sections(self):
+        from bot.telegram_control import HELP
+        for cmd in ("/status", "/positions", "/config", "/scan",
+                    "/strategy", "/close", "/halt", "/resume"):
+            self.assertIn(cmd, HELP)
+
+    def test_close_accepts_a_symbol_argument(self):
+        import inspect
+        from bot.telegram_control import TelegramControl
+        self.assertIn("value=arg.upper()",
+                      inspect.getsource(TelegramControl._handle))
+
+    def test_control_surface_still_calls_no_exchange_method(self):
+        """The invariant the QA audit enforces; asserted here too."""
+        import inspect
+        from bot import telegram_control
+        src = inspect.getsource(telegram_control)
+        for forbidden in ("cancel_all", "usdt_equity", "set_leverage",
+                          "user_trades", "all_orders"):
+            self.assertNotIn(forbidden, src)

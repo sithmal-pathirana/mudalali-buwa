@@ -140,3 +140,74 @@ def explain(equity: float, per_trade: float, portfolio: float,
                   "  fund one position. Scanning wide still helps -- it picks WHICH",
                   "  one -- but holding several is a capital decision, not a setting."]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- allocation
+@dataclass
+class Allocation:
+    """How many positions to open, and how much risk each one carries."""
+    slots: int
+    per_position_risk_pct: float
+    notional_per_position: float
+    total_risk_pct: float
+    limited_by: str
+
+    @property
+    def deployable(self) -> float:
+        return self.slots * self.notional_per_position
+
+    def __str__(self) -> str:
+        if not self.slots:
+            return f"no positions ({self.limited_by})"
+        return (f"{self.slots} x ${self.notional_per_position:,.2f} "
+                f"at {self.per_position_risk_pct:.2f}% each "
+                f"({self.total_risk_pct:.2f}% total, limited by {self.limited_by})")
+
+
+def allocate(equity: float, eligible: int, portfolio_risk_pct: float = 6.0,
+             single_position_cap_pct: float = 2.0, max_leverage: float = 3.0,
+             stop_distance: float = 0.02, min_notional: float = 5.0,
+             hard_cap: int = 40) -> Allocation:
+    """
+    Split the risk budget across however many coins qualified.
+
+        per_position_risk = min(single_position_cap, portfolio_risk / eligible)
+
+    A lone qualifier gets a full SINGLE-POSITION allocation rather than the
+    whole portfolio budget -- otherwise "only one coin looked good today"
+    becomes the riskiest day of the month, which is backwards.
+
+    Slots are then trimmed until every position clears the exchange minimum
+    and the total respects leverage. Trimming rather than shrinking matters:
+    a position below the minimum cannot be placed at all, so opening fewer
+    real positions beats opening more imaginary ones.
+    """
+    if equity <= 0 or eligible < 1 or portfolio_risk_pct <= 0:
+        return Allocation(0, 0.0, 0.0, 0.0, "nothing eligible")
+
+    n = min(eligible, hard_cap)
+    limited_by = "all eligible taken" if eligible <= hard_cap else "hard cap"
+
+    def sizing(count: int) -> tuple[float, float]:
+        risk = min(single_position_cap_pct, portfolio_risk_pct / count)
+        return risk, equity * risk / 100 / stop_distance
+
+    risk, notional = sizing(n)
+    while n > 1 and notional < min_notional:
+        n -= 1
+        risk, notional = sizing(n)
+        limited_by = "minimum order size"
+    if notional < min_notional:
+        return Allocation(0, 0.0, 0.0, 0.0, "cannot fund one position")
+
+    ceiling = equity * max_leverage
+    while n > 1 and notional * n > ceiling + 1e-9:
+        n -= 1
+        risk, notional = sizing(n)
+        limited_by = "leverage"
+    if notional > ceiling + 1e-9:
+        return Allocation(0, 0.0, 0.0, 0.0, "leverage ceiling")
+
+    return Allocation(slots=n, per_position_risk_pct=risk,
+                      notional_per_position=notional,
+                      total_risk_pct=n * risk, limited_by=limited_by)

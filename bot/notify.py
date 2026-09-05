@@ -106,6 +106,9 @@ class Notifier:
     telegram: TelegramChannel = field(default_factory=TelegramChannel)
     email: EmailChannel = field(default_factory=EmailChannel)
     symbol: str = ""
+    #: returns a short "mode · strategy" string, shown on EVERY message so a
+    #: glance at any alert answers "what is it running right now"
+    context: object = None
     listener: object = None          # called (event, subject, body) for every alert
     _fired: set = field(default_factory=set, repr=False)
 
@@ -145,7 +148,14 @@ class Notifier:
                 for stale in list(self._fired)[:256]:
                     self._fired.discard(stale)
 
-        subject = f"{ICON.get(event, '[ ? ]')} {self.symbol} {event.value}"
+        tag = ""
+        if self.context is not None:
+            try:
+                tag = self.context() or ""
+            except Exception:
+                tag = ""
+        subject = (f"{ICON.get(event, '[ ? ]')} {self.symbol} {event.value}"
+                   + (f"\n{tag}" if tag else ""))
         log.info("ALERT %s | %s", subject, body.replace("\n", " | "))
 
         if self.listener is not None:

@@ -54,6 +54,11 @@ class PortfolioConfig:
     portfolio_risk_pct: float = 6.0
     hard_cap: int = 40
     stop_distance: float = 0.02      # representative, for converting risk to size
+    single_position_cap_pct: float = 2.0
+
+    #: filled in at runtime once equity and the eligible count are known
+    resolved_slots: int = 0
+    resolved_risk_pct: float = 0.0
 
 
 @dataclass

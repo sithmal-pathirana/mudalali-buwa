@@ -104,6 +104,49 @@ class RiskManager:
             return Decision(False, "already in this position; averaging down is disabled")
         return Decision(True)
 
+    def check_portfolio(self, open_positions: dict, equity: float,
+                        new_notional: float, symbol: str,
+                        portfolio_cfg) -> Decision:
+        """
+        The gate that per-trade sizing cannot see.
+
+        Each position can be correctly sized on its own and the book still be
+        wrong: twenty-five individually-sane trades can breach total leverage,
+        or stack the whole risk budget into one hour. Checked here, above the
+        per-trade layer, and never instead of it.
+        """
+        if not portfolio_cfg.enabled:
+            if open_positions:
+                return Decision(False, "already holding a position "
+                                       "(portfolio mode is off)")
+            return Decision(True)
+
+        if symbol in open_positions:
+            return Decision(False, f"already holding {symbol}; "
+                                   f"one position per symbol")
+
+        slots = portfolio_cfg.resolved_slots
+        if slots and len(open_positions) >= slots:
+            return Decision(False, f"all {slots} slots in use")
+
+        held_notional = sum(p.notional for p in open_positions.values())
+        ceiling = equity * self.cfg.max_leverage
+        if held_notional + new_notional > ceiling + 1e-9:
+            return Decision(
+                False,
+                f"would deploy ${held_notional + new_notional:,.2f} against a "
+                f"${ceiling:,.2f} leverage ceiling")
+
+        used_risk = len(open_positions) * portfolio_cfg.resolved_risk_pct
+        if used_risk + portfolio_cfg.resolved_risk_pct > portfolio_cfg.portfolio_risk_pct + 1e-9:
+            return Decision(
+                False,
+                f"would take total risk to "
+                f"{used_risk + portfolio_cfg.resolved_risk_pct:.2f}%, over the "
+                f"{portfolio_cfg.portfolio_risk_pct:.2f}% cap")
+
+        return Decision(True, f"slot {len(open_positions) + 1} of {slots or '?'}")
+
     def record_attempt(self) -> None:
         """
         An entry was SUBMITTED. Counts against max_trades_per_day, because the
