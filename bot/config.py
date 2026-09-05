@@ -64,6 +64,7 @@ class Config:
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     targets: dict = field(default_factory=dict)
+    universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
 
     unknown_keys: list = field(default_factory=list)

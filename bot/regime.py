@@ -22,8 +22,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from .strategies.base import Bar
+if TYPE_CHECKING:                     # pragma: no cover
+    # Type-hint only. Importing it at runtime would pull in bot.strategies,
+    # whose package __init__ imports the switcher, which imports this module --
+    # a cycle. `from __future__ import annotations` keeps the hints as strings,
+    # so nothing here needs the real class.
+    from .strategies.base import Bar
 
 
 class Regime(Enum):
@@ -44,7 +50,7 @@ class RegimeReading:
                 f"ATR {self.atr_pct:.2f}%)")
 
 
-def efficiency_ratio(bars: list[Bar], window: int) -> float:
+def efficiency_ratio(bars: list["Bar"], window: int) -> float:
     """Kaufman's Efficiency Ratio over the last `window` closes."""
     if len(bars) < window + 1:
         return 0.0
@@ -54,7 +60,7 @@ def efficiency_ratio(bars: list[Bar], window: int) -> float:
     return net / path if path > 0 else 0.0
 
 
-def realised_vol_pct(bars: list[Bar], window: int) -> float:
+def realised_vol_pct(bars: list["Bar"], window: int) -> float:
     """Mean true range over the window, as a percentage of price."""
     if len(bars) < window + 1:
         return 0.0
@@ -97,7 +103,7 @@ class RegimeDetector:
     def warmup(self) -> int:
         return self.window + 2
 
-    def classify(self, bars: list[Bar]) -> RegimeReading:
+    def classify(self, bars: list["Bar"]) -> RegimeReading:
         """The instantaneous reading, before hysteresis."""
         er = efficiency_ratio(bars, self.window)
         atr_pct = realised_vol_pct(bars, self.window)
@@ -114,7 +120,7 @@ class RegimeDetector:
         return RegimeReading(Regime.UNCLEAR, er, atr_pct,
                              "between regimes -- no strategy claims this")
 
-    def update(self, bars: list[Bar]) -> RegimeReading:
+    def update(self, bars: list["Bar"]) -> RegimeReading:
         """Apply hysteresis and return the reading with the ADOPTED regime."""
         reading = self.classify(bars)
         if reading.regime == self.current:

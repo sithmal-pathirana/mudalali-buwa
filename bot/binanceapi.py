@@ -166,6 +166,11 @@ class Binance:
     def funding_history(self, symbol: str, limit: int = 500):
         return self._request("GET", "/fapi/v1/fundingRate", {"symbol": symbol, "limit": limit})
 
+    def ticker_24hr(self, symbol: str | None = None):
+        """Every symbol in one request -- the cheap way to prefilter a universe."""
+        return self._request("GET", "/fapi/v1/ticker/24hr",
+                             {"symbol": symbol} if symbol else {})
+
     def book_ticker(self, symbol: str):
         return self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
 

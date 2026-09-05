@@ -163,6 +163,63 @@ def cmd_doctor(cfg: Config, equity_override: float | None = None) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- scan
+def cmd_scan(cfg: Config, args) -> int:
+    from bot.binanceapi import Binance, BinanceError
+    from bot.filters import SymbolRules
+    from bot.scanner import ScanConfig, Scanner
+
+    api = Binance(cfg.api_key, cfg.api_secret, testnet=cfg.testnet)
+    equity = args.equity
+    if equity is None and cfg.api_key:
+        try:
+            equity = api.usdt_equity()
+        except BinanceError:
+            equity = None
+    equity = equity or 43.0
+
+    # What the risk layer would actually fund, at a representative 2% stop.
+    budget = equity * cfg.risk.risk_per_trade_pct / 100 / 0.02
+
+    scan_cfg = ScanConfig(**(cfg.universe or {}))
+    scanner = Scanner(api, scan_cfg)
+    info = api.exchange_info()
+    cache: dict = {}
+
+    def rules_for(sym):
+        if sym not in cache:
+            cache[sym] = SymbolRules.from_exchange_info(info, sym)
+        return cache[sym]
+
+    print(f"\n  SCANNING   equity ${equity:,.2f}   "
+          f"risk {cfg.risk.risk_per_trade_pct}%/trade   "
+          f"funds ~${budget:,.2f} notional at a 2% stop")
+    print(f"  universe: top {scan_cfg.max_symbols} USDT perps "
+          f"above ${scan_cfg.min_quote_volume/1e6:.0f}M daily volume\n")
+
+    res = scanner.scan(risk_budget_notional=budget, rules_for=rules_for)
+
+    print(f"  {'symbol':<14} {'score':>8}")
+    print("  " + "-" * 74)
+    for c in res.ranked[: args.top]:
+        print(c.line())
+    if not res.ranked:
+        print("  nothing passed the filters -- the bot would stand down")
+
+    if args.all and res.rejected:
+        print(f"\n  rejected ({len(res.rejected)}):")
+        from collections import Counter
+        reasons = Counter(c.rejected.split("(")[0].strip() for c in res.rejected)
+        for reason, n in reasons.most_common():
+            print(f"    {n:>3}  {reason}")
+
+    print(f"\n  {res.summary()}")
+    if res.best:
+        print(f"\n  the bot would trade {res.best.symbol} next time it is flat")
+    print()
+    return 0
+
+
 # ------------------------------------------------------------------- report
 def cmd_report(cfg: Config, args) -> int:
     import json as _json
@@ -681,6 +738,11 @@ def main() -> int:
     sub.add_parser("project", help="model the escalating target schedule")
     sub.add_parser("netcheck", help="probe every endpoint this host needs")
     sub.add_parser("myip", help="this host's public IP, for Binance IP restriction")
+    sc = sub.add_parser("scan", help="rank the tradable universe right now")
+    sc.add_argument("--equity", type=float, default=None,
+                    help="risk budget to filter against (default: account balance)")
+    sc.add_argument("--top", type=int, default=15, help="how many to show")
+    sc.add_argument("--all", action="store_true", help="also list what was rejected")
     rp = sub.add_parser("report", help="what actually happened, from exchange records")
     rp.add_argument("--days", type=int, default=8, help="how far back (default 8)")
     rp.add_argument("--out", default=None, help="also write the raw JSON here")
@@ -727,6 +789,8 @@ def main() -> int:
         return cmd_myip()
     if args.cmd == "report":
         return cmd_report(cfg, args)
+    if args.cmd == "scan":
+        return cmd_scan(cfg, args)
     if args.cmd == "verifykey":
         return cmd_verifykey(cfg, args)
     if args.cmd == "alerts":
