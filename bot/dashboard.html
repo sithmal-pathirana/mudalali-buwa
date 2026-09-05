@@ -211,8 +211,35 @@
     }
 
     // ---- position
+    var book = s.positions || [];
     var p = s.position, pill = el("posPill"), body = el("posBody");
-    if (p) {
+
+    if (book.length > 1) {
+      pill.className = "pill long";
+      pill.textContent = book.length + " open";
+      var total = 0;
+      body.innerHTML = '<table><tr><td style="color:var(--ink-mute);font-size:11px">'
+        + 'SYMBOL</td><td style="text-align:right;color:var(--ink-mute);font-size:11px">'
+        + 'SIZE</td><td style="text-align:right;color:var(--ink-mute);font-size:11px">'
+        + 'P&amp;L</td><td style="text-align:right;color:var(--ink-mute);font-size:11px">'
+        + 'TP / SL</td></tr>'
+        + book.map(function(q){
+            total += q.unrealized || 0;
+            var col = (q.unrealized >= 0) ? "var(--up)" : "var(--down)";
+            return '<tr><td class="mono">' + q.symbol
+              + '<div style="font-size:10px;color:var(--ink-mute)">' + q.side + '</div></td>'
+              + '<td class="mono" style="text-align:right">' + fmt(q.qty, 4) + '</td>'
+              + '<td class="mono" style="text-align:right;color:' + col + '">'
+              + signed(q.unrealized) + '</td>'
+              + '<td class="mono" style="text-align:right;font-size:11px">'
+              + Math.round(q.to_tp * 100) + '% / ' + Math.round(q.to_sl * 100) + '%</td></tr>';
+          }).join("")
+        + '</table><div class="barlab" style="margin-top:9px"><span>total unrealised</span>'
+        + '<span class="mono" style="color:' + (total >= 0 ? "var(--up)" : "var(--down)")
+        + '">' + signed(total) + ' USDT</span></div>';
+      el("closeBtn").disabled = false;
+      el("closeBtn").textContent = "Close all " + book.length + " positions";
+    } else if (p) {
       pill.className = "pill " + (p.side === "BUY" ? "long":"short");
       pill.textContent = p.side === "BUY" ? "long":"short";
       var upnl = p.unrealized||0;

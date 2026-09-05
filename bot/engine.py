@@ -23,6 +23,7 @@ from .binanceapi import Binance, BinanceError
 from .dashboard import Dashboard, generate_token
 from .filters import SymbolRules
 from .notify import Event, Notifier
+from .portfolio import allocate
 from .positions import ActivePosition
 from .risk import KILL_FILE, RiskManager
 from .state import State, client_order_id, reconcile
@@ -53,7 +54,7 @@ class Engine:
     # plain immutable defaults, so no state is shared between instances.
     _flat_reconciles = 0
     _entry_placed_at = 0.0
-    _dry_pending = None
+    _dry_pending: dict = None
     _last_guard = 0.0
     _last_publish = 0.0
     _last_heartbeat = 0.0
@@ -63,6 +64,9 @@ class Engine:
     _seq = 0
     position_amt = 0.0
     last_prices: dict = None
+    scanner = None
+    _rules_cache: dict = None
+    _exchange_info = None
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -77,6 +81,9 @@ class Engine:
         #: symbol -> ActivePosition. The single-position path is the one-entry
         #: case of this, so there is no parallel code for the two modes.
         self._book: dict[str, ActivePosition] = {}
+        self._rules_cache: dict = {}
+        self._exchange_info = None
+        self.scanner = None
         self.last_price = 0.0
         self.equity = 0.0
         self.bars: list[Bar] = []
@@ -89,7 +96,9 @@ class Engine:
         self.position_amt = 0.0
         self.last_prices: dict[str, float] = {}
         self._entry_placed_at = 0.0
-        self._dry_pending: ActivePosition | None = None
+        #: symbol -> resting dry-run entry. A single slot dropped every entry
+        #: but the last as soon as the portfolio opened more than one.
+        self._dry_pending: dict[str, ActivePosition] = {}
         self._flat_reconciles = 0
         self._stopping = False
         self._stop_reason = ""
@@ -144,6 +153,15 @@ class Engine:
             self.notify.clear_position_alerts(p.tag)
         if self.stream is not None and symbol != self.cfg.symbol:
             self.stream.remove_symbol(symbol)
+
+    def rules_for(self, symbol: str):
+        """Per-symbol filters, cached. exchangeInfo is one request for all."""
+        if symbol not in self._rules_cache:
+            if self._exchange_info is None:
+                self._exchange_info = self.api.exchange_info()
+            self._rules_cache[symbol] = SymbolRules.from_exchange_info(
+                self._exchange_info, symbol)
+        return self._rules_cache[symbol]
 
     def mode_line(self) -> str:
         """
@@ -294,7 +312,16 @@ class Engine:
                 origin = cmd.note or type(controller).__name__
                 log.info("executing command %s (%s)", cmd.action, origin)
                 if cmd.action == "close":
-                    self.close_position(f"closed manually ({origin})")
+                    target = (cmd.value or "").strip().upper()
+                    if target in ("", "ALL"):
+                        self.close_all(f"closed manually ({origin})")
+                    elif target in self.book:
+                        self.close_position(f"closed manually ({origin})",
+                                            symbol=target)
+                    else:
+                        held = ", ".join(sorted(self.book)) or "nothing"
+                        self.notify.send(Event.ERROR,
+                                         f"Not holding {target}. Currently: {held}")
                 elif cmd.action == "halt":
                     self.state.halt(f"halted manually ({origin})")
                     self.notify.send(Event.HALT, f"Halted ({origin}). "
@@ -496,6 +523,12 @@ class Engine:
         self.bars = [Bar.from_kline(k) for k in klines[:-1]]
         log.info("warmed %d bars of %s history", len(self.bars), self.cfg.interval)
 
+        if self.cfg.portfolio.enabled:
+            from .scanner import ScanConfig, Scanner
+            self.scanner = Scanner(self.api, ScanConfig(**(self.cfg.universe or {})))
+            log.info("portfolio mode ON: scanning up to %d symbols every %ds",
+                     self.scanner.cfg.max_symbols, self.scanner.cfg.rescan_seconds)
+
         if self.cfg.telegram.control and self.cfg.telegram_token and self.cfg.telegram_chat_id:
             self.telegram = TelegramControl(self.cfg.telegram_token,
                                             self.cfg.telegram_chat_id)
@@ -647,7 +680,7 @@ class Engine:
             log.info("dry_run: kill sequence not sent to the exchange")
             return
         if flatten:
-            self.close_position("kill switch")
+            self.close_all("kill switch")
         self.cancel_orders_safely(keep_protective=not flatten)
 
     @staticmethod
@@ -802,46 +835,57 @@ class Engine:
                 dedupe_key=f"sl:{pos.tag}")
 
         if self.cfg.dry_run:
-            self.simulate_exit(price)
+            self.simulate_exit(price, tick.symbol)
 
-    def simulate_entry(self, price: float) -> None:
-        """Fill a resting dry-run entry only when price reaches it, and expire
-        it on the same clock the live path uses. (QA R4)"""
-        pending = self._dry_pending
-        if pending is None:
+    def simulate_entry(self, price: float, symbol: str | None = None) -> None:
+        """
+        Fill resting dry-run entries only when price reaches them, and expire
+        them on the same clock the live path uses. (QA R4)
+
+        Keyed by symbol so a portfolio of resting entries resolves
+        independently -- one filling must not disturb the others.
+        """
+        if not self._dry_pending:
             return
-
+        symbols = [symbol] if symbol else list(self._dry_pending)
         minutes = self.cfg.risk.entry_expiry_minutes
-        if minutes > 0 and self._entry_placed_at:
-            age = (time.time() - self._entry_placed_at) / 60.0
-            if age >= minutes:
-                self._dry_pending = None
-                self._entry_placed_at = 0.0
-                log.info("dry_run: entry expired unfilled after %.1f min", age)
-                self.notify.send(Event.DAILY_SUMMARY,
-                                 f"DRY RUN -- entry expired unfilled after "
-                                 f"{age:.0f} min. No trade.")
-                return
 
-        reached = price <= pending.entry if pending.is_long else price >= pending.entry
-        if not reached:
-            return
+        for sym in symbols:
+            pending = self._dry_pending.get(sym)
+            if pending is None:
+                continue
 
-        self._dry_pending = None
-        self.active = pending
-        self.risk.record_fill()
-        log.info("dry_run: entry filled at %.6f", price)
-        self.notify.send(Event.TRADE_OPEN,
-                         f"DRY RUN -- entry filled at {price:,.4f}\n"
-                         f"{pending.status_line(price)}")
+            if minutes > 0 and self._entry_placed_at:
+                age = (time.time() - self._entry_placed_at) / 60.0
+                if age >= minutes:
+                    del self._dry_pending[sym]
+                    log.info("dry_run: %s entry expired unfilled after %.1f min",
+                             sym, age)
+                    self.notify.send(Event.DAILY_SUMMARY,
+                                     f"DRY RUN -- {sym} entry expired unfilled "
+                                     f"after {age:.0f} min. No trade.")
+                    continue
 
-    def simulate_exit(self, price: float) -> None:
+            px = (self.last_prices or {}).get(sym, price)
+            reached = px <= pending.entry if pending.is_long else px >= pending.entry
+            if not reached:
+                continue
+
+            del self._dry_pending[sym]
+            self.book[sym] = pending
+            self.risk.record_fill()
+            log.info("dry_run: %s entry filled at %.6f", sym, px)
+            self.notify.send(Event.TRADE_OPEN,
+                             f"DRY RUN -- {sym} entry filled at {px:,.4f}\n"
+                             f"{pending.status_line(px)}")
+
+    def simulate_exit(self, price: float, symbol: str | None = None) -> None:
         """
         Resolve a dry-run position against real tick prices, so stops, targets,
         P&L accounting and the daily-target logic all run end to end with
         nothing sent to the exchange. (QA F8)
         """
-        pos = self.active
+        pos = self.book.get(symbol) if symbol else self.active
         if pos is None:
             return
         hit_stop = price <= pos.stop if pos.is_long else price >= pos.stop
@@ -865,8 +909,7 @@ class Engine:
         self.notify.send(event,
                          f"DRY RUN -- simulated close at {exit_px:,.4f} "
                          f"for {pnl:+.2f} USDT\n{prog}")
-        self.notify.clear_position_alerts(pos.tag)
-        self.active = None
+        self.release(pos.symbol)
         self._entry_placed_at = 0.0
         self.check_target_reached()
 
@@ -1110,9 +1153,90 @@ class Engine:
                 Event.TARGET_REACHED,
                 f"Day {prog.day} target of ${prog.target:.2f} banked "
                 f"(${prog.realized:+.2f}).\n"
-                + ("No further trades today -- the day's gain is protected."
+                + ("Closing every open position and standing down for the day."
                    if prog.stop_trading else "Continuing to trade."))
+            # Standing down is not enough once several positions are open: the
+            # day's gain can still evaporate while they run. Flatten. (D3)
+            if prog.stop_trading and self.book:
+                self.close_all(f"daily target of ${prog.target:.2f} reached")
         return prog.stop_trading
+
+    # ---------------------------------------------------------- portfolio
+    def portfolio_cycle(self) -> int:
+        """
+        Scan, allocate, and fill whatever slots are free.
+
+        Allocation is recomputed from the number of coins that qualified, so a
+        day with one candidate sizes differently from a day with fifty. Every
+        candidate then goes through the SAME per-trade sizing and portfolio
+        gate as a single-symbol trade -- this layer decides how many and how
+        big, never whether a position gets a stop.
+        """
+        pf = self.cfg.portfolio
+        if not pf.enabled or self.scanner is None:
+            return 0
+
+        if self.scanner.due() or self.scanner.last is None:
+            budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
+                      / pf.stop_distance)
+            self.scanner.scan(risk_budget_notional=budget,
+                              rules_for=self.rules_for)
+
+        result = self.scanner.last
+        if result is None or not result.ranked:
+            return 0
+
+        alloc = allocate(self.equity, len(result.ranked),
+                         portfolio_risk_pct=pf.portfolio_risk_pct,
+                         single_position_cap_pct=pf.single_position_cap_pct,
+                         max_leverage=self.cfg.risk.max_leverage,
+                         stop_distance=pf.stop_distance,
+                         hard_cap=pf.hard_cap)
+        pf.resolved_slots = alloc.slots
+        pf.resolved_risk_pct = alloc.per_position_risk_pct
+        if not alloc.slots:
+            log.info("portfolio: %s", alloc)
+            return 0
+
+        free = alloc.slots - len(self.book)
+        if free <= 0:
+            return 0
+        log.info("portfolio: %s | %d held, %d free", alloc, len(self.book), free)
+
+        opened = 0
+        for cand in result.ranked:
+            if opened >= free:
+                break
+            if cand.symbol in self.book:
+                continue
+            signal = self.strategy.on_bars(cand.bars, 0.0)
+            if signal is None:
+                continue
+
+            sized = self.risk.size_position(
+                self.equity, signal.entry, signal.stop,
+                self.rules_for(cand.symbol),
+                risk_pct_override=alloc.per_position_risk_pct)
+            if not sized:
+                log.info("portfolio: %s rejected by risk -- %s",
+                         cand.symbol, sized.reason)
+                continue
+
+            gate = self.risk.check_portfolio(self.book, self.equity,
+                                             sized.qty_notional, cand.symbol, pf)
+            if not gate:
+                log.info("portfolio: %s refused -- %s", cand.symbol, gate.reason)
+                continue
+
+            self.place(signal, sized.qty_notional, sized.reason, symbol=cand.symbol)
+            if cand.symbol in self.book and self.stream is not None:
+                self.stream.add_symbol(cand.symbol)
+            opened += 1
+
+        if opened:
+            log.info("portfolio: opened %d position(s), %d held",
+                     opened, len(self.book))
+        return opened
 
     def decide(self) -> None:
         if not self.bars:
@@ -1124,6 +1248,10 @@ class Engine:
 
         if self.check_target_reached():
             log.info("daily target already met; standing down until tomorrow")
+            return
+
+        if self.cfg.portfolio.enabled:
+            self.portfolio_cycle()
             return
 
         if self.active is not None:
@@ -1151,18 +1279,21 @@ class Engine:
         self.place(signal, sized.qty_notional, sized.reason)
 
     # ---------------------------------------------------------------- orders
-    def place(self, signal, notional: float, risk_note: str) -> None:
-        sized = self.rules.size_for_notional(notional, signal.entry)
+    def place(self, signal, notional: float, risk_note: str,
+              symbol: str | None = None) -> None:
+        symbol = symbol or self.cfg.symbol
+        rules = self.rules if symbol == self.cfg.symbol else self.rules_for(symbol)
+        sized = rules.size_for_notional(notional, signal.entry)
         if sized is None:
             log.warning("order failed filter checks at $%.2f notional", notional)
             return
         qty, price = sized
-        stop_price = self.rules.round_price(signal.stop)
-        tp_price = self.rules.round_price(signal.take_profit) if signal.take_profit else "0"
+        stop_price = rules.round_price(signal.stop)
+        tp_price = rules.round_price(signal.take_profit) if signal.take_profit else "0"
         exit_side = "SELL" if signal.side == "BUY" else "BUY"
 
         log.info("SIGNAL %s %s %s @ %s stop %s tp %s | %s | %s",
-                 signal.side, qty, self.cfg.symbol, price, stop_price, tp_price,
+                 signal.side, qty, symbol, price, stop_price, tp_price,
                  risk_note, signal.reason)
 
         if self.cfg.dry_run:
@@ -1178,8 +1309,9 @@ class Engine:
             # asked price is the same optimism, in the mode the README tells
             # you to live in for days -- and on a breakout strategy the entries
             # that actually fill are disproportionately the reversals. (QA R4)
-            self._dry_pending = ActivePosition(
-                symbol=self.cfg.symbol, side=signal.side, entry=float(price),
+            self._dry_pending = self._dry_pending or {}
+            self._dry_pending[symbol] = ActivePosition(
+                symbol=symbol, side=signal.side, entry=float(price),
                 stop=float(stop_price), take_profit=float(tp_price),
                 qty=float(qty), entry_order_id=tag, tag=tag)
             self._entry_placed_at = time.time()
@@ -1197,30 +1329,30 @@ class Engine:
         stop_id = client_order_id("s", self._seq)
         tp_id = client_order_id("t", self._seq)
 
-        entry = self.api.order(symbol=self.cfg.symbol, side=signal.side, type="LIMIT",
+        entry = self.api.order(symbol=symbol, side=signal.side, type="LIMIT",
                                timeInForce="GTC", quantity=qty, price=price,
                                newClientOrderId=entry_id)
         log.info("entry placed %s status=%s", entry_id, entry.get("status"))
 
         try:
-            self.api.order(symbol=self.cfg.symbol, side=exit_side, type="STOP_MARKET",
+            self.api.order(symbol=symbol, side=exit_side, type="STOP_MARKET",
                            stopPrice=stop_price, closePosition="true",
                            workingType="MARK_PRICE", newClientOrderId=stop_id)
             if signal.take_profit:
-                self.api.order(symbol=self.cfg.symbol, side=exit_side,
+                self.api.order(symbol=symbol, side=exit_side,
                                type="TAKE_PROFIT_MARKET", stopPrice=tp_price,
                                closePosition="true", workingType="MARK_PRICE",
                                newClientOrderId=tp_id)
         except BinanceError as e:
             log.critical("PROTECTIVE ORDER FAILED (%s) -- cancelling entry", e)
-            self.api.cancel_all(self.cfg.symbol)
-            self.state.halt(f"could not place protective stop: {e}")
+            self.api.cancel_all(symbol)
+            self.state.halt(f"could not place protective stop on {symbol}: {e}")
             self.notify.send(Event.HALT, f"Could not place a stop: {e}\n"
                                          "Entry cancelled, bot halted. Nothing is open.")
             return
 
-        self.active = ActivePosition(
-            symbol=self.cfg.symbol, side=signal.side, entry=float(price),
+        self.book[symbol] = ActivePosition(
+            symbol=symbol, side=signal.side, entry=float(price),
             stop=float(stop_price), take_profit=float(tp_price), qty=float(qty),
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
             tag=entry_id)
@@ -1232,6 +1364,6 @@ class Engine:
         prog = self.schedule.progress(self.state.realized_today)
         self.notify.send(
             Event.TRADE_OPEN,
-            f"{signal.side} {qty} {self.cfg.symbol} @ {price}\n"
+            f"{signal.side} {qty} {symbol} @ {price}\n"
             f"SL {stop_price}   TP {tp_price}\n{risk_note}\n"
             f"{signal.reason}\n{prog}")

@@ -48,6 +48,9 @@ class Candidate:
     min_notional: float
     score: float = 0.0
     rejected: str = ""
+    #: the bars fetched during scoring, reused for the entry decision rather
+    #: than re-requested -- 100 symbols is already 100 klines calls
+    bars: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -200,7 +203,7 @@ class Scanner:
                           quote_volume=row["quote_volume"],
                           efficiency=efficiency_ratio(bars, self.cfg.lookback),
                           atr_pct=realised_vol_pct(bars, 14),
-                          min_notional=min_notional)
+                          min_notional=min_notional, bars=bars)
             c = self.score(c, risk_budget_notional)
             (res.ranked if c.ok else res.rejected).append(c)
 

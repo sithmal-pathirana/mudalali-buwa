@@ -63,7 +63,8 @@ class RiskManager:
         return Decision(True)
 
     # ------------------------------------------------------- gate: this order
-    def size_position(self, equity: float, entry: float, stop: float, rules) -> Decision:
+    def size_position(self, equity: float, entry: float, stop: float, rules,
+                      risk_pct_override: float | None = None) -> Decision:
         """
         Position size follows from the stop distance, not from a fixed lot.
         Risk a fixed % of equity between entry and stop, then clamp by leverage.
@@ -74,7 +75,11 @@ class RiskManager:
         if stop_distance < 1e-6:
             return Decision(False, "stop distance is zero")
 
-        risk_usdt = equity * self.cfg.risk_per_trade_pct / 100.0
+        # In portfolio mode the allocator has already divided the budget by
+        # how many coins qualified, so it passes the per-position figure in.
+        risk_pct = (risk_pct_override if risk_pct_override is not None
+                    else self.cfg.risk_per_trade_pct)
+        risk_usdt = equity * risk_pct / 100.0
         notional_by_risk = risk_usdt / stop_distance
         notional_cap = equity * self.cfg.max_leverage * self.cfg.max_position_pct / 100.0
         notional = min(notional_by_risk, notional_cap)
@@ -86,7 +91,7 @@ class RiskManager:
                 f"correct size is ${notional:,.2f} but the cheapest legal order on "
                 f"{rules.symbol} is ${cheapest:,.2f}. Trading anyway would mean "
                 f"risking {cheapest * stop_distance / equity * 100:.1f}% of equity "
-                f"per trade instead of {self.cfg.risk_per_trade_pct:.1f}%. Skipping.")
+                f"per trade instead of {risk_pct:.2f}%. Skipping.")
 
         implied_leverage = notional / equity
         if implied_leverage > self.cfg.max_leverage + 1e-9:

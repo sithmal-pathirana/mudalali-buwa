@@ -98,6 +98,11 @@ def engine(api=None, dry_run=False, active=None, halted=False,
         {"stop_when_reached": True,
          "schedule": [{"from_day": 1, "usd_per_day": 2.0}]})
     e.schedule.start_date = st.day
+
+    # A real RiskManager, like the real State above: hand-rolled fakes had to
+    # grow a method every time the engine touched one.
+    from bot.risk import RiskManager
+    e.risk = RiskManager(e.cfg, st)
     e.equity = 5000.0
     e.last_price = 0.09
     e.events = __import__("collections").deque(maxlen=40)
