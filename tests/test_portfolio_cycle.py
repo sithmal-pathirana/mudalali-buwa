@@ -236,3 +236,58 @@ class TestPhase6Commands(unittest.TestCase):
         self.assertIn("book.length > 1", html)
         self.assertIn("total unrealised", html)
         self.assertIn("Close all ", html)
+
+
+class TestEverySymbolIsPrepared(unittest.TestCase):
+    """
+    Margin mode and leverage were set at startup for cfg.symbol alone, so every
+    scanner-opened symbol inherited the ACCOUNT DEFAULT -- typically cross
+    margin at 20x on Binance futures. Cross is the dangerous half: isolated
+    caps a position's loss at its own margin, cross lets one position reach the
+    whole balance and take the rest of the book with it.
+    """
+
+    def _prepared_for(self, api):
+        return {c[1] for c in api.calls if c[0] == "set_margin_type"}
+
+    def test_each_opened_symbol_gets_isolated_margin(self):
+        e = portfolio_engine(5)
+        Engine.portfolio_cycle(e)
+        prepared = self._prepared_for(e.api)
+        self.assertEqual(prepared, set(e.book),
+                         "some positions were opened on the account defaults")
+
+    def test_leverage_matches_the_configured_cap(self):
+        e = portfolio_engine(3)
+        Engine.portfolio_cycle(e)
+        levs = {c[2] for c in e.api.calls if c[0] == "set_leverage"}
+        self.assertEqual(levs, {e.cfg.risk.max_leverage})
+
+    def test_margin_type_is_isolated_not_cross(self):
+        e = portfolio_engine(3)
+        Engine.portfolio_cycle(e)
+        modes = {c[2] for c in e.api.calls if c[0] == "set_margin_type"}
+        self.assertEqual(modes, {"ISOLATED"})
+
+    def test_preparation_happens_once_per_symbol(self):
+        e = portfolio_engine(3)
+        Engine.portfolio_cycle(e)
+        first = len([c for c in e.api.calls if c[0] == "set_leverage"])
+        Engine.portfolio_cycle(e)
+        again = len([c for c in e.api.calls if c[0] == "set_leverage"])
+        self.assertEqual(first, again, "re-prepared symbols it already holds")
+
+    def test_a_symbol_that_cannot_be_prepared_is_not_traded(self):
+        """Better to skip it than trade it on whatever the account defaults to."""
+        from bot.binanceapi import BinanceError
+
+        e = portfolio_engine(3)
+        real = e.api.set_leverage
+
+        def refuse(symbol, leverage):
+            raise BinanceError(-4028, "leverage not modifiable", "/leverage")
+
+        e.api.set_leverage = refuse
+        Engine.portfolio_cycle(e)
+        self.assertEqual(e.book, {}, "traded a symbol it could not configure")
+        e.api.set_leverage = real

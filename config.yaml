@@ -4,6 +4,13 @@ mode: testnet          # testnet | live   (testnet uses fake money on real marke
 dry_run: true          # true = log intended orders, send nothing. Your first run.
 realtime: true         # websockets: 1 price/sec + real fills. false = REST polling.
 
+# The symbol traded when portfolio mode is OFF. When portfolio.enabled is
+# true this is NOT traded -- the scanner picks symbols and this one is only
+# used to warm up bars and filters at startup.
+#
+# BTCUSDT cannot be traded on a small account: its $50 minimum order exceeds
+# a $43 account's whole risk budget, so every signal is correctly refused.
+# Check yours with:  run.py doctor --equity 43
 symbol: BTCUSDT
 interval: 15m
 strategy: switcher     # switcher | trend_atr | mean_reversion | funding_arb

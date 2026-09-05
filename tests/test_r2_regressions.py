@@ -54,6 +54,14 @@ class StubAPI:
         self.calls.append(("usdt_equity", None))
         return 5000.0
 
+    def set_margin_type(self, symbol, margin_type="ISOLATED"):
+        self.calls.append(("set_margin_type", symbol, margin_type))
+        return {"msg": "ok"}
+
+    def set_leverage(self, symbol, leverage):
+        self.calls.append(("set_leverage", symbol, leverage))
+        return {"leverage": leverage}
+
     def cancel_all(self, symbol):
         self.calls.append(("cancel_all", symbol))
 

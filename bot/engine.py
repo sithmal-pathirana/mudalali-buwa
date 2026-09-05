@@ -69,6 +69,7 @@ class Engine:
     aggressive_profile = None
     _rules_cache: dict = None
     _exchange_info = None
+    _prepared: set = None
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -84,6 +85,7 @@ class Engine:
         #: case of this, so there is no parallel code for the two modes.
         self._book: dict[str, ActivePosition] = {}
         self._rules_cache: dict = {}
+        self._prepared: set = set()
         self._exchange_info = None
         self.scanner = None
         self.last_price = 0.0
@@ -155,6 +157,38 @@ class Engine:
             self.notify.clear_position_alerts(p.tag)
         if self.stream is not None and symbol != self.cfg.symbol:
             self.stream.remove_symbol(symbol)
+
+    def prepare_symbol(self, symbol: str) -> bool:
+        """
+        Set ISOLATED margin and the configured leverage before this symbol's
+        first order. Once per symbol, cached.
+
+        Margin mode and leverage were configured at startup for cfg.symbol
+        alone. Every scanner-opened symbol therefore inherited the ACCOUNT
+        DEFAULT -- on Binance futures typically cross margin at 20x. Cross is
+        the dangerous half: isolated caps a position's loss at its own margin,
+        while cross lets one bad position reach the whole balance and take the
+        rest of the book with it. That is the opposite of the per-position
+        risk model everything else here is built on.
+        """
+        if self._prepared is None:
+            self._prepared = set()
+        if symbol in self._prepared:
+            return True
+        try:
+            self.api.set_margin_type(symbol, "ISOLATED")
+            self.api.set_leverage(symbol, self.cfg.risk.max_leverage)
+        except (BinanceError, AttributeError) as e:
+            log.error("%s: could not set ISOLATED %dx (%s) -- refusing to trade "
+                      "it rather than inheriting the account default",
+                      symbol, self.cfg.risk.max_leverage, e)
+            self.notify.send(Event.ERROR,
+                             f"{symbol}: could not set isolated margin or "
+                             f"leverage ({e}). Skipping it.")
+            return False
+        self._prepared.add(symbol)
+        log.info("%s prepared: ISOLATED, %dx", symbol, self.cfg.risk.max_leverage)
+        return True
 
     def rules_for(self, symbol: str):
         """Per-symbol filters, cached. exchangeInfo is one request for all."""
@@ -1435,6 +1469,9 @@ class Engine:
                              f"{signal.side} {qty} @ {price}\nSL {stop_price}  TP {tp_price}\n"
                              f"{risk_note}")
             return
+
+        if not self.prepare_symbol(symbol):
+            return          # never trade a symbol on the account's defaults
 
         self._seq += 1
         entry_id = client_order_id("e", self._seq)
