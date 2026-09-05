@@ -38,7 +38,11 @@ class TestProfileApplication(unittest.TestCase):
         apply(cfg, PROFILES["high"])
         self.assertNotEqual(cfg.risk.max_leverage, before)
         self.assertEqual(cfg.risk.max_leverage, 20)
-        self.assertEqual(cfg.interval, "5m")
+        self.assertEqual(cfg.risk.risk_per_trade_pct, 4.0)
+        # Interval comes from the profile, whatever the measurement says it
+        # should be -- asserted against the profile rather than a literal, so
+        # this test does not have to be edited every time the data moves it.
+        self.assertEqual(cfg.interval, PROFILES["high"].interval)
 
     def test_loosens_trendiness_and_demands_movement(self):
         cfg = Config()
