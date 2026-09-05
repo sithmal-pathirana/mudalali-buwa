@@ -284,6 +284,11 @@ class Engine:
         """The settings that actually decide behaviour, for /config."""
         r = self.cfg.risk
         return {
+            # First line, because "my edit did not apply" is almost always the
+            # wrong file: setup.sh copies the clone over /opt/trading-bot, so
+            # editing the clone after install changes nothing until you re-run
+            # it, and editing /opt is undone by the next re-run.
+            "config file": self.cfg.config_path or "(defaults)",
             "mode": self.cfg.mode,
             "dry_run": self.cfg.dry_run,
             "symbol": self.cfg.symbol,
@@ -299,10 +304,21 @@ class Engine:
         }
 
     def _scan_summary(self) -> dict:
+        """
+        Three distinct states, previously collapsed into one unhelpful message:
+        portfolio off, portfolio on but nothing scanned yet, and a real result.
+        """
+        if not self.cfg.portfolio.enabled:
+            return {"state": "portfolio mode is off -- set portfolio.enabled: "
+                             "true in config.yaml and restart"}
         scanner = getattr(self, "scanner", None)
-        last = getattr(scanner, "last", None) if scanner else None
+        if scanner is None:
+            return {"state": "portfolio is on but the scanner did not start -- "
+                             "check the startup log"}
+        last = getattr(scanner, "last", None)
         if last is None:
-            return {}
+            return {"state": f"no scan yet; the first runs at startup and then "
+                             f"every {scanner.cfg.rescan_seconds // 60} min"}
         age = int(time.time() - last.scanned_at)
         return {
             "considered": last.considered,
@@ -598,6 +614,16 @@ class Engine:
             self.scanner = Scanner(self.api, ScanConfig(**(self.cfg.universe or {})))
             log.info("portfolio mode ON: scanning up to %d symbols every %ds",
                      self.scanner.cfg.max_symbols, self.scanner.cfg.rescan_seconds)
+            # Scan once now. Waiting for the first bar close meant /scan and the
+            # dashboard reported nothing for up to a full interval after start,
+            # which reads exactly like a broken scanner.
+            try:
+                budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
+                          / self.cfg.portfolio.stop_distance)
+                self.scanner.scan(risk_budget_notional=budget,
+                                  rules_for=self.rules_for)
+            except Exception as e:
+                log.warning("initial scan failed (%s); the loop will retry", e)
 
         if self.cfg.telegram.control and self.cfg.telegram_token and self.cfg.telegram_chat_id:
             self.telegram = TelegramControl(self.cfg.telegram_token,

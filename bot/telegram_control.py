@@ -260,7 +260,10 @@ class TelegramControl:
         s = self.read()
         scan = s.get("scan") or {}
         if not scan:
-            self.send("no scan yet -- the scanner may not be enabled")
+            self.send("no scan data published yet")
+            return
+        if scan.get("state"):
+            self.send(f"{s.get('mode_line','')}\n\n{scan['state']}")
             return
         lines = [s.get("mode_line", ""), "",
                  f"scanned {scan.get('considered', 0)}, "

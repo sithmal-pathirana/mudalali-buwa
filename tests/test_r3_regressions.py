@@ -306,3 +306,84 @@ class TestClockCheckCannotBreakTheLoop(unittest.TestCase):
         e.api = api
         e._last_reconcile = 0                # force the periodic body to run
         Engine.periodic(e)                   # must not raise
+
+
+class TestConfigAndScanDiagnostics(unittest.TestCase):
+    """
+    Reported: portfolio enabled in config.yaml, but /config said off and /scan
+    did nothing. The config parsed correctly -- the running bot had loaded a
+    different file, and neither command said which. /scan also could not
+    distinguish "off" from "on, waiting for the first bar close".
+    """
+
+    def _engine(self, cfg):
+        from bot.targets import TargetSchedule
+        e = object.__new__(Engine)
+        e.cfg = cfg
+        e.scanner = None
+        e.schedule = TargetSchedule.from_config(cfg.targets or {})
+        e.schedule.start_date = "2026-09-05"
+        return e
+
+    def _cfg(self, **kw):
+        from bot.config import Config, PortfolioConfig
+        c = Config(**kw)
+        if "portfolio" not in kw:
+            c.portfolio = PortfolioConfig()
+        return c
+
+    def test_config_names_the_file_it_loaded(self):
+        from bot.config import Config
+        cfg = Config.load()
+        summary = Engine._config_summary(self._engine(cfg))
+        self.assertIn("config file", summary)
+        self.assertTrue(summary["config file"].endswith(".yaml"))
+
+    def test_config_file_is_the_first_line(self):
+        """It is the answer to 'my edit did not apply', so it leads."""
+        from bot.config import Config
+        summary = Engine._config_summary(self._engine(Config.load()))
+        self.assertEqual(next(iter(summary)), "config file")
+
+    def test_portfolio_flag_is_reported_accurately(self):
+        from bot.config import PortfolioConfig
+        off = self._cfg(portfolio=PortfolioConfig(enabled=False))
+        on = self._cfg(portfolio=PortfolioConfig(enabled=True))
+        self.assertEqual(Engine._config_summary(self._engine(off))["portfolio"], "off")
+        self.assertEqual(Engine._config_summary(self._engine(on))["portfolio"], "on")
+
+    def test_scan_says_portfolio_is_off_rather_than_nothing(self):
+        from bot.config import PortfolioConfig
+        e = self._engine(self._cfg(portfolio=PortfolioConfig(enabled=False)))
+        state = Engine._scan_summary(e)["state"]
+        self.assertIn("portfolio mode is off", state)
+        self.assertIn("portfolio.enabled: true", state)
+
+    def test_scan_distinguishes_on_but_not_yet_scanned(self):
+        from bot.config import PortfolioConfig
+        e = self._engine(self._cfg(portfolio=PortfolioConfig(enabled=True)))
+        e.scanner = type("S", (), {"last": None,
+                                   "cfg": type("C", (), {"rescan_seconds": 300})()})()
+        state = Engine._scan_summary(e)["state"]
+        self.assertIn("no scan yet", state)
+        self.assertNotIn("off", state)
+
+    def test_a_real_result_carries_no_state_message(self):
+        from bot.config import PortfolioConfig
+        from bot.scanner import Candidate, ScanResult
+        e = self._engine(self._cfg(portfolio=PortfolioConfig(enabled=True)))
+        res = ScanResult(considered=100)
+        res.ranked = [Candidate("AUSDT", 1.0, 1e8, 0.5, 1.0, 5.0, score=0.9)]
+        e.scanner = type("S", (), {"last": res,
+                                   "cfg": type("C", (), {"rescan_seconds": 300})()})()
+        summary = Engine._scan_summary(e)
+        self.assertNotIn("state", summary)
+        self.assertEqual(summary["passed"], 1)
+
+    def test_startup_scans_once_immediately(self):
+        """Waiting for the first bar close looked exactly like a broken scanner."""
+        src = inspect.getsource(Engine.startup)
+        block = src.split("portfolio mode ON")[1][:800]
+        self.assertIn("self.scanner.scan(", block)
+        self.assertIn("initial scan failed", block,
+                      "a failed initial scan must not stop startup")
