@@ -53,10 +53,20 @@ class TestScoring(unittest.TestCase):
         self.assertTrue(self.s.score(cand(minn=5000.0), 0.0).ok)
 
     def test_volatility_has_diminishing_returns(self):
+        """
+        Concavity shows in equal ABSOLUTE steps. Comparing 1->2 against 2->4
+        tests equal ratios, and a log curve gives those roughly equal
+        increments by construction -- which says nothing about concavity.
+        """
         a = self.s.score(cand(atr=1.0), 100.0).score
         b = self.s.score(cand(atr=2.0), 100.0).score
-        c = self.s.score(cand(atr=4.0), 100.0).score
+        c = self.s.score(cand(atr=3.0), 100.0).score
         self.assertGreater(b - a, c - b, "ATR term is not concave")
+
+    def test_more_volatility_still_scores_higher(self):
+        """Concave, but still monotonic up to the hard ceiling."""
+        scores = [self.s.score(cand(atr=v), 100.0).score for v in (0.5, 1.0, 3.0, 8.0)]
+        self.assertEqual(scores, sorted(scores))
 
 
 class TestCapacity(unittest.TestCase):
