@@ -66,6 +66,9 @@ class Engine:
     position_amt = 0.0
     last_prices: dict = None
     scanner = None
+    equity = 0.0
+    actual_equity = 0.0
+    last_price = 0.0
     aggressive_profile = None
     _rules_cache: dict = None
     _exchange_info = None
@@ -190,6 +193,20 @@ class Engine:
         log.info("%s prepared: ISOLATED, %dx", symbol, self.cfg.risk.max_leverage)
         return True
 
+    def effective_equity(self, actual: float) -> float:
+        """
+        The equity every sizing and allocation decision uses.
+
+        With `risk.equity_cap_usdt` set, the bot behaves as though the account
+        held that much. It is the only honest way to rehearse a $100 account on
+        a testnet that hands you 5,000 -- otherwise position sizes, slot counts
+        and the minimum-order refusals all belong to an account you do not have.
+        """
+        cap = getattr(self.cfg.risk, "equity_cap_usdt", 0.0) or 0.0
+        if cap <= 0:
+            return actual
+        return min(actual, cap)
+
     def rules_for(self, symbol: str):
         """Per-symbol filters, cached. exchangeInfo is one request for all."""
         if symbol not in self._rules_cache:
@@ -234,7 +251,9 @@ class Engine:
         return {
             "symbol": self.cfg.symbol, "mode": self.cfg.mode,
             "strategy": self.strategy.name, "dry_run": self.cfg.dry_run,
-            "equity": self.equity, "price": self.last_price,
+            "equity": self.equity, "actual_equity": self.actual_equity,
+            "equity_capped": self.equity != self.actual_equity,
+            "price": self.last_price,
             "realized_today": self.state.realized_today,
             "day": prog.day, "target": prog.target, "target_pct": prog.pct,
             "target_reached": prog.reached,
@@ -294,6 +313,10 @@ class Engine:
             "symbol": self.cfg.symbol,
             "interval": self.cfg.interval,
             "strategy": self.cfg.strategy,
+            "equity used": (f"${self.equity:,.2f} (capped from "
+                            f"${self.actual_equity:,.2f})"
+                            if self.equity != self.actual_equity
+                            else f"${self.equity:,.2f}"),
             "max_leverage": f"{r.max_leverage}x",
             "risk_per_trade": f"{r.risk_per_trade_pct}%",
             "daily_loss_limit": f"{r.daily_loss_limit_pct}%",
@@ -603,7 +626,12 @@ class Engine:
             return False
 
         snap = reconcile(self.api, self.cfg.symbol)
-        self.equity = snap["equity"]
+        self.actual_equity = snap["equity"]
+        self.equity = self.effective_equity(snap["equity"])
+        if self.equity != self.actual_equity:
+            log.warning("equity capped at %.2f USDT for sizing "
+                        "(account actually holds %.2f)",
+                        self.equity, self.actual_equity)
 
         ok, note = self.strategy.feasible(self.equity, self.last_price, self.rules)
         log.info("feasibility: %s", note or "ok")
@@ -1149,7 +1177,8 @@ class Engine:
         self.resync_clock_if_due()
 
         snap = reconcile(self.api, self.cfg.symbol)
-        self.equity = snap["equity"]
+        self.actual_equity = snap["equity"]
+        self.equity = self.effective_equity(snap["equity"])
 
         if self.state.roll_day_if_needed(self.equity):
             self.schedule.start_date = self.state.schedule_start_date

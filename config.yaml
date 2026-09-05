@@ -31,6 +31,12 @@ risk:
   # Halting is separate and never does either: it stops new trades and leaves
   # everything open and monitored.
   kill_action: flatten
+  # Trade as if the account held this much, whatever the real balance is.
+  # 0 = use the real balance. Testnet hands you a large demo balance, which
+  # makes every position size, slot count and minimum-order refusal belong to
+  # an account you do not have. Set this to the capital you actually intend to
+  # fund so the rehearsal matches the performance.
+  equity_cap_usdt: 0.0
 
 # Daily profit targets. stop_when_reached is the real mechanism behind
 # "guarantee the profit": once the day's target is banked the bot stops

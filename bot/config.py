@@ -26,6 +26,11 @@ class RiskConfig:
     # position and its stop on the book. Doing neither -- cancelling the stop
     # and walking away -- is the one outcome to avoid. (QA R2)
     kill_action: str = "flatten"
+    #: Trade as if the account held this much, regardless of the real balance.
+    #: 0 disables it. Testnet hands out a large demo balance, which makes every
+    #: sizing decision unrepresentative of the account you actually intend to
+    #: fund -- and hides the minimum-order constraint entirely.
+    equity_cap_usdt: float = 0.0
 
 
 @dataclass

@@ -268,6 +268,7 @@ def cmd_report(cfg: Config, args) -> int:
     data["state"] = rp._local_state()
     data["log"] = rp._log_signals(args.days)
     data["mode"] = cfg.mode
+    data["dry_run"] = cfg.dry_run
     data["strategy"] = cfg.strategy
     data["interval"] = cfg.interval
 

@@ -97,8 +97,19 @@ def render(data: dict) -> str:
 
     add("=" * 68)
     add(f"  RUN REPORT   {sym}   last {days} days")
-    add(f"  generated {data['generated']}")
+    add(f"  generated {data['generated']}   mode {data.get('mode', '?')}")
     add("=" * 68)
+
+    # Dry run books simulated P&L into local state while sending nothing to the
+    # exchange. Without saying so, this report showed "+24.49" beside "0 fills"
+    # and read as though money had been made.
+    if data.get("dry_run"):
+        add("")
+        add("  *** DRY RUN -- NOTHING BELOW WAS SENT TO THE EXCHANGE ***")
+        add("  Exchange figures are all zero because no order was placed.")
+        add("  The BOT STATE section is SIMULATED: fills are modelled against")
+        add("  real tick prices, and its P&L is what the strategy WOULD have")
+        add("  made. It is not money, and the balance has not moved.")
 
     if data.get("errors"):
         add("\n  COULD NOT FETCH:")
@@ -196,12 +207,27 @@ def render(data: dict) -> str:
     # ---------------------------------------------------------- bot's own view
     st = data.get("state") or {}
     if st:
-        add("\n  BOT STATE (local)")
-        for k in ("day", "day_start_equity", "trades_today", "realized_today",
-                  "total_trades", "halted", "halt_reason", "schedule_start_date",
-                  "strategy_override", "target_reached_today"):
+        add("\n  BOT STATE (local, SIMULATED)" if data.get("dry_run")
+            else "\n  BOT STATE (local)")
+        labels = {
+            "trades_today": "entries submitted today",
+            "total_trades": "entries that filled",
+            "realized_today": "P&L today" + (" (SIMULATED)" if data.get("dry_run") else ""),
+            "day_start_equity": "equity at day start",
+            "target_reached_today": "daily target reached",
+        }
+        for k in ("day", "day_start_equity", "trades_today", "total_trades",
+                  "realized_today", "target_reached_today", "halted",
+                  "halt_reason", "schedule_start_date", "strategy_override"):
             if k in st and st[k] not in ("", None):
-                add(f"    {k:<24} {st[k]}")
+                v = st[k]
+                if isinstance(v, float):
+                    v = f"{v:+.4f}" if "realized" in k else f"{v:.2f}"
+                add(f"    {labels.get(k, k):<28} {v}")
+        add("")
+        add("    'entries submitted' counts orders placed; 'entries that filled'")
+        add("    counts the ones that became positions. They differ when a limit")
+        add("    entry expires unfilled, which is normal.")
 
     lg = data.get("log") or {}
     if lg.get("log_counts"):
@@ -216,6 +242,12 @@ def render(data: dict) -> str:
 
     # ---------------------------------------------------------- the check
     add("\n  " + "-" * 64)
+    if data.get("dry_run"):
+        add("  RECONCILIATION  skipped -- dry run places no orders, so the")
+        add("    exchange has nothing to compare against. Set dry_run: false")
+        add("    on testnet to get a real reconciliation.")
+        add("=" * 68)
+        return "\n".join(L)
     local_trades = st.get("total_trades")
     if local_trades is not None and trades:
         add(f"  RECONCILIATION  bot counted {local_trades} fills, "

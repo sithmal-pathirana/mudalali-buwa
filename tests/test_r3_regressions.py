@@ -481,3 +481,89 @@ class TestForcedScan(unittest.TestCase):
     def test_help_documents_both_forms(self):
         from bot.telegram_control import HELP
         self.assertIn("/scan now", HELP)
+
+
+class TestDryRunIsNeverPresentedAsReal(unittest.TestCase):
+    """
+    A live report showed "+24.49 realized_today" beside "0 fills, equity
+    unchanged". Both were correct -- dry run books simulated P&L locally and
+    sends nothing -- but the report never said so, and read as money made.
+    """
+
+    def _dry(self, **kw):
+        from bot import report as rp
+        data = {"symbol": "DOGEUSDT", "days": 1, "generated": "x", "equity": 5000.0,
+                "mode": "testnet", "dry_run": True,
+                "state": {"realized_today": 24.49, "trades_today": 10,
+                          "total_trades": 4}}
+        data.update(kw)
+        return rp.render(data)
+
+    def test_dry_run_is_announced_before_any_number(self):
+        out = self._dry()
+        self.assertIn("DRY RUN", out)
+        self.assertLess(out.index("DRY RUN"), out.index("EQUITY NOW"))
+
+    def test_local_pnl_is_labelled_simulated(self):
+        out = self._dry()
+        self.assertIn("SIMULATED", out)
+        self.assertIn("P&L today (SIMULATED)", out)
+
+    def test_it_says_the_balance_has_not_moved(self):
+        self.assertIn("has not moved", self._dry())
+
+    def test_reconciliation_is_skipped_with_a_reason(self):
+        out = self._dry()
+        self.assertIn("RECONCILIATION  skipped", out)
+        self.assertIn("dry_run: false", out)
+
+    def test_a_live_report_carries_no_simulated_labels(self):
+        from bot import report as rp
+        out = rp.render({"symbol": "X", "days": 1, "generated": "x",
+                         "equity": 100.0, "mode": "testnet", "dry_run": False,
+                         "state": {"total_trades": 0}})
+        self.assertNotIn("SIMULATED", out)
+        self.assertNotIn("DRY RUN", out)
+
+    def test_the_two_trade_counters_are_explained(self):
+        out = self._dry()
+        self.assertIn("entries submitted", out)
+        self.assertIn("entries that filled", out)
+
+
+class TestEquityCap(unittest.TestCase):
+    """
+    Testnet hands out 5,000 USDT. Sizing against it rehearses an account you do
+    not have, and hides the minimum-order constraint that governs a small one.
+    """
+
+    def _engine(self, cap):
+        from bot.config import Config, RiskConfig
+        e = object.__new__(Engine)
+        e.cfg = Config(risk=RiskConfig(equity_cap_usdt=cap))
+        return e
+
+    def test_zero_means_use_the_real_balance(self):
+        self.assertEqual(Engine.effective_equity(self._engine(0.0), 5000.0), 5000.0)
+
+    def test_a_cap_is_applied(self):
+        self.assertEqual(Engine.effective_equity(self._engine(100.0), 5000.0), 100.0)
+
+    def test_a_cap_never_inflates_a_smaller_balance(self):
+        """If the account really holds $43, the cap must not pretend it is $100."""
+        self.assertEqual(Engine.effective_equity(self._engine(100.0), 43.0), 43.0)
+
+    def test_the_cap_changes_position_sizing(self):
+        from bot.portfolio import allocate
+        big = allocate(5000.0, 100).notional_per_position
+        small = allocate(100.0, 100).notional_per_position
+        self.assertGreater(big, small * 10)
+
+    def test_config_reports_when_equity_is_capped(self):
+        src = inspect.getsource(Engine._config_summary)
+        self.assertIn("capped from", src)
+
+    def test_snapshot_exposes_both_figures(self):
+        src = inspect.getsource(Engine.snapshot)
+        self.assertIn('"actual_equity"', src)
+        self.assertIn('"equity_capped"', src)
