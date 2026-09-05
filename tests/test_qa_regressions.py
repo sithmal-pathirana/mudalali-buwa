@@ -555,3 +555,44 @@ class TestSymbolIsSingular(unittest.TestCase):
         self.assertIn("--equity", src)
         self.assertIn("equity_override", src)
         self.assertIn("PLANNING AGAINST", src)
+
+
+class TestDocumentedPathsMatchTheCode(unittest.TestCase):
+    """
+    The GitHub repo is `mudalali-buwa`, the working copy is `trading-bot`, and
+    the install path is `/opt/trading-bot`. Renaming the repo left the README
+    pointing at `/opt/mudalali-buwa/.venv`, which setup.sh never creates --
+    the kind of drift that sends you looking in the wrong directory at the
+    worst moment.
+    """
+
+    def setUp(self):
+        self.setup = (ROOT / "deploy" / "setup.sh").read_text()
+        self.unit = (ROOT / "deploy" / "trading-bot.service").read_text()
+        self.readme = (ROOT / "README.md").read_text()
+        import re
+        m = re.search(r"^APP_DIR=(\S+)", self.setup, re.M)
+        self.app_dir = m.group(1)
+
+    def test_install_path_is_fixed(self):
+        self.assertEqual(self.app_dir, "/opt/trading-bot")
+
+    def test_unit_agrees_with_setup(self):
+        for directive in ("WorkingDirectory=", "ExecStart="):
+            line = next(l for l in self.unit.splitlines() if l.startswith(directive))
+            self.assertIn(self.app_dir, line,
+                          f"{directive} disagrees with APP_DIR")
+
+    def test_no_doc_points_at_an_install_path_that_is_never_created(self):
+        import re
+        for name, text in (("README.md", self.readme),
+                           ("setup.sh", self.setup),
+                           ("trading-bot.service", self.unit)):
+            for path in re.findall(r"/opt/[\w.-]+", text):
+                self.assertTrue(path.startswith(self.app_dir),
+                                f"{name} references {path}, but the installer "
+                                f"only ever creates {self.app_dir}")
+
+    def test_setup_locates_its_source_without_naming_the_directory(self):
+        """So the checkout can be called anything."""
+        self.assertIn('dirname "$0"', self.setup)

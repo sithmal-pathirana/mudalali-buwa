@@ -177,12 +177,18 @@ scp -r mudalali-buwa ubuntu@<ip>:~/
 ssh ubuntu@<ip> 'bash ~/mudalali-buwa/deploy/setup.sh'
 ```
 
+**The repository name does not affect anything after this point.** `setup.sh`
+finds its own source with `$(dirname $0)/..`, so the checkout can be called
+anything, and it always installs to **`/opt/trading-bot`** with the service
+registered as **`trading-bot`**. Every `systemctl` and `/opt` path in these
+docs is therefore correct whatever you named the clone.
+
 Installs `chrony` (signed requests fail on clock drift), creates a locked-down
 service user, and installs a hardened `systemd` unit — strict filesystem, syscall
 filter, no new privileges, capped at 1 GB and 50% of one core so it stays a good
 neighbour on a shared box. The firewall step is **additive** and never resets
 existing rules. Pass `--no-firewall` to skip it, or `--venv` to install into
-`/opt/mudalali-buwa/.venv` instead of system-wide.
+`/opt/trading-bot/.venv` instead of system-wide.
 
 See [deploy/oracle-notes.md](deploy/oracle-notes.md) — in particular that Oracle
 reclaims idle Always Free instances, and a bot waiting on bar closes looks idle.

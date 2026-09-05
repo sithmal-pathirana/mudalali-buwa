@@ -2,8 +2,13 @@
 # Provision an Oracle Cloud Always Free Ampere A1 instance to run the bot.
 # Tested target: Ubuntu 22.04/24.04 aarch64, 2 OCPU / 12 GB.
 #
-#   scp -r trading-bot ubuntu@<ip>:~/
-#   ssh ubuntu@<ip> 'bash ~/trading-bot/deploy/setup.sh'
+#   scp -r <checkout> ubuntu@<ip>:~/
+#   ssh ubuntu@<ip> 'bash ~/<checkout>/deploy/setup.sh'
+#
+# The checkout directory can be called anything -- the repo is mudalali-buwa,
+# the working copy here is trading-bot. This script locates its own source
+# relative to itself and always installs to $APP_DIR below, so the service
+# name and every /opt path stay fixed regardless.
 #
 # Pass --venv to install into /opt/trading-bot/.venv instead of system-wide.
 # You almost certainly do not need it: the bot has two dependencies and both
