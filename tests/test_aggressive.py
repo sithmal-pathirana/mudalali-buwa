@@ -120,3 +120,30 @@ class TestNonNegotiables(unittest.TestCase):
     def test_momentum_burst_is_not_routed_by_the_switcher(self):
         from bot.strategies.switcher import RegimeSwitcher
         self.assertNotIn("momentum_burst", str(RegimeSwitcher().routes))
+
+
+class TestProfilesFollowTheMeasurement(unittest.TestCase):
+    """
+    The 5m default was a guess ('faster is more aggressive') and the data
+    contradicted it: momentum_burst is -1.42 $/day out-of-sample on 5m and
+    +0.27 on 15m. Profiles must not drift back to the intuition.
+    """
+
+    def test_no_profile_uses_a_sub_15m_interval(self):
+        for name, prof in PROFILES.items():
+            self.assertIn(prof.interval, ("15m", "1h"),
+                          f"{name} uses {prof.interval}, which measured negative")
+
+    def test_aggression_comes_from_size_not_speed(self):
+        levs = [PROFILES[n].leverage for n in ("moderate", "high", "maximum")]
+        self.assertEqual(levs, sorted(levs))
+        intervals = {PROFILES[n].interval for n in PROFILES}
+        self.assertEqual(len(intervals), 1,
+                         "profiles differ by timeframe rather than by size")
+
+    def test_the_measurement_is_recorded_next_to_the_choice(self):
+        import inspect
+        from bot import aggressive
+        src = inspect.getsource(aggressive)
+        self.assertIn("out-of-sample", src)
+        self.assertIn("-1.4202", src, "the losing 5m number is not recorded")

@@ -31,7 +31,7 @@ from bot.strategies.base import Bar                  # noqa: E402
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "BNBUSDT"]
 INTERVALS = ["15m", "1h", "4h"]
 MINUTES = {"15m": 15, "1h": 60, "4h": 240}
-CONTENDERS = ["trend_atr", "mean_reversion", "switcher"]
+CONTENDERS = ["trend_atr", "mean_reversion", "switcher", "momentum_burst"]
 BARS = 1500
 
 
@@ -64,7 +64,7 @@ def measure(api, info, cfg, equity, which):
             days = len(bars) / (1440 / MINUTES[iv])
             mn = rules.min_affordable_notional(bars[-1].close)
             for name in CONTENDERS:
-                strat = build(name, cfg.params if name == "trend_atr" else {})
+                strat = build(name, cfg.params if name == cfg.strategy else {})
                 res = bt.run(bars, strat, equity=equity,
                              risk_pct=cfg.risk.risk_per_trade_pct,
                              max_leverage=cfg.risk.max_leverage, min_notional=mn)
@@ -107,11 +107,21 @@ def main(equity: float = 43.0) -> int:
     print(f"  trend_atr out-of-sample {tr_out:+.4f} $/day")
     print()
     if sw_out > 0 and sw_out > tr_out:
-        decay = (1 - sw_out / sw_in) * 100 if sw_in else 0
-        print(f"  HOLDS. Still positive and still beating its component on data the")
-        print(f"  rule never saw. Performance decayed {decay:.0f}% from in-sample,")
-        print(f"  which is normal and healthy -- a rule that does NOT decay is")
-        print(f"  usually a sign the two windows overlap. Worth testnet.")
+        print("  HOLDS. Still positive and still beating its component on data")
+        print("  the rule never saw.")
+        # A ratio is only meaningful when both windows share a sign; across a
+        # sign change "decayed 115%" is arithmetic noise, not a finding.
+        if sw_in > 0:
+            print(f"  Decayed {(1 - sw_out / sw_in) * 100:.0f}% from in-sample, "
+                  f"which is normal and healthy --")
+            print("  a rule that does NOT decay usually means the windows overlap.")
+        else:
+            print(f"  In-sample was NEGATIVE ({sw_in:+.4f}) and out-of-sample is "
+                  f"positive ({sw_out:+.4f}).")
+            print("  That is a sign flip, not decay, and it is a warning rather than")
+            print("  a triumph: it means the result is unstable across windows and")
+            print("  neither number should be trusted yet. Re-run on more windows.")
+        print("  Worth testnet, not worth conviction.")
     elif sw_out > tr_out:
         print("  PARTIAL. Still beats its component out-of-sample but is not")
         print("  positive. The gating helps; the underlying signal does not clear")

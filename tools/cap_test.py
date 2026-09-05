@@ -63,7 +63,7 @@ def main(equity: float = 43.0, target: float = 2.0) -> int:
 
             row = []
             for cap in (0.0, target):
-                strat = build(cfg.strategy, cfg.params if cfg.strategy == "trend_atr" else {})
+                strat = build(cfg.strategy, cfg.params if cfg.strategy == cfg.strategy else {})
                 res = bt.run(bars, strat, equity=equity,
                              risk_pct=cfg.risk.risk_per_trade_pct,
                              max_leverage=cfg.risk.max_leverage,

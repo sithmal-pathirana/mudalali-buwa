@@ -70,7 +70,7 @@ def main(equity: float = 43.0) -> int:
                     labels.append(det.update(bars[:i + 1]).regime.value)
 
             for name in ("trend_atr", "mean_reversion"):
-                strat = build(name, cfg.params if name == "trend_atr" else {})
+                strat = build(name, cfg.params if name == cfg.strategy else {})
                 res = bt.run(bars, strat, equity=equity,
                              risk_pct=cfg.risk.risk_per_trade_pct,
                              max_leverage=cfg.risk.max_leverage, min_notional=mn)

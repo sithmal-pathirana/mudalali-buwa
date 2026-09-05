@@ -48,10 +48,22 @@ class Profile:
                 f"{self.portfolio_risk_pct:.0f}% portfolio, {self.interval} bars")
 
 
+# The interval is 15m in every profile, and that is a measured choice rather
+# than a preference. momentum_burst on 5m -- the "faster is more aggressive"
+# intuition -- is badly negative; on 15m it is the only strategy in this
+# repository positive in BOTH windows:
+#
+#   interval   in-sample   out-of-sample   OOS cells positive
+#   5m          -0.5204        -1.4202            14%
+#   15m         +0.1291        +0.2709            86%
+#   1h          -0.0743        +0.0602            71%
+#
+# Aggressive means bigger and more concurrent, not shorter bars. Shortening
+# the timeframe only bought more fees against more noise.
 PROFILES = {
-    "moderate": Profile("moderate", 10, 2.0, 20.0, "5m", 300, 6, 2.0, 12),
-    "high":     Profile("high",     20, 4.0, 30.0, "5m", 300, 12, 1.5, 8),
-    "maximum":  Profile("maximum",  50, 8.0, 50.0, "1m", 180, 20, 1.0, 5),
+    "moderate": Profile("moderate", 10, 2.0, 20.0, "15m", 300, 6, 2.0, 12),
+    "high":     Profile("high",     20, 4.0, 30.0, "15m", 300, 12, 1.5, 8),
+    "maximum":  Profile("maximum",  50, 8.0, 50.0, "15m", 180, 20, 1.0, 5),
 }
 
 

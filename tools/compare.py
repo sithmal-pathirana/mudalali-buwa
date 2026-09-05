@@ -27,7 +27,7 @@ from bot.strategies.base import Bar                  # noqa: E402
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "BNBUSDT"]
 INTERVALS = ["15m", "1h", "4h"]
 MINUTES = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
-CONTENDERS = ["trend_atr", "mean_reversion", "switcher"]
+CONTENDERS = ["trend_atr", "mean_reversion", "switcher", "momentum_burst"]
 
 
 def main(equity: float = 43.0) -> int:
@@ -66,7 +66,7 @@ def main(equity: float = 43.0) -> int:
 
             row = []
             for name in CONTENDERS:
-                strat = build(name, cfg.params if name == "trend_atr" else {})
+                strat = build(name, cfg.params if name == cfg.strategy else {})
                 res = bt.run(bars, strat, equity=equity,
                              risk_pct=cfg.risk.risk_per_trade_pct,
                              max_leverage=cfg.risk.max_leverage,
