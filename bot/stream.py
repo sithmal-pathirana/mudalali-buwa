@@ -90,11 +90,30 @@ class StreamStale:
 
 
 class MarketStream:
-    """Start with .start(), read with .get(timeout=...), stop with .stop()."""
+    """
+    One connection, many symbols.
 
-    def __init__(self, symbol: str, interval: str, api=None, testnet: bool = True):
-        self.symbol = symbol.lower()
+    Binance combined streams carry any number of subscriptions on a single
+    socket, and SUBSCRIBE / UNSUBSCRIBE frames change them in place. That
+    matters here: positions open and close continuously, and reconnecting the
+    whole socket each time would drop ticks for every OTHER held symbol during
+    the handshake.
+
+    Accepts a single symbol or a list, so the single-position path is just the
+    one-element case rather than a separate code path.
+    """
+
+    def __init__(self, symbol, interval: str, api=None, testnet: bool = True):
+        if isinstance(symbol, str):
+            symbols = [symbol]
+        else:
+            symbols = list(symbol)
+        self.symbols = [s.lower() for s in symbols]
+        self.symbol = self.symbols[0] if self.symbols else ""
         self.interval = interval
+        self._sub_id = 0
+        self._ws = None
+        self._event_loop = None
         self.api = api
         import os
         self.base = (os.environ.get("BINANCE_TESTNET_WS", WS_TESTNET)
@@ -158,11 +177,55 @@ class MarketStream:
                 return out
 
     # --------------------------------------------------------------- thread
+    def _streams_for(self, sym: str) -> list[str]:
+        return [f"{sym}@markPrice@1s", f"{sym}@kline_{self.interval}"]
+
     def _url(self) -> str:
-        streams = [f"{self.symbol}@markPrice@1s", f"{self.symbol}@kline_{self.interval}"]
+        streams: list[str] = []
+        for sym in self.symbols:
+            streams.extend(self._streams_for(sym))
         if self._listen_key:
             streams.append(self._listen_key)
+        if not streams:
+            # An empty combined stream is rejected; subscribe to a heartbeat
+            # until the first symbol arrives.
+            streams = ["btcusdt@markPrice@1s"]
         return f"{self.base}/stream?streams={'/'.join(streams)}"
+
+    # ------------------------------------------------------ subscriptions
+    def add_symbol(self, symbol: str) -> None:
+        """Subscribe without disturbing the symbols already streaming."""
+        sym = symbol.lower()
+        if sym in self.symbols:
+            return
+        self.symbols.append(sym)
+        self._send_sub("SUBSCRIBE", self._streams_for(sym))
+        log.info("stream: subscribed %s (%d total)", symbol, len(self.symbols))
+
+    def remove_symbol(self, symbol: str) -> None:
+        sym = symbol.lower()
+        if sym not in self.symbols:
+            return
+        self.symbols.remove(sym)
+        self._send_sub("UNSUBSCRIBE", self._streams_for(sym))
+        log.info("stream: unsubscribed %s (%d total)", symbol, len(self.symbols))
+
+    def _send_sub(self, method: str, params: list[str]) -> None:
+        """
+        Fire a subscription frame onto the stream thread's own event loop.
+
+        If the socket is not up, nothing is sent and nothing breaks -- the next
+        reconnect builds its URL from self.symbols, which is already updated.
+        """
+        ws, loop = self._ws, self._event_loop
+        if ws is None or loop is None or loop.is_closed():
+            return
+        self._sub_id += 1
+        payload = json.dumps({"method": method, "params": params, "id": self._sub_id})
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(payload), loop)
+        except Exception as e:
+            log.warning("stream: %s failed (%s); will apply on reconnect", method, e)
 
     def _run(self) -> None:
         asyncio.run(self._loop())
@@ -173,7 +236,12 @@ class MarketStream:
             try:
                 async with websockets.connect(self._url(), ping_interval=20,
                                               ping_timeout=20, close_timeout=5) as ws:
-                    log.info("websocket connected: %s", self.symbol.upper())
+                    self._ws = ws
+                    self._event_loop = asyncio.get_running_loop()
+                    log.info("websocket connected: %d symbol(s) [%s]",
+                             len(self.symbols),
+                             ", ".join(s.upper() for s in self.symbols[:6])
+                             + (" ..." if len(self.symbols) > 6 else ""))
                     self.connected.set()
                     backoff = 1
                     self._last_message = time.time()
@@ -195,6 +263,7 @@ class MarketStream:
                 break
             except Exception as e:
                 self.connected.clear()
+                self._ws = None
                 self._put(Disconnected(str(e)))
                 log.warning("websocket dropped (%s); reconnecting in %ds", e, backoff)
                 await asyncio.sleep(backoff)
@@ -225,6 +294,8 @@ class MarketStream:
                 pass
 
     def _dispatch(self, msg: dict) -> None:
+        if "result" in msg and "id" in msg:
+            return                       # SUBSCRIBE/UNSUBSCRIBE acknowledgement
         data = msg.get("data", msg)
         etype = data.get("e")
 

@@ -61,8 +61,8 @@ class Engine:
     _stopping = False
     _stop_reason = ""
     _seq = 0
-    active = None
     position_amt = 0.0
+    last_prices: dict = None
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -74,7 +74,9 @@ class Engine:
         self.schedule = TargetSchedule.from_config(cfg.targets)
         self.rules: SymbolRules | None = None
         self.stream: MarketStream | None = None
-        self.active: ActivePosition | None = None
+        #: symbol -> ActivePosition. The single-position path is the one-entry
+        #: case of this, so there is no parallel code for the two modes.
+        self._book: dict[str, ActivePosition] = {}
         self.last_price = 0.0
         self.equity = 0.0
         self.bars: list[Bar] = []
@@ -85,6 +87,7 @@ class Engine:
         self._last_guard = 0.0
         self.events: deque = deque(maxlen=40)
         self.position_amt = 0.0
+        self.last_prices: dict[str, float] = {}
         self._entry_placed_at = 0.0
         self._dry_pending: ActivePosition | None = None
         self._flat_reconciles = 0
@@ -96,6 +99,52 @@ class Engine:
         self.notify.context = self.mode_line
 
     # ------------------------------------------------------------ dashboard
+    # ------------------------------------------------------------- the book
+    #: A mutable class attribute would be SHARED by every Engine built with
+    #: object.__new__, so the default is a sentinel and the property
+    #: materialises a per-instance dict on first use.
+    _book: dict | None = None
+
+    @property
+    def book(self) -> dict:
+        if self._book is None:
+            self._book = {}
+        return self._book
+
+    @book.setter
+    def book(self, value: dict) -> None:
+        self._book = dict(value or {})
+
+    @property
+    def active(self) -> "ActivePosition | None":
+        """
+        The single open position, or None.
+
+        Kept as a view over the book so every existing call site and test goes
+        on working untouched while the book is the real storage underneath.
+        With more than one position open it returns the first, which only
+        happens in portfolio mode where callers use the book directly.
+        """
+        return next(iter(self.book.values()), None)
+
+    @active.setter
+    def active(self, position) -> None:
+        if position is None:
+            self.book = {}
+        else:
+            self.book = {position.symbol: position}
+
+    def position_for(self, symbol: str) -> "ActivePosition | None":
+        return self.book.get(symbol)
+
+    def release(self, symbol: str) -> None:
+        """Forget ONE position and free its slot. Never touches the others."""
+        p = self.book.pop(symbol, None)
+        if p is not None:
+            self.notify.clear_position_alerts(p.tag)
+        if self.stream is not None and symbol != self.cfg.symbol:
+            self.stream.remove_symbol(symbol)
+
     def mode_line(self) -> str:
         """
         One line naming what is running: risk profile, strategy, and how the
@@ -128,9 +177,10 @@ class Engine:
             pos = {
                 "side": p.side, "qty": p.qty, "entry": p.entry,
                 "stop": p.stop, "take_profit": p.take_profit,
-                "unrealized": p.unrealized(self.last_price) if self.last_price else 0.0,
-                "to_tp": p.progress_to_tp(self.last_price) if self.last_price else 0.0,
-                "to_sl": p.progress_to_stop(self.last_price) if self.last_price else 0.0,
+                "price": (self.last_prices or {}).get(sym, self.last_price),
+                "unrealized": p.unrealized(px) if px else 0.0,
+                "to_tp": p.progress_to_tp(px) if px else 0.0,
+                "to_sl": p.progress_to_stop(px) if px else 0.0,
             }
         return {
             "symbol": self.cfg.symbol, "mode": self.cfg.mode,
@@ -159,20 +209,22 @@ class Engine:
         surfaces need no special case once portfolio mode lands."""
         book = []
         for sym, p in self._positions().items():
+            # Each position is valued at ITS OWN last price, not a single
+            # global one -- with several symbols open, one shared price would
+            # report every position's P&L against the wrong market.
+            px = (self.last_prices or {}).get(sym, 0.0)
             book.append({
                 "symbol": sym, "side": p.side, "qty": p.qty, "entry": p.entry,
                 "stop": p.stop, "take_profit": p.take_profit,
-                "unrealized": p.unrealized(self.last_price) if self.last_price else 0.0,
-                "to_tp": p.progress_to_tp(self.last_price) if self.last_price else 0.0,
-                "to_sl": p.progress_to_stop(self.last_price) if self.last_price else 0.0,
+                "price": (self.last_prices or {}).get(sym, self.last_price),
+                "unrealized": p.unrealized(px) if px else 0.0,
+                "to_tp": p.progress_to_tp(px) if px else 0.0,
+                "to_sl": p.progress_to_stop(px) if px else 0.0,
             })
         return book
 
     def _positions(self) -> dict:
-        """Single position today, a keyed book once portfolio mode lands."""
-        if isinstance(self.active, dict):
-            return self.active
-        return {self.cfg.symbol: self.active} if self.active else {}
+        return self.book
 
     def _config_summary(self) -> dict:
         """The settings that actually decide behaviour, for /config."""
@@ -287,24 +339,53 @@ class Engine:
                          + (f"\n\nCurrent market reading: {reading}" if reading else ""))
         return result
 
-    def close_position(self, reason: str) -> None:
+    def close_all(self, reason: str) -> int:
+        """
+        Flatten every open position, one at a time.
+
+        Sequential and individually reported on purpose: if the third close
+        fails, the first two are already flat and the remaining ones still
+        hold their exchange-side stops. A batch that aborts halfway must never
+        leave a position unprotected.
+        """
+        symbols = list(self.book) or [self.cfg.symbol]
+        closed, failed = 0, []
+        for sym in symbols:
+            try:
+                self.close_position(reason, symbol=sym)
+                closed += 1
+            except Exception as e:
+                failed.append(f"{sym}: {e}")
+                log.exception("close_all: %s failed", sym)
+        if failed:
+            self.notify.send(Event.ERROR,
+                             f"close_all ({reason}): {closed} closed, "
+                             f"{len(failed)} FAILED\n" + "\n".join(failed)
+                             + "\nThe failures still hold their stops.")
+        else:
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"closed {closed} position(s): {reason}")
+        return closed
+
+    def close_position(self, reason: str, symbol: str | None = None) -> None:
         """Cancel resting orders, then flatten with a reduce-only market order."""
+        symbol = symbol or (self.active.symbol if self.active else self.cfg.symbol)
         if self.cfg.dry_run:
-            log.info("dry_run: would close position (%s)", reason)
-            self.notify.send(Event.SL_HIT, f"DRY RUN -- would close: {reason}")
-            self.active = None
+            log.info("dry_run: would close %s (%s)", symbol, reason)
+            self.notify.send(Event.SL_HIT, f"DRY RUN -- would close {symbol}: {reason}")
+            self.release(symbol)
             return
         try:
-            live = self.api.positions(self.cfg.symbol)
+            live = self.api.positions(symbol)
         except BinanceError as e:
             log.error("could not read position to close: %s", e)
             self.notify.send(Event.ERROR, f"Close failed reading position: {e}")
             return
 
         if not live:
-            log.info("close requested but the account is already flat")
-            self.notify.send(Event.DAILY_SUMMARY, "Close requested; already flat.")
-            self.active = None
+            log.info("close requested but %s is already flat", symbol)
+            self.notify.send(Event.DAILY_SUMMARY, f"Close requested; {symbol} already flat.")
+            self.release(symbol)
             return
 
         amt = float(live[0]["positionAmt"])
@@ -324,7 +405,7 @@ class Engine:
         # cannot conflict with a stop that fires concurrently. (QA R2)
         try:
             self._seq += 1
-            self.api.order(symbol=self.cfg.symbol, side=side, type="MARKET",
+            self.api.order(symbol=symbol, side=side, type="MARKET",
                            quantity=qty, reduceOnly="true",
                            newClientOrderId=client_order_id("x", self._seq))
             log.info("flattened %s %s (%s)", side, qty, reason)
@@ -336,14 +417,16 @@ class Engine:
             return
 
         try:
-            self.api.cancel_all(self.cfg.symbol)
+            self.api.cancel_all(symbol)
         except BinanceError as e:
             log.error("close succeeded but cancelling leftovers failed: %s", e)
         self.notify.send(Event.SL_HIT,
-                         f"Position closed manually: {side} {qty} at market.\n{reason}")
-        if self.active is not None:
-            self.notify.clear_position_alerts(self.active.tag)
-        self.active = None
+                         f"{symbol} closed: {side} {qty} at market.\n{reason}")
+        # release(symbol), NEVER `self.active = None`. The latter goes through
+        # the property setter, which replaces the whole book -- so closing one
+        # of twenty-five positions would drop tracking for the other
+        # twenty-four while they were still open on the exchange.
+        self.release(symbol)
 
     # ------------------------------------------------------------------ boot
     def startup(self) -> bool:
@@ -689,13 +772,20 @@ class Engine:
 
     def on_tick(self, tick: Tick) -> None:
         self.last_price = tick.mark_price
+        if self.last_prices is None:
+            self.last_prices = {}
+        self.last_prices[tick.symbol] = tick.mark_price
         self._tick_guard()
         if self.cfg.dry_run:
             self.simulate_entry(tick.mark_price)
-        if self.active is None:
+
+        # Route to the position for THIS symbol; a tick for a symbol we do not
+        # hold is still useful for the price cache and nothing else.
+        pos = self.book.get(tick.symbol)
+        if pos is None:
             return
         threshold = self.cfg.alerts.approach_pct / 100.0
-        pos, price = self.active, tick.mark_price
+        price = tick.mark_price
 
         to_tp = pos.progress_to_tp(price)
         if to_tp >= threshold:
