@@ -131,7 +131,8 @@ class Notifier:
         return out or ["none configured (log only)"]
 
     # ------------------------------------------------------------------ send
-    def send(self, event: Event, body: str, dedupe_key: str | None = None) -> None:
+    def send(self, event: Event, body: str, dedupe_key: str | None = None,
+             symbol: str | None = None) -> None:
         """
         dedupe_key suppresses repeats: pass something that identifies the
         *state*, e.g. "approach_sl:<order id>", so a 90%-of-the-way-to-stop
@@ -154,7 +155,10 @@ class Notifier:
                 tag = self.context() or ""
             except Exception:
                 tag = ""
-        subject = (f"{ICON.get(event, '[ ? ]')} {self.symbol} {event.value}"
+        # Name the symbol this event is ABOUT. Defaulting to the configured
+        # symbol meant every alert in portfolio mode was titled DOGEUSDT --
+        # including "would close COLLECTUSDT".
+        subject = (f"{ICON.get(event, '[ ? ]')} {symbol or self.symbol} {event.value}"
                    + (f"\n{tag}" if tag else ""))
         log.info("ALERT %s | %s", subject, body.replace("\n", " | "))
 

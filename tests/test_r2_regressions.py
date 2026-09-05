@@ -126,7 +126,9 @@ def engine(api=None, dry_run=False, active=None, halted=False,
     e.last_price = 0.09
     e.events = __import__("collections").deque(maxlen=40)
     e.notify = type("N", (), {
-        "send": lambda s, ev, body, dedupe_key=None: e.sent.append((ev, body)),
+        # **kw so the stub survives new keyword arguments on the real
+        # signature (symbol=, added when alerts had to name their own symbol).
+        "send": lambda s, ev, body, **kw: e.sent.append((ev, body)),
         "clear_position_alerts": lambda s, tag: None})()
     e.stream = None
     e.dashboard = None
@@ -251,20 +253,30 @@ class TestR4DryRunFills(unittest.TestCase):
         self.assertIsNotNone(e._dry_pending)
 
     def test_entry_fills_only_when_price_reaches_it(self):
+        """
+        Ticks are now symbol-scoped: simulate_entry resolves only the symbol
+        that ticked, and refuses to price one symbol with another's tick.
+        """
         e = self._dry()
+        sym = e.cfg.symbol
         e.place(Signal("BUY", entry=0.09, stop=0.0882, take_profit=0.0954), 20.0, "n")
-        e.simulate_entry(0.0925)            # above a BUY limit: no fill
+        e.last_prices = {sym: 0.0925}
+        e.simulate_entry(0.0925, sym)       # above a BUY limit: no fill
         self.assertIsNone(e.active)
-        e.simulate_entry(0.0899)            # trades through: fills
+        e.last_prices[sym] = 0.0899
+        e.simulate_entry(0.0899, sym)       # trades through: fills
         self.assertIsNotNone(e.active)
 
     def test_short_entry_fills_on_the_other_side(self):
         e = self._dry()
+        sym = e.cfg.symbol
         e.rules.size_for_notional = lambda n, p: ("100", "0.090000")
         e.place(Signal("SELL", entry=0.09, stop=0.0918, take_profit=0.0846), 20.0, "n")
-        e.simulate_entry(0.0880)
+        e.last_prices = {sym: 0.0880}
+        e.simulate_entry(0.0880, sym)
         self.assertIsNone(e.active)
-        e.simulate_entry(0.0901)
+        e.last_prices[sym] = 0.0901
+        e.simulate_entry(0.0901, sym)
         self.assertIsNotNone(e.active)
 
 

@@ -239,12 +239,22 @@ class TelegramControl:
         total = 0.0
         for p in book:
             total += p.get("unrealized", 0.0)
+            # Each position's OWN price. Using the snapshot's global price
+            # showed every symbol quoted at the configured symbol's market --
+            # "LIGHTUSDT entry 0.1969 now 0.0860" was DOGEUSDT's price.
+            px = p.get("price") or 0.0
+            now = f"{px:,.4f}" if px else "waiting for first tick"
             lines.append(
                 f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}"
-                f"\n  entry {p['entry']:,.4f}  now {s.get('price', 0):,.4f}"
+                f"\n  entry {p['entry']:,.4f}  now {now}"
                 f"\n  unrealised {p['unrealized']:+.2f}"
                 f"\n  TP {p['to_tp']*100:.0f}%  SL {p['to_sl']*100:.0f}%")
         lines.append(f"\ntotal unrealised {total:+.2f} USDT")
+        pending = s.get("pending") or []
+        if pending:
+            lines.append(f"\n{len(pending)} entry order(s) resting, not filled:")
+            for q in pending:
+                lines.append(f"  {q['symbol']}  {q['side']} @ {q['entry']:,.6f}")
         self.send("\n".join(lines))
 
     def _send_config(self) -> None:

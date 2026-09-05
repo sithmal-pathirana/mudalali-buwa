@@ -567,3 +567,100 @@ class TestEquityCap(unittest.TestCase):
         src = inspect.getsource(Engine.snapshot)
         self.assertIn('"actual_equity"', src)
         self.assertIn('"equity_capped"', src)
+
+
+class TestCrossSymbolContamination(unittest.TestCase):
+    """
+    Observed live: COLLECTUSDT and LIGHTUSDT "filled" and were quoted at
+    DOGEUSDT's price. simulate_entry iterated every resting entry and fell back
+    to the caller's tick price, so a DOGEUSDT tick at 0.0860 satisfied a
+    COLLECTUSDT limit resting at 0.0890 -- a fill against a market it has
+    nothing to do with.
+    """
+
+    def _engine(self):
+        from bot.positions import ActivePosition
+        e = held([])
+        e.cfg.dry_run = True
+        e.risk = type("R", (), {"record_fill": lambda s, p=0.0: None})()
+        e._entry_placed_at = 0.0
+        e._dry_pending = {
+            "COLLECTUSDT": ActivePosition("COLLECTUSDT", "BUY", 0.0890, 0.0870,
+                                          0.0920, 100.0, entry_order_id="c",
+                                          tag="c"),
+        }
+        e.last_prices = {}
+        return e
+
+    def test_another_symbols_tick_cannot_fill_an_entry(self):
+        e = self._engine()
+        e.last_prices["DOGEUSDT"] = 0.0860
+        Engine.simulate_entry(e, 0.0860, "DOGEUSDT")
+        self.assertEqual(e.book, {}, "filled against another symbol's price")
+        self.assertIn("COLLECTUSDT", e._dry_pending)
+
+    def test_its_own_tick_does_fill_it(self):
+        e = self._engine()
+        e.last_prices["COLLECTUSDT"] = 0.0885
+        Engine.simulate_entry(e, 0.0885, "COLLECTUSDT")
+        self.assertIn("COLLECTUSDT", e.book)
+
+    def test_no_tick_yet_means_no_fill(self):
+        e = self._engine()
+        Engine.simulate_entry(e, 0.0885, "COLLECTUSDT")   # last_prices empty
+        self.assertEqual(e.book, {})
+
+    def test_on_tick_passes_the_symbol_through(self):
+        src = inspect.getsource(Engine.on_tick)
+        self.assertIn("self.simulate_entry(tick.mark_price, tick.symbol)", src)
+
+    def test_a_resting_dry_run_entry_subscribes_to_the_stream(self):
+        """Without it the symbol never gets a tick, so it can never fill."""
+        src = inspect.getsource(Engine.portfolio_cycle)
+        self.assertIn("_dry_pending", src)
+        self.assertIn("add_symbol", src)
+
+
+class TestAlertsNameTheRightSymbol(unittest.TestCase):
+    def test_send_accepts_a_per_message_symbol(self):
+        from bot.notify import Event, Notifier
+        n = Notifier(symbol="DOGEUSDT")
+        seen = []
+        n._safe = staticmethod(lambda ch, subj, body: seen.append(subj))
+        n.telegram = type("T", (), {"enabled": True, "send": lambda *a: None})()
+        n.send(Event.TP_HIT, "body", symbol="COLLECTUSDT")
+        self.assertIn("COLLECTUSDT", seen[0])
+        self.assertNotIn("DOGEUSDT", seen[0])
+
+    def test_it_falls_back_to_the_configured_symbol(self):
+        from bot.notify import Event, Notifier
+        n = Notifier(symbol="DOGEUSDT")
+        seen = []
+        n._safe = staticmethod(lambda ch, subj, body: seen.append(subj))
+        n.telegram = type("T", (), {"enabled": True, "send": lambda *a: None})()
+        n.send(Event.TP_HIT, "body")
+        self.assertIn("DOGEUSDT", seen[0])
+
+    def test_a_target_close_is_not_reported_as_a_stop_loss(self):
+        src = inspect.getsource(Engine.close_position)
+        self.assertNotIn("Event.SL_HIT", src,
+                         "a manual or target close is not a stop-loss")
+
+
+class TestPositionsShowTheirOwnPrice(unittest.TestCase):
+    def test_renderer_uses_the_per_position_price(self):
+        import inspect as i
+        from bot.telegram_control import TelegramControl
+        src = i.getsource(TelegramControl._send_position_book)
+        self.assertIn('p.get("price")', src)
+        self.assertNotIn("s.get('price', 0):,.4f", src)
+
+    def test_a_position_with_no_tick_says_so(self):
+        import inspect as i
+        from bot.telegram_control import TelegramControl
+        self.assertIn("waiting for first tick",
+                      i.getsource(TelegramControl._send_position_book))
+
+    def test_snapshot_publishes_resting_entries(self):
+        src = inspect.getsource(Engine.snapshot)
+        self.assertIn('"pending"', src)

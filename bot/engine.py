@@ -273,9 +273,20 @@ class Engine:
             "strategy_choices": getattr(self.strategy, "choices", []),
             "mode_line": self.mode_line(),
             "positions": book,
+            "pending": self._pending_book(),
             "config": self._config_summary(),
             "scan": self._scan_summary(),
         }
+
+    def _pending_book(self) -> list[dict]:
+        """Dry-run entries that are resting, not yet filled."""
+        out = []
+        for sym, p in (self._dry_pending or {}).items():
+            out.append({"symbol": sym, "side": p.side, "qty": p.qty,
+                        "entry": p.entry, "stop": p.stop,
+                        "take_profit": p.take_profit,
+                        "price": (self.last_prices or {}).get(sym, 0.0)})
+        return out
 
     def _position_book(self) -> list[dict]:
         """Every open position. A list even when there is one, so the control
@@ -532,7 +543,9 @@ class Engine:
         symbol = symbol or (self.active.symbol if self.active else self.cfg.symbol)
         if self.cfg.dry_run:
             log.info("dry_run: would close %s (%s)", symbol, reason)
-            self.notify.send(Event.SL_HIT, f"DRY RUN -- would close {symbol}: {reason}")
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"DRY RUN -- would close {symbol}: {reason}",
+                             symbol=symbol)
             self.release(symbol)
             return True
         try:
@@ -580,8 +593,9 @@ class Engine:
             self.api.cancel_all(symbol)
         except BinanceError as e:
             log.error("close succeeded but cancelling leftovers failed: %s", e)
-        self.notify.send(Event.SL_HIT,
-                         f"{symbol} closed: {side} {qty} at market.\n{reason}")
+        self.notify.send(Event.DAILY_SUMMARY,
+                         f"{symbol} closed: {side} {qty} at market.\n{reason}",
+                         symbol=symbol)
         # release(symbol), NEVER `self.active = None`. The latter goes through
         # the property setter, which replaces the whole book -- so closing one
         # of twenty-five positions would drop tracking for the other
@@ -991,7 +1005,7 @@ class Engine:
         self.last_prices[tick.symbol] = tick.mark_price
         self._tick_guard()
         if self.cfg.dry_run:
-            self.simulate_entry(tick.mark_price)
+            self.simulate_entry(tick.mark_price, tick.symbol)
 
         # Route to the position for THIS symbol; a tick for a symbol we do not
         # hold is still useful for the price cache and nothing else.
@@ -1028,7 +1042,11 @@ class Engine:
         """
         if not self._dry_pending:
             return
-        symbols = [symbol] if symbol else list(self._dry_pending)
+        # ONLY the symbol that ticked. Iterating everything and falling back to
+        # the caller's price meant a DOGEUSDT tick at 0.0860 was used as
+        # COLLECTUSDT's price, filling a limit resting at 0.0890 against a
+        # market it has nothing to do with.
+        symbols = [symbol] if symbol else []
         minutes = self.cfg.risk.entry_expiry_minutes
 
         for sym in symbols:
@@ -1047,7 +1065,9 @@ class Engine:
                                      f"after {age:.0f} min. No trade.")
                     continue
 
-            px = (self.last_prices or {}).get(sym, price)
+            px = (self.last_prices or {}).get(sym)
+            if not px:
+                continue        # no tick for THIS symbol yet -- never guess
             reached = px <= pending.entry if pending.is_long else px >= pending.entry
             if not reached:
                 continue
@@ -1479,7 +1499,12 @@ class Engine:
                 continue
 
             self.place(signal, sized.qty_notional, sized.reason, symbol=cand.symbol)
-            if cand.symbol in self.book and self.stream is not None:
+            # Subscribe for a RESTING entry too, not only a filled position --
+            # in dry run the entry sits in _dry_pending and would otherwise
+            # never receive a tick of its own.
+            tracked = (cand.symbol in self.book
+                       or cand.symbol in (self._dry_pending or {}))
+            if tracked and self.stream is not None:
                 self.stream.add_symbol(cand.symbol)
             opened += 1
 

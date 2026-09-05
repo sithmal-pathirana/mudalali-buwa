@@ -553,7 +553,7 @@ def layer_audit(report, args):
         e = _engine(api=_StubAPI(), active=ActivePosition(
             "DOGEUSDT", "BUY", 0.0900, 0.0882, 0.0954, 100, "e-1", "s-1", tag="e-1"))
         sent = []
-        e.notify.send = lambda ev, body, dedupe_key=None: sent.append(body)
+        e.notify.send = lambda ev, body, **kw: sent.append(body)
         e.on_order(OrderUpdate(symbol="DOGEUSDT", client_order_id="e-1", side="BUY",
                                status="FILLED", order_type="LIMIT",
                                last_filled_qty=100.0, cumulative_qty=100.0,
@@ -958,7 +958,7 @@ def layer_portfolio(report, args):
         api = _MultiAPI(open_symbols=held, fail_on=["BBBUSDT"])
         e = _engine(book=held, portfolio=True, api=api)
         alerts = []
-        e.notify.send = lambda ev, body, dedupe_key=None: alerts.append((ev.name, body))
+        e.notify.send = lambda ev, body, **kw: alerts.append((ev.name, body))
         e.close_all("qa")
         cancelled_bbb = ("cancel_all", "BBBUSDT") in api.calls
         loud = any(a[0] == "ERROR" for a in alerts)
@@ -1158,7 +1158,7 @@ def layer_portfolio(report, args):
 
         e = _engine(book=held, portfolio=True, api=Exploding(open_symbols=held))
         alerts = []
-        e.notify.send = lambda ev, body, dedupe_key=None: alerts.append(ev.name)
+        e.notify.send = lambda ev, body, **kw: alerts.append(ev.name)
         closed = e.close_all("qa")
         return closed == 2 and "BBBUSDT" in e.book and "ERROR" in alerts, (
             f"closed={closed}, still tracked {sorted(e.book)}, "
