@@ -67,6 +67,7 @@ class Config:
     params: dict = field(default_factory=dict)
 
     unknown_keys: list = field(default_factory=list)
+    config_path: str = ""
 
     api_key: str = ""
     api_secret: str = ""
@@ -109,6 +110,7 @@ class Config:
         unknown = sorted(k for k in raw if k not in known)
         cfg = cls(**built, **{k: v for k, v in raw.items() if k in known})
         cfg.unknown_keys = unknown
+        cfg.config_path = str(Path(path))
 
         # Every declared section must be its dataclass, never a passed-through dict.
         for name, factory in sections.items():

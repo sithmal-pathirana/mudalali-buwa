@@ -349,7 +349,15 @@ class Engine:
                 + "\n\nSend /help for commands.")
             log.info("telegram control enabled for chat %s", self.cfg.telegram_chat_id)
         elif self.cfg.telegram_token and not self.cfg.telegram.control:
-            log.info("telegram alerts on, control disabled by config")
+            # A warning, not info: alerts arriving while commands are ignored
+            # looks like a broken bot rather than a config choice, and the one
+            # channel that could explain it is the one that is switched off.
+            log.warning("TELEGRAM COMMANDS ARE OFF. Alerts will arrive, but "
+                        "/status, /close and /strategy will be IGNORED.")
+            log.warning("  to enable, in %s:", self.cfg.config_path or "config.yaml")
+            log.warning("      telegram:")
+            log.warning("        control: true")
+            log.warning("  then: sudo systemctl restart trading-bot")
 
         if self.cfg.dashboard.enabled:
             token = self.cfg.dashboard_token or generate_token()

@@ -205,3 +205,40 @@ class TestPlumbing(Base):
         for name in ("publish", "pop_commands", "start", "stop"):
             self.assertTrue(hasattr(TelegramControl, name))
             self.assertTrue(hasattr(Dashboard, name))
+
+
+class TestControlDisabledIsDiscoverable(unittest.TestCase):
+    """
+    Alerts arriving while commands are ignored looks like a broken bot, and the
+    one channel that could explain it is the one switched off. So the engine
+    must say it loudly at startup, and `doctor` must answer it directly.
+    """
+
+    def test_engine_warns_rather_than_informs(self):
+        import inspect
+
+        from bot.engine import Engine
+        src = inspect.getsource(Engine.startup)
+        block = src.split("not self.cfg.telegram.control")[1][:700]
+        self.assertIn("log.warning", block, "still only an INFO line")
+        self.assertIn("control: true", block, "does not say how to fix it")
+
+    def test_warning_names_the_config_file(self):
+        from bot.config import Config
+        cfg = Config.load()
+        self.assertTrue(cfg.config_path, "config does not record where it loaded from")
+        self.assertTrue(cfg.config_path.endswith(".yaml"))
+
+    def test_doctor_reports_control_surface_state(self):
+        src = (ROOT / "run.py").read_text()
+        block = src.split("control surfaces")[1][:900]
+        self.assertIn("commands ON", block)
+        self.assertIn("commands OFF", block)
+        self.assertIn("control: true", block)
+
+    def test_missing_chat_id_is_called_out_separately(self):
+        """Token without chat id is a different fault from control: false."""
+        src = (ROOT / "run.py").read_text()
+        block = src.split("control surfaces")[1][:900]
+        self.assertIn("TELEGRAM_CHAT_ID missing", block)
+        self.assertIn("allowlist", block)

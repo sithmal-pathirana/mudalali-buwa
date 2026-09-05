@@ -97,6 +97,26 @@ def cmd_doctor(cfg: Config) -> int:
     equity = equity if equity else 43.0
     strat = build(cfg.strategy, cfg.params)
     ok, note = strat.feasible(equity, price, rules)
+    # Control surfaces: the question "alerts work but commands do not" should
+    # be answerable here rather than by grepping config on the server.
+    print("\n  control surfaces")
+    if not cfg.telegram_token:
+        print("    telegram      no token -- no alerts, no commands")
+    elif not cfg.telegram_chat_id:
+        print("    telegram      token set but TELEGRAM_CHAT_ID missing;")
+        print("                  control stays disabled (that id is the allowlist)")
+    elif cfg.telegram.control:
+        print(f"    telegram      alerts ON, commands ON  (chat {cfg.telegram_chat_id})")
+    else:
+        print(f"    telegram      alerts ON, commands OFF  (chat {cfg.telegram_chat_id})")
+        print("                  set `telegram: control: true` in config.yaml,")
+        print("                  then restart, to use /status /close /strategy")
+    if cfg.dashboard.enabled:
+        tok = "set" if cfg.dashboard_token else "generated fresh each restart"
+        print(f"    dashboard     {cfg.dashboard.host}:{cfg.dashboard.port}, token {tok}")
+    else:
+        print("    dashboard     disabled")
+
     print(f"\n  strategy      {strat.name}: {'RUNNABLE' if ok else 'NOT RUNNABLE'}")
     if note:
         print(f"                {note}")
