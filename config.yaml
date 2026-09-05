@@ -37,6 +37,22 @@ targets:
     - from_day: 16           # your day-15 escalation
       usd_per_day: 3.0
 
+# AGGRESSIVE MODE. Off, and it should stay off unless you have measured an
+# edge. It REPLACES the risk profile wholesale -- leverage, per-trade risk,
+# timeframe, scan rate, market entries, trailing stops -- and ignores the
+# daily target entirely.
+#
+#   run.py risk        shows the modelled probability of ruin per profile
+#
+# At $43 with no edge, every profile models 100% ruin (median life 8 days at
+# `moderate`, 1 day at `maximum`). Still enforced in every profile: an
+# exchange-side stop on every position, the KILL file, and the equity floor.
+aggressive:
+  enabled: false
+  profile: moderate        # moderate (10x) | high (20x) | maximum (50x)
+  keep_daily_loss_limit: true
+  confirm_live: true       # type AGGRESSIVE before the first live order
+
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.

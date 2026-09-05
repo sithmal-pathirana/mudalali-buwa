@@ -284,6 +284,48 @@ def cmd_report(cfg: Config, args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- risk
+def cmd_risk(cfg: Config, args) -> int:
+    """See what each profile is modelled to do, before enabling one."""
+    from bot.aggressive import PROFILES, banner, ruin_probability
+
+    equity = args.equity
+    if equity is None and cfg.api_key:
+        from bot.binanceapi import Binance, BinanceError
+        try:
+            equity = Binance(cfg.api_key, cfg.api_secret,
+                             testnet=cfg.testnet).usdt_equity()
+        except BinanceError:
+            equity = None
+    equity = equity or 43.0
+
+    print(f"\n  MODELLED RUIN   equity ${equity:,.2f}, 180-day horizon, "
+          f"assuming no edge\n")
+    print(f"  {'profile':<12}{'lev':>5}{'risk/trade':>12}{'trades/day':>12}"
+          f"{'P(ruin)':>10}{'med. life':>11}")
+    print("  " + "-" * 62)
+    safe = type("P", (), {"leverage": cfg.risk.max_leverage,
+                          "risk_per_trade_pct": cfg.risk.risk_per_trade_pct,
+                          "trades_per_day": 1})()
+    p, life = ruin_probability(equity, safe)
+    print(f"  {'safe (now)':<12}{safe.leverage:>4}x"
+          f"{safe.risk_per_trade_pct:>11.2f}%{1:>12}{p*100:>9.1f}%{life:>11.0f}")
+    for name, prof in PROFILES.items():
+        p, life = ruin_probability(equity, prof)
+        print(f"  {name:<12}{prof.leverage:>4}x{prof.risk_per_trade_pct:>11.2f}%"
+              f"{prof.trades_per_day:>12}{p*100:>9.1f}%{life:>11.0f}")
+
+    if cfg.aggressive.enabled:
+        print()
+        print(banner(equity, PROFILES[cfg.aggressive.profile]))
+    else:
+        print("\n  Aggressive mode is OFF. Enable it in config.yaml:")
+        print("      aggressive:\n        enabled: true\n        profile: moderate")
+    print("\n  'No edge' is what this repo has measured out-of-sample. A strategy")
+    print("  with real edge would change these numbers in your favour.\n")
+    return 0
+
+
 # --------------------------------------------------------------------- myip
 def public_ip() -> str | None:
     """Whatever the outside world sees this host as. Several sources, in case
@@ -746,6 +788,23 @@ def cmd_backtest(cfg: Config, args) -> int:
 def cmd_trade(cfg: Config) -> int:
     from bot.engine import Engine
 
+    if cfg.aggressive.enabled and not cfg.testnet and not cfg.dry_run \
+            and cfg.aggressive.confirm_live:
+        from bot.aggressive import PROFILES, banner
+        from bot.binanceapi import Binance, BinanceError
+        equity = 43.0
+        try:
+            equity = Binance(cfg.api_key, cfg.api_secret,
+                             testnet=False).usdt_equity() or equity
+        except BinanceError:
+            pass
+        print()
+        print(banner(equity, PROFILES[cfg.aggressive.profile]))
+        print()
+        if input("  Type AGGRESSIVE to continue: ").strip() != "AGGRESSIVE":
+            print("  aborted\n")
+            return 1
+
     if not cfg.testnet and not cfg.dry_run:
         print("\n  !! LIVE MODE WITH REAL MONEY !!")
         print(f"     symbol={cfg.symbol}  leverage={cfg.risk.max_leverage}x  "
@@ -765,6 +824,8 @@ def main() -> int:
     sub.add_parser("project", help="model the escalating target schedule")
     sub.add_parser("netcheck", help="probe every endpoint this host needs")
     sub.add_parser("myip", help="this host's public IP, for Binance IP restriction")
+    rk = sub.add_parser("risk", help="modelled ruin for each aggressive profile")
+    rk.add_argument("--equity", type=float, default=None)
     sc = sub.add_parser("scan", help="rank the tradable universe right now")
     sc.add_argument("--equity", type=float, default=None,
                     help="risk budget to filter against (default: account balance)")
@@ -814,6 +875,8 @@ def main() -> int:
         return cmd_netcheck(cfg)
     if args.cmd == "myip":
         return cmd_myip()
+    if args.cmd == "risk":
+        return cmd_risk(cfg, args)
     if args.cmd == "report":
         return cmd_report(cfg, args)
     if args.cmd == "scan":

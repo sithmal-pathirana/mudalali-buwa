@@ -65,6 +65,7 @@ class Engine:
     position_amt = 0.0
     last_prices: dict = None
     scanner = None
+    aggressive_profile = None
     _rules_cache: dict = None
     _exchange_info = None
 
@@ -214,6 +215,9 @@ class Engine:
             "position": pos, "events": list(self.events),
             "stream_ok": bool(self.stream and self.stream.connected.is_set()),
             "regime": self._regime_note(),
+            "aggressive": bool(self.cfg.aggressive.enabled),
+            "aggressive_profile": (self.aggressive_profile.name
+                                   if self.aggressive_profile else ""),
             "strategy_mode": getattr(self.strategy, "mode", "fixed"),
             "strategy_choices": getattr(self.strategy, "choices", []),
             "mode_line": self.mode_line(),
@@ -463,6 +467,19 @@ class Engine:
         self.warn_if_foreground()
         log.info("alert channels: %s", ", ".join(self.notify.channels))
 
+        if self.cfg.aggressive.enabled:
+            from .aggressive import PROFILES, apply as apply_aggressive
+            profile = PROFILES.get(self.cfg.aggressive.profile)
+            if profile is None:
+                log.error("unknown aggressive profile %r; refusing to start",
+                          self.cfg.aggressive.profile)
+                return False
+            apply_aggressive(self.cfg, profile)
+            self.aggressive_profile = profile
+            if not self.cfg.aggressive.keep_daily_loss_limit:
+                self.cfg.risk.daily_loss_limit_pct = 100.0
+                log.warning("aggressive: daily loss limit DISABLED by config")
+
         for problem in self.cfg.validate():
             log.warning("config: %s", problem)
 
@@ -497,6 +514,17 @@ class Engine:
                 log.warning("saved override %r is no longer valid (%s); "
                             "reverting to automatic", self.state.strategy_override, e)
                 self.state.strategy_override = ""
+
+        if self.cfg.aggressive.enabled:
+            from .aggressive import banner, short_warning
+            for line in banner(self.equity, self.aggressive_profile).splitlines():
+                log.warning("%s", line)
+            self.notify.send(
+                Event.HALT,
+                banner(self.equity, self.aggressive_profile)
+                + "\n\nSend /halt to stop opening new trades at any time.")
+            log.warning("summary: %s",
+                        short_warning(self.equity, self.aggressive_profile))
 
         self.state.roll_day_if_needed(self.equity)
         self.schedule.start_date = self.state.schedule_start_date

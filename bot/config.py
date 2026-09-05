@@ -43,6 +43,18 @@ class DashboardConfig:
 
 
 @dataclass
+class AggressiveConfig:
+    """
+    Off by default and deliberately so. When on it REPLACES the risk profile
+    rather than adjusting it, and the engine says so on every surface.
+    """
+    enabled: bool = False
+    profile: str = "moderate"        # moderate | high | maximum
+    keep_daily_loss_limit: bool = True
+    confirm_live: bool = True
+
+
+@dataclass
 class PortfolioConfig:
     """
     Concurrency is derived, not chosen. Fix the portfolio risk you can accept
@@ -83,6 +95,7 @@ class Config:
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -114,7 +127,7 @@ class Config:
         # is precisely how the `telegram:` section broke once.
         sections = {"risk": RiskConfig, "alerts": AlertConfig,
                     "dashboard": DashboardConfig, "telegram": TelegramConfig,
-                    "portfolio": PortfolioConfig}
+                    "portfolio": PortfolioConfig, "aggressive": AggressiveConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}
@@ -153,8 +166,22 @@ class Config:
         cfg.dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
         return cfg
 
+    @property
+    def aggressive_on(self) -> bool:
+        return bool(self.aggressive.enabled)
+
     def validate(self) -> list[str]:
         problems = []
+        if self.aggressive.enabled:
+            from .aggressive import PROFILES
+            if self.aggressive.profile not in PROFILES:
+                problems.append(f"aggressive.profile must be one of "
+                                f"{', '.join(PROFILES)}, got "
+                                f"{self.aggressive.profile!r}")
+            problems.append(
+                "AGGRESSIVE MODE IS ENABLED. This replaces the risk profile "
+                "wholesale. Run `run.py risk` to see the modelled probability "
+                "of ruin for your configured profile and equity.")
         if self.risk.kill_action not in ("flatten", "protect"):
             problems.append(f"risk.kill_action must be 'flatten' or 'protect', "
                             f"got {self.risk.kill_action!r}")
