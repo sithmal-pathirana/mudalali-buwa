@@ -118,6 +118,7 @@ class Config:
     smtp_password: str = ""
     alert_email: str = ""
     dashboard_token: str = ""
+    signal_chat_id: str = ""
 
     @property
     def testnet(self) -> bool:
@@ -126,6 +127,14 @@ class Config:
     @classmethod
     def load(cls, path: str | Path = ROOT / "config.yaml") -> "Config":
         raw = yaml.safe_load(Path(path).read_text()) or {}
+
+        # config.local.yaml overlays the tracked defaults and is gitignored.
+        # Editing the tracked file directly means every `git pull` conflicts
+        # with your own deployment settings, which is a fight you lose weekly.
+        local = Path(path).with_name("config.local.yaml")
+        if local.exists():
+            overlay = yaml.safe_load(local.read_text()) or {}
+            raw = _deep_merge(raw, overlay)
 
         # Table-driven so adding a section cannot be half-wired: forgetting an
         # entry here would let the raw dict flow through into the field, which
@@ -151,6 +160,8 @@ class Config:
         cfg = cls(**built, **{k: v for k, v in raw.items() if k in known})
         cfg.unknown_keys = unknown
         cfg.config_path = str(Path(path))
+        if local.exists():
+            cfg.config_path += f" + {local.name}"
 
         # Every declared section must be its dataclass, never a passed-through dict.
         for name, factory in sections.items():
@@ -169,6 +180,7 @@ class Config:
         cfg.smtp_password = os.environ.get("SMTP_PASSWORD", "")
         cfg.alert_email = os.environ.get("ALERT_EMAIL", "")
         cfg.dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
+        cfg.signal_chat_id = os.environ.get("TELEGRAM_SIGNAL_CHAT_ID", "")
         return cfg
 
     @property
@@ -227,6 +239,22 @@ class Config:
                 "target resets the required daily return to roughly where it "
                 "started, undoing the risk reduction from equity growth.")
         return problems
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """
+    Overlay wins, one section at a time.
+
+    Nested so `portfolio: {enabled: true}` in the override does not wipe the
+    other portfolio settings from the tracked defaults.
+    """
+    out = dict(base)
+    for k, v in (overlay or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 
 def _load_env_file(path: Path) -> None:

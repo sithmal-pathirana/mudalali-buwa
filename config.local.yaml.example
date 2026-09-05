@@ -1,0 +1,19 @@
+# Copy to config.local.yaml -- gitignored, overlays config.yaml.
+#
+# Put YOUR deployment settings here instead of editing config.yaml, so
+# `git pull` never conflicts with them. Only the keys you set are overridden;
+# everything else comes from the tracked defaults.
+
+portfolio:
+  enabled: true
+
+telegram:
+  control: true
+
+risk:
+  # Trade as if the account held this much, whatever testnet hands you.
+  equity_cap_usdt: 100.0
+
+# symbol: DOGEUSDT
+# strategy: switcher
+# dry_run: false

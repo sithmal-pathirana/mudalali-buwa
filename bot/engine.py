@@ -66,6 +66,7 @@ class Engine:
     position_amt = 0.0
     last_prices: dict = None
     scanner = None
+    signals = None
     equity = 0.0
     actual_equity = 0.0
     last_price = 0.0
@@ -111,6 +112,8 @@ class Engine:
         self._stop_reason = ""
         self.dashboard: Dashboard | None = None
         self.telegram: TelegramControl | None = None
+        from .signals import SignalChannel
+        self.signals = SignalChannel(cfg.telegram_token, cfg.signal_chat_id)
         self.notify.listener = self._record_event
         self.notify.context = self.mode_line
 
@@ -610,6 +613,9 @@ class Engine:
                  self.cfg.symbol, self.strategy.name)
         self.warn_if_foreground()
         log.info("alert channels: %s", ", ".join(self.notify.channels))
+        if self.signals is not None and self.signals.enabled:
+            log.info("signal channel ON -- entries broadcast to chat %s "
+                     "(one-way, no account detail)", self.cfg.signal_chat_id)
 
         if self.cfg.aggressive.enabled:
             from .aggressive import PROFILES, apply as apply_aggressive
@@ -1160,6 +1166,13 @@ class Engine:
             self.state.realized_today += pnl
             self.state.save()
             event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
+            if self.signals is not None and pos.entry:
+                move = (upd.avg_price - pos.entry) / pos.entry * 100
+                self.signals.closed(
+                    upd.symbol, upd.avg_price,
+                    move if pos.is_long else -move,
+                    "take-profit" if pnl >= 0 else "stop-loss",
+                    mode=self.cfg.mode, dry_run=self.cfg.dry_run)
             prog = self.schedule.progress(self.state.realized_today)
             self.notify.send(
                 event,
@@ -1638,6 +1651,12 @@ class Engine:
         self.state.stop_order_id = stop_id
         self.risk.record_attempt()
         self._entry_placed_at = time.time()
+
+        if self.signals is not None:
+            self.signals.entry(symbol, signal.side, float(price),
+                               float(stop_price), float(tp_price),
+                               mode=self.cfg.mode, dry_run=self.cfg.dry_run,
+                               reason=signal.reason)
 
         prog = self.schedule.progress(self.state.realized_today)
         self.notify.send(
