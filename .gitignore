@@ -1,0 +1,11 @@
+.env
+data/
+logs/
+KILL
+__pycache__/
+*.pyc
+.venv/
+
+# QA reports (saved web pages)
+trading-bot QA*.html
+trading-bot QA*_files/

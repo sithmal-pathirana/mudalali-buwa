@@ -1,0 +1,185 @@
+"""Config loading. YAML for behaviour, environment for secrets -- never mixed."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass
+class RiskConfig:
+    max_leverage: int = 3
+    risk_per_trade_pct: float = 2.0        # % of equity risked between entry and stop
+    max_position_pct: float = 100.0        # cap on notional as % of equity * leverage
+    daily_loss_limit_pct: float = 5.0      # halt for the day past this drawdown
+    max_trades_per_day: int = 10
+    min_equity_usdt: float = 10.0          # below this the bot stops permanently
+    allow_averaging_down: bool = False     # keep False; see README
+    entry_expiry_minutes: int = 60         # cancel a limit entry that never fills
+    # What `touch KILL` means. "flatten" closes the position at market first,
+    # then cancels everything and exits. "protect" stops trading but leaves the
+    # position and its stop on the book. Doing neither -- cancelling the stop
+    # and walking away -- is the one outcome to avoid. (QA R2)
+    kill_action: str = "flatten"
+
+
+@dataclass
+class AlertConfig:
+    approach_pct: float = 80.0      # warn once price is this % of the way to TP or SL
+    heartbeat_minutes: int = 360    # periodic "still alive" summary; 0 disables
+    email_on_every_tick: bool = False
+
+
+@dataclass
+class DashboardConfig:
+    enabled: bool = True
+    host: str = "127.0.0.1"     # see README before changing; this endpoint closes trades
+    port: int = 8080
+
+
+@dataclass
+class TelegramConfig:
+    # Off by default: a control surface should be opted into, not inherited by
+    # anyone who configured a token for alerts. (QA R7)
+    control: bool = False       # accept /commands, not just send alerts
+    poll_seconds: int = 0       # 0 = long-poll (recommended); >0 forces short polls
+
+
+@dataclass
+class Config:
+    mode: str = "testnet"                  # testnet | live
+    symbol: str = "BTCUSDT"
+    interval: str = "15m"
+    strategy: str = "trend_atr"
+    poll_seconds: int = 20
+    dry_run: bool = True                   # log intended orders, send nothing
+    realtime: bool = True                  # websockets; False falls back to polling
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    targets: dict = field(default_factory=dict)
+    params: dict = field(default_factory=dict)
+
+    unknown_keys: list = field(default_factory=list)
+
+    api_key: str = ""
+    api_secret: str = ""
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    alert_email: str = ""
+    dashboard_token: str = ""
+
+    @property
+    def testnet(self) -> bool:
+        return self.mode != "live"
+
+    @classmethod
+    def load(cls, path: str | Path = ROOT / "config.yaml") -> "Config":
+        raw = yaml.safe_load(Path(path).read_text()) or {}
+
+        # Table-driven so adding a section cannot be half-wired: forgetting an
+        # entry here would let the raw dict flow through into the field, which
+        # is precisely how the `telegram:` section broke once.
+        sections = {"risk": RiskConfig, "alerts": AlertConfig,
+                    "dashboard": DashboardConfig, "telegram": TelegramConfig}
+        built = {}
+        for name, factory in sections.items():
+            section = raw.pop(name, {}) or {}
+            if not isinstance(section, dict):
+                raise TypeError(f"config.yaml: `{name}:` must be a block of settings, "
+                                f"got {type(section).__name__}")
+            try:
+                built[name] = factory(**section)
+            except TypeError as e:
+                valid = ", ".join(sorted(factory.__dataclass_fields__))
+                raise TypeError(f"config.yaml: bad key under `{name}:` ({e}). "
+                                f"Valid keys: {valid}") from None
+
+        known = set(cls.__annotations__)
+        unknown = sorted(k for k in raw if k not in known)
+        cfg = cls(**built, **{k: v for k, v in raw.items() if k in known})
+        cfg.unknown_keys = unknown
+
+        # Every declared section must be its dataclass, never a passed-through dict.
+        for name, factory in sections.items():
+            assert isinstance(getattr(cfg, name), factory), \
+                f"config section `{name}` was not built into {factory.__name__}"
+
+        _load_env_file(ROOT / ".env")
+        prefix = "BINANCE_TESTNET" if cfg.testnet else "BINANCE_LIVE"
+        cfg.api_key = os.environ.get(f"{prefix}_KEY", "")
+        cfg.api_secret = os.environ.get(f"{prefix}_SECRET", "")
+        cfg.telegram_token = os.environ.get("TELEGRAM_TOKEN", "")
+        cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        cfg.smtp_host = os.environ.get("SMTP_HOST", "")
+        cfg.smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        cfg.smtp_user = os.environ.get("SMTP_USER", "")
+        cfg.smtp_password = os.environ.get("SMTP_PASSWORD", "")
+        cfg.alert_email = os.environ.get("ALERT_EMAIL", "")
+        cfg.dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
+        return cfg
+
+    def validate(self) -> list[str]:
+        problems = []
+        if self.risk.kill_action not in ("flatten", "protect"):
+            problems.append(f"risk.kill_action must be 'flatten' or 'protect', "
+                            f"got {self.risk.kill_action!r}")
+        if self.unknown_keys:
+            # A typo like `dry_runn: false` used to be dropped in silence, so you
+            # could believe you were trading ETH 1h while the bot traded BTC 15m.
+            problems.append(
+                f"config.yaml has unrecognised top-level keys: "
+                f"{', '.join(self.unknown_keys)}. These are IGNORED -- check for "
+                f"a typo (did you mean one of: "
+                f"{', '.join(sorted(k for k in self.__annotations__ if not k.startswith('_')))[:120]}...)")
+        if self.risk.max_leverage > 5:
+            problems.append(
+                f"max_leverage={self.risk.max_leverage}. Above 5x, the reality_check "
+                f"simulation puts one-year ruin above 90%. Lower it or accept that.")
+        if self.risk.allow_averaging_down:
+            problems.append("allow_averaging_down is True -- this is the single most "
+                            "common cause of total account loss.")
+        if not self.testnet and self.dry_run is False and not self.api_key:
+            problems.append("live mode with no API key configured")
+        if not (self.telegram_token or self.smtp_host):
+            problems.append("no alert channel configured -- you will not be told "
+                            "about fills, stops, or halts. Fill in .env.")
+        if self.telegram.control and self.telegram_token and not self.telegram_chat_id:
+            problems.append(
+                "TELEGRAM_TOKEN is set but TELEGRAM_CHAT_ID is not. The chat id is "
+                "the ONLY thing stopping a stranger who finds your bot from issuing "
+                "commands -- control stays disabled until you set it.")
+        if self.dashboard.enabled and self.dashboard.host not in ("127.0.0.1", "localhost"):
+            problems.append(
+                f"dashboard is bound to {self.dashboard.host}, which exposes an "
+                f"endpoint that can close trades. Use an SSH tunnel instead "
+                f"unless you have put it behind TLS and a firewall.")
+        steps = self.targets.get("schedule", [])
+        if len(steps) > 1:
+            problems.append(
+                "target schedule escalates. Run tools/projection.py: raising the "
+                "target resets the required daily return to roughly where it "
+                "started, undoing the risk reduction from equity growth.")
+        return problems
+
+
+def _load_env_file(path: Path) -> None:
+    """Tiny .env reader so secrets stay out of the YAML and out of git."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))

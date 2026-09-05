@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0e1116">
+<title>Bot Monitor</title>
+<style>
+  :root{
+    --ground:#eef0f3; --surface:#fff; --surface-alt:#f6f7f9; --ink:#14181e;
+    --ink-soft:#3d4550; --ink-mute:#6b7482; --rule:#d8dce2;
+    --accent:#9a6c00; --accent-wash:#fdf4dd;
+    --up:#1b6b4f; --up-wash:#e8f5ef; --down:#a2352a; --down-wash:#fbeeec;
+    --warn:#8a5a00;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --ground:#0e1116; --surface:#161a20; --surface-alt:#1b2027; --ink:#e7eaef;
+      --ink-soft:#bcc3cd; --ink-mute:#8b95a3; --rule:#2a313a;
+      --accent:#f0b90b; --accent-wash:#2a2410;
+      --up:#3fb489; --up-wash:#12271f; --down:#e0665a; --down-wash:#2c1a18;
+      --warn:#f0b90b;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--ground); color:var(--ink);
+    font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+    padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .wrap{max-width:640px;margin:0 auto;padding:14px 14px 40px;display:flex;flex-direction:column;gap:12px}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+
+  header{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:2px 2px 0}
+  h1{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .sub{font-size:11px;color:var(--ink-mute);letter-spacing:.08em;text-transform:uppercase}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:1px}
+  .dot.ok{background:var(--up)} .dot.bad{background:var(--down)} .dot.warn{background:var(--warn)}
+
+  .card{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:14px}
+  .card h2{margin:0 0 10px;font-size:11px;font-weight:600;letter-spacing:.12em;
+           text-transform:uppercase;color:var(--ink-mute)}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{background:var(--surface-alt);border-radius:8px;padding:10px 12px}
+  .stat .k{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-mute)}
+  .stat .v{font-size:21px;font-weight:600;margin-top:2px;letter-spacing:-.02em}
+  .v.pos{color:var(--up)} .v.neg{color:var(--down)}
+
+  .bar{height:8px;border-radius:99px;background:var(--surface-alt);overflow:hidden;margin-top:7px}
+  .bar > i{display:block;height:100%;border-radius:99px;transition:width .4s ease}
+  .bar.tp > i{background:var(--up)} .bar.sl > i{background:var(--down)}
+  .bar.tgt > i{background:var(--accent)}
+  .barlab{display:flex;justify-content:space-between;font-size:11px;color:var(--ink-mute);margin-top:5px}
+
+  .pill{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.08em;
+        text-transform:uppercase;padding:3px 8px;border-radius:99px;border:1px solid}
+  .pill.long{color:var(--up);border-color:var(--up);background:var(--up-wash)}
+  .pill.short{color:var(--down);border-color:var(--down);background:var(--down-wash)}
+  .pill.flat{color:var(--ink-mute);border-color:var(--rule)}
+  .pill.halt{color:var(--down);border-color:var(--down);background:var(--down-wash)}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  td{padding:5px 0;border-bottom:1px solid var(--rule)}
+  tr:last-child td{border-bottom:none}
+  td:first-child{color:var(--ink-mute);font-size:12px}
+  td:last-child{text-align:right}
+
+  .btn{appearance:none;width:100%;padding:13px;border-radius:9px;font-size:15px;
+       font-weight:600;cursor:pointer;border:1px solid var(--rule);
+       background:var(--surface-alt);color:var(--ink);touch-action:manipulation}
+  .btn:active{transform:translateY(1px)}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn.danger{background:var(--down-wash);border-color:var(--down);color:var(--down)}
+  .btn.armed{background:var(--down);border-color:var(--down);color:#fff}
+  .btn[disabled]{opacity:.45;cursor:not-allowed}
+  .btns{display:flex;flex-direction:column;gap:8px}
+  .segs{display:flex;flex-wrap:wrap;gap:6px}
+  .seg{appearance:none;flex:1 1 auto;min-width:84px;padding:9px 6px;border-radius:8px;
+       font-size:13px;font-weight:600;cursor:pointer;border:1px solid var(--rule);
+       background:var(--surface-alt);color:var(--ink);touch-action:manipulation}
+  .seg[aria-pressed="true"]{background:var(--accent-wash);border-color:var(--accent);
+       color:var(--accent)}
+  .seg[disabled]{opacity:.5;cursor:not-allowed}
+  .seg:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .log{max-height:220px;overflow-y:auto;font-size:12px;display:flex;flex-direction:column;gap:6px}
+  .log div{display:flex;gap:8px;align-items:baseline}
+  .log time{color:var(--ink-mute);flex:0 0 52px}
+  .empty{color:var(--ink-mute);font-size:13px;text-align:center;padding:14px 0}
+  .note{font-size:11px;color:var(--ink-mute);margin-top:8px;line-height:1.45}
+  .banner{border-radius:9px;padding:10px 12px;font-size:13px;font-weight:500}
+  .banner.halt{background:var(--down-wash);color:var(--down);border:1px solid var(--down)}
+  .banner.done{background:var(--accent-wash);color:var(--warn);border:1px solid var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1 id="sym">—</h1>
+      <div class="sub" id="mode">connecting</div>
+    </div>
+    <div style="text-align:right">
+      <div class="sub"><span class="dot warn" id="dot"></span><span id="conn">…</span></div>
+      <div class="sub mono" id="clock" style="margin-top:3px">—</div>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Equity</div><div class="v mono" id="equity">—</div></div>
+    <div class="stat"><div class="k">Today</div><div class="v mono" id="today">—</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Daily target</h2>
+    <div class="bar tgt"><i id="tgtbar" style="width:0%"></i></div>
+    <div class="barlab"><span id="tgtlab">—</span><span class="mono" id="tgtpct">0%</span></div>
+    <div class="note" id="tgtnote"></div>
+  </div>
+
+  <div class="card">
+    <h2>Position <span class="pill flat" id="posPill" style="float:right">flat</span></h2>
+    <div id="posBody"><div class="empty">No open position</div></div>
+  </div>
+
+  <div class="card" id="stratCard" style="display:none">
+    <h2>Strategy <span class="pill flat" id="stratMode" style="float:right">—</span></h2>
+    <div class="barlab" style="margin:0 0 9px"><span id="stratRead">—</span></div>
+    <div class="segs" id="stratSegs"></div>
+    <div class="note">Automatic routes by market regime. Picking one pins it
+      regardless of what the market is doing; the reading above keeps updating
+      so you can see what you are overriding.</div>
+  </div>
+
+  <div class="card">
+    <h2>Controls</h2>
+    <div class="btns">
+      <button class="btn danger" id="closeBtn" disabled>Close position</button>
+      <button class="btn" id="haltBtn">Halt bot</button>
+      <button class="btn" id="resumeBtn" style="display:none">Resume after halt</button>
+    </div>
+    <div class="note">Close sends a reduce-only market order and cancels resting
+      orders. Halt stops new trades; it does not close what is open. Resume
+      appears only after a halt — read the reason above before using it. All
+      three need a second tap to confirm.</div>
+  </div>
+
+  <div class="card">
+    <h2>Recent events</h2>
+    <div class="log" id="log"><div class="empty">Nothing yet</div></div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  var T = new URLSearchParams(location.search).get("t") || "";
+  var armed = {}, lastOk = 0;
+
+  function fmt(n, d){ d = d===undefined?2:d;
+    return (n===null||n===undefined||isNaN(n)) ? "—" : Number(n).toLocaleString(undefined,
+      {minimumFractionDigits:d, maximumFractionDigits:d}); }
+  function money(n,d){ var s = fmt(n,d); return s==="—"?s:"$"+s; }
+  function signed(n){ return (n>=0?"+":"") + fmt(n,2); }
+  function el(id){ return document.getElementById(id); }
+
+  function api(path, opts){
+    opts = opts || {};
+    opts.headers = Object.assign({"Authorization":"Bearer "+T,"Content-Type":"application/json"},
+                                 opts.headers||{});
+    return fetch(path, opts);
+  }
+
+  function setConn(ok, text){
+    el("dot").className = "dot " + (ok?"ok":"bad");
+    el("conn").textContent = text;
+  }
+
+  function render(s){
+    el("sym").textContent = s.symbol || "—";
+    el("mode").textContent = (s.mode||"") + (s.dry_run?" · dry run":"") +
+                             (s.strategy?" · "+s.strategy:"");
+    el("clock").textContent = new Date().toLocaleTimeString();
+
+    el("equity").textContent = money(s.equity);
+    var t = el("today");
+    t.textContent = signed(s.realized_today||0);
+    t.className = "v mono " + ((s.realized_today||0) >= 0 ? "pos":"neg");
+
+    // ---- daily target
+    var pct = Math.max(0, Math.min(100, s.target_pct||0));
+    el("tgtbar").style.width = pct + "%";
+    el("tgtlab").textContent = "day " + (s.day||"?") + " · " +
+        money(s.realized_today||0) + " of " + money(s.target||0);
+    el("tgtpct").textContent = Math.round(s.target_pct||0) + "%";
+    el("tgtnote").textContent = [s.target_note, s.regime].filter(Boolean).join(" · ");
+
+    // ---- banner
+    var b = el("banner"); b.innerHTML = "";
+    if (s.halted) {
+      b.innerHTML = '<div class="banner halt">HALTED — ' + (s.halt_reason||"") + '</div>';
+    } else if (s.target_reached) {
+      b.innerHTML = '<div class="banner done">Daily target banked. ' +
+                    (s.stop_when_reached ? "No further trades today." : "Still trading.") + '</div>';
+    }
+
+    // ---- position
+    var p = s.position, pill = el("posPill"), body = el("posBody");
+    if (p) {
+      pill.className = "pill " + (p.side === "BUY" ? "long":"short");
+      pill.textContent = p.side === "BUY" ? "long":"short";
+      var upnl = p.unrealized||0;
+      body.innerHTML =
+        '<table>' +
+        '<tr><td>Size</td><td class="mono">'+fmt(p.qty,4)+'</td></tr>' +
+        '<tr><td>Entry</td><td class="mono">'+fmt(p.entry,4)+'</td></tr>' +
+        '<tr><td>Mark</td><td class="mono">'+fmt(s.price,4)+'</td></tr>' +
+        '<tr><td>Unrealised</td><td class="mono" style="color:'+(upnl>=0?"var(--up)":"var(--down)")+'">'+
+            signed(upnl)+' USDT</td></tr>' +
+        '</table>' +
+        '<div style="margin-top:12px">' +
+          '<div class="bar tp"><i style="width:'+Math.max(0,Math.min(100,p.to_tp*100))+'%"></i></div>' +
+          '<div class="barlab"><span>to take-profit '+fmt(p.take_profit,4)+'</span>' +
+          '<span class="mono">'+Math.round(p.to_tp*100)+'%</span></div>' +
+        '</div>' +
+        '<div style="margin-top:10px">' +
+          '<div class="bar sl"><i style="width:'+Math.max(0,Math.min(100,p.to_sl*100))+'%"></i></div>' +
+          '<div class="barlab"><span>to stop '+fmt(p.stop,4)+'</span>' +
+          '<span class="mono">'+Math.round(p.to_sl*100)+'%</span></div>' +
+        '</div>';
+      el("closeBtn").disabled = false;
+    } else {
+      pill.className = "pill flat"; pill.textContent = "flat";
+      body.innerHTML = '<div class="empty">No open position</div>';
+      el("closeBtn").disabled = true;
+      resetBtn("closeBtn","Close position");
+    }
+
+    el("haltBtn").style.display = s.halted ? "none" : "";
+    el("resumeBtn").style.display = s.halted ? "" : "none";
+
+    // ---- strategy selection
+    var choices = s.strategy_choices || [];
+    var card = el("stratCard");
+    if (choices.length) {
+      card.style.display = "";
+      el("stratMode").textContent = s.strategy_mode || "—";
+      el("stratMode").className = "pill " +
+        ((s.strategy_mode || "").indexOf("manual") === 0 ? "short" : "long");
+      el("stratRead").textContent = s.regime || "reading the market…";
+      var segs = el("stratSegs");
+      if (segs.dataset.built !== choices.join(",")) {
+        segs.dataset.built = choices.join(",");
+        segs.innerHTML = "";
+        choices.forEach(function(c){
+          var b = document.createElement("button");
+          b.className = "seg"; b.textContent = c; b.dataset.value = c;
+          b.setAttribute("aria-pressed", "false");
+          b.addEventListener("click", function(){ pickStrategy(c, b); });
+          segs.appendChild(b);
+        });
+      }
+      var active = (s.strategy_mode === "auto") ? "auto"
+                 : (s.strategy_mode || "").replace("manual/", "");
+      Array.prototype.forEach.call(segs.children, function(b){
+        b.setAttribute("aria-pressed", String(b.dataset.value === active));
+      });
+    } else { card.style.display = "none"; }
+
+    // ---- events
+    var log = el("log");
+    if (s.events && s.events.length) {
+      log.innerHTML = s.events.slice().reverse().map(function(e){
+        return '<div><time class="mono">'+e.t+'</time><span>'+
+               e.text.replace(/[<>&]/g, function(c){
+                 return {"<":"&lt;",">":"&gt;","&":"&amp;"}[c]; })+'</span></div>';
+      }).join("");
+    } else { log.innerHTML = '<div class="empty">Nothing yet</div>'; }
+  }
+
+  function resetBtn(id, label){
+    var b = el(id); b.textContent = label; b.classList.remove("armed"); armed[id] = false;
+  }
+
+  function wire(id, label, path, confirmLabel){
+    var b = el(id);
+    b.addEventListener("click", function(){
+      if (!armed[id]) {                       // first tap arms, second tap fires
+        armed[id] = true;
+        b.textContent = confirmLabel;
+        b.classList.add("armed");
+        setTimeout(function(){ if (armed[id]) resetBtn(id, label); }, 5000);
+        return;
+      }
+      resetBtn(id, label);
+      b.disabled = true; b.textContent = "sending…";
+      api(path, {method:"POST", body: JSON.stringify({confirm:true})})
+        .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+        .then(function(res){
+          b.textContent = res.ok ? "queued ✓" : ("error: " + (res.j.error||"?"));
+          setTimeout(function(){ b.disabled=false; resetBtn(id,label); }, 2500);
+        })
+        .catch(function(e){ b.textContent = "failed"; b.disabled = false;
+          setTimeout(function(){ resetBtn(id,label); }, 2500); });
+    });
+  }
+
+  function pickStrategy(value, btn){
+    var was = btn.textContent;
+    Array.prototype.forEach.call(btn.parentNode.children, function(b){ b.disabled = true; });
+    btn.textContent = "…";
+    api("/api/strategy", {method:"POST",
+        body: JSON.stringify({confirm:true, value:value})})
+      .then(function(r){ return r.json(); })
+      .then(function(){ btn.textContent = was; })
+      .catch(function(){ btn.textContent = "failed"; })
+      .then(function(){
+        setTimeout(function(){
+          btn.textContent = was;
+          Array.prototype.forEach.call(btn.parentNode.children,
+                                       function(b){ b.disabled = false; });
+        }, 900);
+      });
+  }
+
+  wire("closeBtn","Close position","/api/close","Tap again to close");
+  wire("haltBtn","Halt bot","/api/halt","Tap again to halt");
+  wire("resumeBtn","Resume after halt","/api/resume","Tap again to resume");
+
+  function poll(){
+    api("/api/state")
+      .then(function(r){
+        if (r.status === 401) { setConn(false,"bad token"); throw new Error("401"); }
+        return r.json();
+      })
+      .then(function(s){ lastOk = Date.now(); setConn(true,"live"); render(s); })
+      .catch(function(){
+        if (Date.now() - lastOk > 8000) setConn(false, lastOk?"stale":"offline");
+      });
+  }
+  poll();
+  setInterval(poll, 2000);
+  document.addEventListener("visibilitychange", function(){
+    if (!document.hidden) poll();
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+# /etc/systemd/system/trading-bot.service
+#
+#   sudo cp deploy/trading-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now trading-bot
+#   journalctl -u trading-bot -f
+
+[Unit]
+Description=Binance futures bot
+Documentation=file:/opt/trading-bot/README.md
+After=network-online.target chronyd.service
+Wants=network-online.target
+# Signed requests fail if the clock drifts, so do not start before time sync.
+After=time-sync.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/trading-bot/run.py trade
+
+# Restart on crash, but give up if it is crash-looping -- a bot that cannot
+# stay up should page you, not thrash against the exchange's rate limits.
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Stop cleanly: SIGINT is what the engine's shutdown path listens for, so it
+# cancels open orders before exiting.
+KillSignal=SIGINT
+# Must exceed the engine's shutdown path: cancel orders, then stop the
+# controllers (Telegram joins for up to 5s). 60 leaves comfortable margin.
+# (QA R3)
+TimeoutStopSec=60
+
+# Hardening. The bot needs outbound HTTPS and its own directory, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# This box is expected to run other things -- websites, jobs -- so the bot is
+# capped to stay a good neighbour. It idles well under 100 MB and a few percent
+# of one core; these limits are generous headroom, not a target.
+MemoryMax=1G
+CPUQuota=50%
+TasksMax=64
+# Yield to interactive work (a web server serving a request) under contention.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+[Install]
+WantedBy=multi-user.target

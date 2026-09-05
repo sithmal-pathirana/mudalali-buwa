@@ -1,0 +1,95 @@
+# Behaviour lives here. Secrets live in .env -- never in this file.
+
+mode: testnet          # testnet | live   (testnet uses fake money on real markets)
+dry_run: true          # true = log intended orders, send nothing. Your first run.
+realtime: true         # websockets: 1 price/sec + real fills. false = REST polling.
+
+symbol: BTCUSDT
+interval: 15m
+strategy: switcher     # switcher | trend_atr | mean_reversion | funding_arb
+poll_seconds: 20       # only used when realtime: false
+
+risk:
+  max_leverage: 3            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
+  risk_per_trade_pct: 2.0    # % of equity between entry and stop
+  max_position_pct: 100.0
+  daily_loss_limit_pct: 5.0  # halts the bot for the day; restart is manual
+  max_trades_per_day: 10
+  min_equity_usdt: 10.0      # below this the bot stops permanently
+  allow_averaging_down: false
+  entry_expiry_minutes: 60     # cancel a limit entry that never fills
+  # What `touch KILL` means:
+  #   flatten - close the position at market, then cancel everything and exit
+  #   protect - stop trading, leave the position and its stop on the exchange
+  # Halting is separate and never does either: it stops new trades and leaves
+  # everything open and monitored.
+  kill_action: flatten
+
+# Daily profit targets. stop_when_reached is the real mechanism behind
+# "guarantee the profit": once the day's target is banked the bot stops
+# trading, so a won day cannot be given back. It cannot make the target
+# arrive -- nothing can -- but it can stop you handing it back.
+targets:
+  stop_when_reached: true
+  schedule:
+    - from_day: 1
+      usd_per_day: 2.0
+    - from_day: 16           # your day-15 escalation
+      usd_per_day: 3.0
+
+# Telegram control. Outbound-only: the bot long-polls Telegram, so the host
+# needs no inbound port and nothing opened in a cloud security list. Commands
+# are accepted ONLY from TELEGRAM_CHAT_ID, and close/halt/resume each require
+# pressing a confirmation button.
+#   /usr/bin/python3 run.py telegram --setup     finds your chat id
+telegram:
+  control: false      # opt in: this turns your alert bot into a command surface
+
+# Web dashboard: monitor and close trades from a phone or laptop.
+# host stays on 127.0.0.1 -- this endpoint can close positions, so reach it
+# over an SSH tunnel rather than exposing it on a public cloud IP:
+#   ssh -L 8080:127.0.0.1:8080 ubuntu@<oracle-ip>
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+
+alerts:
+  approach_pct: 80.0         # warn once price is 80% of the way to TP or SL
+  heartbeat_minutes: 360     # periodic "still alive + progress" message; 0 disables
+
+# Params for the strategy named above. For `switcher`, use instead:
+#
+#   params:
+#     regime: {window: 30, trend_above: 0.35, range_below: 0.20, confirm_bars: 3}
+#     trend:  {channel: 20, atr_period: 14, atr_stop_mult: 2.0, atr_target_mult: 3.0}
+#     routes: {trending: trend_atr, ranging: null, unclear: null}
+#
+# Those routes are measured, not assumed -- see tools/regime_edge.py. Gating
+# trend_atr to trending markets cut losses by roughly 70% in BOTH the fitted
+# window and an unseen earlier one, but the result is still negative
+# out-of-sample. Do not trade it expecting profit.
+params:
+  regime:
+    window: 30
+    trend_above: 0.35      # efficiency ratio above this = trending
+    range_below: 0.20      # below this = ranging
+    confirm_bars: 3        # hysteresis: bars a new regime must persist
+    min_atr_pct: 0.15
+  trend:
+    channel: 20
+    atr_period: 14
+    atr_stop_mult: 2.0
+    atr_target_mult: 3.0
+    min_atr_pct: 0.15
+  revert:
+    window: 20
+    z_entry: 2.0
+    atr_stop_mult: 1.5
+  # Measured, not assumed. mean_reversion loses in every regime, so nothing
+  # routes to it -- see tools/regime_edge.py. Override at runtime with
+  # /strategy in Telegram or the dashboard selector.
+  routes:
+    trending: trend_atr
+    ranging: null
+    unclear: null

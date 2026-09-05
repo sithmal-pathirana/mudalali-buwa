@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      # The offline layers only: no exchange calls, no credentials, and safe to
+      # run on every push. The network layer is deliberately excluded from CI.
+      - name: QA harness (offline)
+        run: python tools/qa.py --offline
+
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse a repo that ships armed or leaks secrets
+        run: |
+          set -e
+          if [ -f .env ]; then
+            echo "::error::.env is committed. Remove it and rotate every key it held."
+            exit 1
+          fi
+          if grep -qE '^\s*dry_run:\s*false' config.yaml; then
+            echo "::error::config.yaml ships with dry_run: false"
+            exit 1
+          fi
+          if grep -qE '^\s*mode:\s*live' config.yaml; then
+            echo "::error::config.yaml ships with mode: live"
+            exit 1
+          fi
+          echo "config ships safe: testnet + dry run, no .env"

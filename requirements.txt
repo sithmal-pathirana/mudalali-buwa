@@ -1,0 +1,2 @@
+PyYAML>=6.0        # config parsing
+websockets>=12     # required when realtime: true (the default)
