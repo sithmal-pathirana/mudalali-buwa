@@ -156,6 +156,43 @@ def cmd_doctor(cfg: Config) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- report
+def cmd_report(cfg: Config, args) -> int:
+    import json as _json
+
+    from bot import report as rp
+    from bot.binanceapi import Binance
+
+    if not cfg.api_key:
+        print(f"\n  No API key for mode={cfg.mode}. The report reads your account "
+              f"history,\n  so credentials are required.\n")
+        return 1
+
+    api = Binance(cfg.api_key, cfg.api_secret, testnet=cfg.testnet)
+    api.sync_clock()
+    data = rp.gather(api, cfg.symbol, args.days)
+    data["state"] = rp._local_state()
+    data["log"] = rp._log_signals(args.days)
+    data["mode"] = cfg.mode
+    data["strategy"] = cfg.strategy
+    data["interval"] = cfg.interval
+
+    text = rp.render(data)
+    print()
+    print(text)
+    print()
+
+    out = Path(args.out) if args.out else ROOT / "logs" / "run-report.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text + "\n")
+    print(f"  saved to {out}")
+    if args.out and args.out.endswith(".json"):
+        Path(args.out).write_text(_json.dumps(data, indent=2, default=str))
+        print(f"  raw json at {args.out}")
+    print("  This contains no keys or account identifiers -- safe to share.\n")
+    return 0
+
+
 # --------------------------------------------------------------------- myip
 def public_ip() -> str | None:
     """Whatever the outside world sees this host as. Several sources, in case
@@ -637,6 +674,9 @@ def main() -> int:
     sub.add_parser("project", help="model the escalating target schedule")
     sub.add_parser("netcheck", help="probe every endpoint this host needs")
     sub.add_parser("myip", help="this host's public IP, for Binance IP restriction")
+    rp = sub.add_parser("report", help="what actually happened, from exchange records")
+    rp.add_argument("--days", type=int, default=8, help="how far back (default 8)")
+    rp.add_argument("--out", default=None, help="also write the raw JSON here")
     v = sub.add_parser("verifykey", help="test an API key/secret pair before saving it")
     v.add_argument("--live", action="store_true",
                    help="check against live Binance instead of testnet")
@@ -675,6 +715,8 @@ def main() -> int:
         return cmd_netcheck(cfg)
     if args.cmd == "myip":
         return cmd_myip()
+    if args.cmd == "report":
+        return cmd_report(cfg, args)
     if args.cmd == "verifykey":
         return cmd_verifykey(cfg, args)
     if args.cmd == "alerts":

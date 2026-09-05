@@ -267,6 +267,20 @@ class Binance:
     def close_listen_key(self) -> None:
         self._request("DELETE", "/fapi/v1/listenKey", signed=True)
 
+    def user_trades(self, symbol: str, start_ms: int | None = None, limit: int = 1000):
+        """Actual fills, as the exchange recorded them."""
+        p = {"symbol": symbol, "limit": limit}
+        if start_ms:
+            p["startTime"] = start_ms
+        return self._request("GET", "/fapi/v1/userTrades", p, signed=True)
+
+    def all_orders(self, symbol: str, start_ms: int | None = None, limit: int = 1000):
+        """Every order including cancelled and expired ones."""
+        p = {"symbol": symbol, "limit": limit}
+        if start_ms:
+            p["startTime"] = start_ms
+        return self._request("GET", "/fapi/v1/allOrders", p, signed=True)
+
     def income(self, income_type: str | None = None, start_ms: int | None = None, limit: int = 100):
         p = {"limit": limit}
         if income_type:
