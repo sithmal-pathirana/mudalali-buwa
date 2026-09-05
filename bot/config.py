@@ -43,6 +43,20 @@ class DashboardConfig:
 
 
 @dataclass
+class PortfolioConfig:
+    """
+    Concurrency is derived, not chosen. Fix the portfolio risk you can accept
+    and let per-trade risk shrink as slots are added; the count then scales
+    with equity instead of inheriting a number tuned for a different account.
+    """
+    enabled: bool = False            # opt in: the engine still trades one symbol
+    max_concurrent: str | int = "auto"
+    portfolio_risk_pct: float = 6.0
+    hard_cap: int = 40
+    stop_distance: float = 0.02      # representative, for converting risk to size
+
+
+@dataclass
 class TelegramConfig:
     # Off by default: a control surface should be opted into, not inherited by
     # anyone who configured a token for alerts. (QA R7)
@@ -63,6 +77,7 @@ class Config:
     alerts: AlertConfig = field(default_factory=AlertConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -93,7 +108,8 @@ class Config:
         # entry here would let the raw dict flow through into the field, which
         # is precisely how the `telegram:` section broke once.
         sections = {"risk": RiskConfig, "alerts": AlertConfig,
-                    "dashboard": DashboardConfig, "telegram": TelegramConfig}
+                    "dashboard": DashboardConfig, "telegram": TelegramConfig,
+                    "portfolio": PortfolioConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}

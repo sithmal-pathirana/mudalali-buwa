@@ -107,3 +107,80 @@ class TestNoImportCycle(unittest.TestCase):
              "import bot.scanner, bot.regime, bot.strategies, bot.engine; print('ok')"],
             capture_output=True, text=True)
         self.assertIn("ok", r.stdout, r.stderr[-400:])
+
+
+class TestAutoScaling(unittest.TestCase):
+    """
+    Slot count must scale with equity in BOTH directions -- a $43 account and a
+    $4,300 account should each fill their own capacity, not inherit a number
+    tuned for the other.
+    """
+
+    def _slots(self, equity, cap=6.0, lev=3.0):
+        from bot.portfolio import auto_slots
+        return auto_slots(equity, cap, lev)
+
+    def test_more_equity_never_means_fewer_slots(self):
+        counts = [self._slots(e)[0] for e in (20, 43, 75, 100, 500, 5000)]
+        self.assertEqual(counts, sorted(counts))
+
+    def test_small_account_is_bounded_by_the_exchange_minimum(self):
+        slots, per_trade = self._slots(20.0)
+        notional = 20.0 * per_trade / 100 / 0.02
+        self.assertGreaterEqual(notional, 5.0)
+        self.assertGreater(slots, 1, "a $20 account should still hold several")
+
+    def test_forty_three_dollars_supports_far_more_than_three(self):
+        """The old fixed 2%/6% split gave 3; deriving per-trade risk gives many."""
+        slots, _ = self._slots(43.0)
+        self.assertGreaterEqual(slots, 20)
+
+    def test_every_slot_clears_the_minimum_order(self):
+        for equity in (15, 43, 100, 1000):
+            slots, per_trade = self._slots(equity)
+            if not slots:
+                continue
+            notional = equity * per_trade / 100 / 0.02
+            self.assertGreaterEqual(round(notional, 6), 5.0,
+                                    f"${equity} slots are below the minimum")
+
+    def test_total_notional_respects_leverage(self):
+        for equity in (43, 100, 1000):
+            slots, per_trade = self._slots(equity, lev=3.0)
+            deployed = slots * equity * per_trade / 100 / 0.02
+            self.assertLessEqual(round(deployed, 6), equity * 3.0 + 1e-6)
+
+    def test_portfolio_risk_is_conserved_however_many_slots(self):
+        for equity in (43, 1000):
+            slots, per_trade = self._slots(equity, cap=6.0)
+            self.assertAlmostEqual(slots * per_trade, 6.0, places=6)
+
+    def test_hard_cap_is_respected(self):
+        from bot.portfolio import auto_slots
+        slots, _ = auto_slots(50_000.0, 6.0, 3.0, hard_cap=12)
+        self.assertLessEqual(slots, 12)
+
+    def test_zero_equity_yields_nothing(self):
+        self.assertEqual(self._slots(0.0)[0], 0)
+
+
+class TestPortfolioConfig(unittest.TestCase):
+    def test_multi_position_is_opt_in(self):
+        from bot.config import PortfolioConfig
+        self.assertFalse(PortfolioConfig().enabled,
+                         "multi-position must not switch on silently")
+
+    def test_defaults_to_auto(self):
+        from bot.config import PortfolioConfig
+        self.assertEqual(PortfolioConfig().max_concurrent, "auto")
+
+    def test_section_is_built_into_its_dataclass(self):
+        from bot.config import Config, PortfolioConfig
+        self.assertIsInstance(Config.load().portfolio, PortfolioConfig)
+
+    def test_universe_section_reaches_the_scanner(self):
+        from bot.config import Config
+        from bot.scanner import ScanConfig
+        cfg = Config.load()
+        sc = ScanConfig(**cfg.universe)
+        self.assertGreaterEqual(sc.max_symbols, 100)

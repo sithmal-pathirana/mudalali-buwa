@@ -214,8 +214,35 @@ def cmd_scan(cfg: Config, args) -> int:
             print(f"    {n:>3}  {reason}")
 
     print(f"\n  {res.summary()}")
-    if res.best:
+
+    from bot.portfolio import auto_slots
+    pf = cfg.portfolio
+    if str(pf.max_concurrent).lower() == "auto":
+        slots, per_trade = auto_slots(equity, pf.portfolio_risk_pct,
+                                      cfg.risk.max_leverage,
+                                      stop_distance=pf.stop_distance,
+                                      hard_cap=pf.hard_cap)
+    else:
+        slots = int(pf.max_concurrent)
+        per_trade = pf.portfolio_risk_pct / slots if slots else 0.0
+
+    if slots > 1:
+        per_slot = equity * per_trade / 100 / pf.stop_distance
+        print(f"\n  CAPACITY   {slots} concurrent slots, {per_trade:.2f}% risk each, "
+              f"~${per_slot:,.2f} notional per slot")
+        fill = res.ranked[:slots]
+        if fill:
+            print(f"  would open {len(fill)}: "
+                  + ", ".join(c.symbol for c in fill))
+        if len(res.ranked) < slots:
+            print(f"  only {len(res.ranked)} candidates passed, so "
+                  f"{slots - len(res.ranked)} slots stay empty -- as they should")
+    elif res.best:
         print(f"\n  the bot would trade {res.best.symbol} next time it is flat")
+
+    if not pf.enabled:
+        print("\n  NOTE: portfolio.enabled is false, so the engine still trades one")
+        print("  symbol at a time. The capacity above is what it COULD run.")
     print()
     return 0
 

@@ -76,6 +76,52 @@ def capacity(equity: float, per_trade_risk_pct: float, portfolio_risk_pct: float
                     limited_by=limited_by, detail=detail)
 
 
+def auto_slots(equity: float, portfolio_risk_pct: float, max_leverage: float,
+               stop_distance: float = 0.02, min_notional: float = 5.0,
+               hard_cap: int = 40) -> tuple[int, float]:
+    """
+    How many slots this equity supports, and the per-trade risk that fits them.
+
+    Rather than fixing per-trade risk and discovering how few positions fit,
+    fix the PORTFOLIO risk and let per-trade risk shrink as slots are added:
+
+        per_trade_risk = portfolio_risk / slots
+
+    Slots are then bounded by whichever binds first -- every slot must still
+    clear the exchange minimum, and total notional must respect leverage. This
+    scales in both directions: a $43 account and a $4,300 account both fill
+    their capacity instead of inheriting a number tuned for the other.
+
+    Returns (slots, per_trade_risk_pct).
+    """
+    if equity <= 0 or portfolio_risk_pct <= 0:
+        return 0, 0.0
+
+    total_notional = equity * max_leverage
+    best = 0
+    for n in range(1, hard_cap + 1):
+        per_trade = portfolio_risk_pct / n
+        notional = equity * per_trade / 100 / stop_distance
+        if notional < min_notional:
+            break                       # slots would be too small to place
+        if notional * n > total_notional + 1e-9:
+            break                       # would exceed the leverage ceiling
+        best = n
+    return best, (portfolio_risk_pct / best if best else 0.0)
+
+
+def explain_auto(equity: float, portfolio_risk_pct: float = 6.0,
+                 max_leverage: float = 3.0, min_notional: float = 5.0) -> str:
+    slots, per_trade = auto_slots(equity, portfolio_risk_pct, max_leverage,
+                                  min_notional=min_notional)
+    if not slots:
+        return f"  ${equity:,.2f}: cannot fund a single position"
+    notional = equity * per_trade / 100 / 0.02
+    return (f"  ${equity:>10,.2f}  {slots:>3} slots  "
+            f"{per_trade:>5.2f}% each  ${notional:>9,.2f}/slot  "
+            f"${notional * slots:>10,.2f} deployed")
+
+
 def explain(equity: float, per_trade: float, portfolio: float,
             leverage: float, requested: int) -> str:
     c = capacity(equity, per_trade, portfolio, leverage, requested)

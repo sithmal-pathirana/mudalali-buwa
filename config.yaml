@@ -37,6 +37,27 @@ targets:
     - from_day: 16           # your day-15 escalation
       usd_per_day: 3.0
 
+# Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
+# portfolio risk you can accept and per-trade risk shrinks as slots are added,
+# so the count scales with equity instead of being tuned for one account size.
+#   $43  -> 25 slots at 0.24% each   (~$5.16 notional per slot)
+#   $100 -> 40 slots at 0.15% each   (~$7.50 per slot)
+# Slots are bounded by the exchange minimum order and the leverage ceiling.
+#   run.py scan --equity <n>   shows the capacity and what would fill it
+portfolio:
+  enabled: false          # opt in; the engine trades one symbol until this is true
+  max_concurrent: auto    # auto, or a fixed number
+  portfolio_risk_pct: 6.0 # total risk across ALL open positions
+  hard_cap: 40
+
+# Universe scanning: which coins are even considered.
+universe:
+  max_symbols: 100
+  min_quote_volume: 20000000
+  min_efficiency: 0.30
+  min_atr_pct: 0.25
+  rescan_seconds: 300
+
 # Telegram control. Outbound-only: the bot long-polls Telegram, so the host
 # needs no inbound port and nothing opened in a cloud security list. Commands
 # are accepted ONLY from TELEGRAM_CHAT_ID, and close/halt/resume each require
