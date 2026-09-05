@@ -59,7 +59,7 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 # ------------------------------------------------------------------- doctor
-def cmd_doctor(cfg: Config) -> int:
+def cmd_doctor(cfg: Config, equity_override: float | None = None) -> int:
     from bot.binanceapi import Binance, BinanceError
     from bot.filters import SymbolRules
     from bot.strategies import build
@@ -94,6 +94,13 @@ def cmd_doctor(cfg: Config) -> int:
     else:
         print(f"  account       no API key for mode={cfg.mode}; using $43 for sizing math")
 
+    if equity_override is not None:
+        # Testnet hands you a large demo balance, which hides exactly the
+        # constraint that decides everything live: whether the account can
+        # legally place the order at all.
+        print(f"\n  PLANNING AGAINST ${equity_override:,.2f} "
+              f"(actual balance ignored)")
+        equity = equity_override
     equity = equity if equity else 43.0
     strat = build(cfg.strategy, cfg.params)
     ok, note = strat.feasible(equity, price, rules)
@@ -691,7 +698,10 @@ def main() -> int:
                    help="serve synthetic data so you can look at the UI now")
     d.add_argument("--host", default=None, help="override bind address")
     d.add_argument("--port", type=int, default=None)
-    sub.add_parser("doctor", help="connectivity, filters, affordability")
+    doc = sub.add_parser("doctor", help="connectivity, filters, affordability")
+    doc.add_argument("--equity", type=float, default=None,
+                     help="plan against this equity instead of the account balance "
+                          "(e.g. --equity 43 to see what live would do)")
     b = sub.add_parser("backtest", help="measure the strategy on history")
     b.add_argument("--validate", action="store_true", help="prove the harness is honest")
     b.add_argument("--equity", type=float, default=43.0)
@@ -726,7 +736,7 @@ def main() -> int:
     if args.cmd == "telegram":
         return cmd_telegram(cfg, args)
     if args.cmd == "doctor":
-        return cmd_doctor(cfg)
+        return cmd_doctor(cfg, getattr(args, "equity", None))
     if args.cmd == "backtest":
         return cmd_backtest(cfg, args)
     if args.cmd == "trade":

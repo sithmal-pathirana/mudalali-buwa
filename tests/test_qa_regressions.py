@@ -517,3 +517,27 @@ class TestSharedHostSafety(unittest.TestCase):
         from bot.config import DashboardConfig
         self.assertEqual(DashboardConfig(port=9123).port, 9123)
         self.assertIn("port", (ROOT / "config.yaml").read_text())
+
+
+class TestSymbolIsSingular(unittest.TestCase):
+    """
+    The engine trades exactly one symbol. Worth pinning, because the config key
+    is singular and someone will eventually try a list.
+    """
+
+    def test_config_symbol_is_a_string(self):
+        from bot.config import Config
+        self.assertIsInstance(Config().symbol, str)
+
+    def test_engine_scopes_everything_to_one_symbol(self):
+        import inspect
+        from bot.engine import Engine
+        for method in (Engine.startup, Engine.place, Engine.close_position):
+            self.assertIn("self.cfg.symbol", inspect.getsource(method))
+
+    def test_doctor_can_plan_against_a_different_equity(self):
+        """Testnet's demo balance hides the constraint that decides live."""
+        src = (ROOT / "run.py").read_text()
+        self.assertIn("--equity", src)
+        self.assertIn("equity_override", src)
+        self.assertIn("PLANNING AGAINST", src)
