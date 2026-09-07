@@ -35,6 +35,7 @@ class Event(Enum):
     TARGET_RAISED = "daily target raised"
     HALT = "HALTED"
     DAILY_SUMMARY = "daily summary"
+    SCAN = "scan"
     ERROR = "error"
 
 
@@ -49,7 +50,8 @@ ICON = {
     Event.APPROACH_TP: "[ ~ ]", Event.APPROACH_SL: "[ ! ]",
     Event.TP_HIT: "[ + ]", Event.SL_HIT: "[ - ]",
     Event.TARGET_REACHED: "[ = ]", Event.TARGET_RAISED: "[ ^ ]",
-    Event.HALT: "[!!!]", Event.DAILY_SUMMARY: "[ i ]", Event.ERROR: "[ x ]",
+    Event.HALT: "[!!!]", Event.DAILY_SUMMARY: "[ i ]", Event.SCAN: "[ o ]",
+    Event.ERROR: "[ x ]",
 }
 
 

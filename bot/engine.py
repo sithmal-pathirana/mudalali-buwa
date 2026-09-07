@@ -210,6 +210,28 @@ class Engine:
             return actual
         return min(actual, cap)
 
+    def rebase_day_start_equity(self) -> None:
+        """
+        Keep both halves of the daily-loss comparison on one basis.
+
+        The limit measures day_start_equity against the equity every other
+        decision uses -- the capped one. Setting or lowering
+        `risk.equity_cap_usdt` mid-day changes only the second half: the day
+        was anchored at the account's real 5,000 and is then measured at 100,
+        which reads as -98% and halts on the very next bar. Re-anchor the day
+        through the same cap instead. (QA R9)
+        """
+        anchor = self.state.day_start_equity
+        if anchor <= 0:
+            return
+        capped = self.effective_equity(anchor)
+        if capped < anchor:
+            log.warning("day start equity re-based %.2f -> %.2f to match the "
+                        "equity cap; the daily loss limit was measuring a "
+                        "drawdown that never happened", anchor, capped)
+            self.state.day_start_equity = capped
+            self.state.save()
+
     def rules_for(self, symbol: str):
         """Per-symbol filters, cached. exchangeInfo is one request for all."""
         if symbol not in self._rules_cache:
@@ -452,12 +474,16 @@ class Engine:
                 msg = (f"A scan finished {age:.0f}s ago. Rescanning is limited "
                        f"to once every {self.MIN_SCAN_INTERVAL}s -- send /scan "
                        f"to see that result.")
-                self.notify.send(Event.DAILY_SUMMARY, msg)
+                self.notify.send(Event.SCAN, msg, symbol="market")
                 return msg
 
-        self.notify.send(Event.DAILY_SUMMARY,
+        # A market-wide scan is not the configured symbol's daily summary, and
+        # titling it that way put "[ i ] BTCUSDT daily summary" above a message
+        # about a hundred other coins. (QA R9)
+        self.notify.send(Event.SCAN,
                          f"Scanning up to {self.scanner.cfg.max_symbols} symbols "
-                         f"({origin or 'local'})... this takes about a minute.")
+                         f"({origin or 'local'})... this takes about a minute.",
+                         symbol="market")
         try:
             budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
                       / self.cfg.portfolio.stop_distance)
@@ -471,7 +497,7 @@ class Engine:
         top = ", ".join(c.symbol for c in res.ranked[:5]) or "nothing passed"
         msg = (f"Scan complete: {len(res.ranked)}/{res.considered} passed "
                f"in {res.elapsed:.0f}s\nTop: {top}\n\nSend /scan for the full list.")
-        self.notify.send(Event.DAILY_SUMMARY, msg)
+        self.notify.send(Event.SCAN, msg, symbol="market")
         return msg
 
     def set_strategy(self, name: str, origin: str = "") -> str:
@@ -682,6 +708,7 @@ class Engine:
                         short_warning(self.equity, self.aggressive_profile))
 
         self.state.roll_day_if_needed(self.equity)
+        self.rebase_day_start_equity()
         self.schedule.start_date = self.state.schedule_start_date
         log.info("targets: %s", self.schedule.describe(self.equity))
 
@@ -1005,10 +1032,14 @@ class Engine:
             log.warning("stream disconnected: %s", ev.reason)
 
     def on_tick(self, tick: Tick) -> None:
-        self.last_price = tick.mark_price
         if self.last_prices is None:
             self.last_prices = {}
         self.last_prices[tick.symbol] = tick.mark_price
+        # `last_price` is the CONFIGURED symbol's price: it is what /status and
+        # the heartbeat print next to that symbol's name. Letting any held coin
+        # write to it published "BTCUSDT ... price 0.1946". (QA R9)
+        if tick.symbol.upper() == self.cfg.symbol.upper():
+            self.last_price = tick.mark_price
         self._tick_guard()
         if self.cfg.dry_run:
             self.simulate_entry(tick.mark_price, tick.symbol)
@@ -1026,14 +1057,14 @@ class Engine:
             self.notify.send(
                 Event.APPROACH_TP,
                 f"{to_tp*100:.0f}% of the way to take-profit.\n{pos.status_line(price)}",
-                dedupe_key=f"tp:{pos.tag}")
+                dedupe_key=f"tp:{pos.tag}", symbol=pos.symbol)
 
         to_sl = pos.progress_to_stop(price)
         if to_sl >= threshold:
             self.notify.send(
                 Event.APPROACH_SL,
                 f"{to_sl*100:.0f}% of the way to the stop.\n{pos.status_line(price)}",
-                dedupe_key=f"sl:{pos.tag}")
+                dedupe_key=f"sl:{pos.tag}", symbol=pos.symbol)
 
         if self.cfg.dry_run:
             self.simulate_exit(price, tick.symbol)
@@ -1068,7 +1099,7 @@ class Engine:
                              sym, age)
                     self.notify.send(Event.DAILY_SUMMARY,
                                      f"DRY RUN -- {sym} entry expired unfilled "
-                                     f"after {age:.0f} min. No trade.")
+                                     f"after {age:.0f} min. No trade.", symbol=sym)
                     continue
 
             px = (self.last_prices or {}).get(sym)
@@ -1084,7 +1115,7 @@ class Engine:
             log.info("dry_run: %s entry filled at %.6f", sym, px)
             self.notify.send(Event.TRADE_OPEN,
                              f"DRY RUN -- {sym} entry filled at {px:,.4f}\n"
-                             f"{pending.status_line(px)}")
+                             f"{pending.status_line(px)}", symbol=sym)
 
     def simulate_exit(self, price: float, symbol: str | None = None) -> None:
         """
@@ -1115,7 +1146,7 @@ class Engine:
         prog = self.schedule.progress(self.state.realized_today)
         self.notify.send(event,
                          f"DRY RUN -- simulated close at {exit_px:,.4f} "
-                         f"for {pnl:+.2f} USDT\n{prog}")
+                         f"for {pnl:+.2f} USDT\n{prog}", symbol=pos.symbol)
         self.release(pos.symbol)
         self._entry_placed_at = 0.0
         self.check_target_reached()
@@ -1129,6 +1160,13 @@ class Engine:
         return self.emergency_check()      # may set the stopping flag
 
     def on_bar(self, bar: BarClosed) -> None:
+        # Every held symbol streams its own klines on the same socket. Taking
+        # them all meant one series blended several markets -- so the regime
+        # router and the single-symbol path read a chart that does not exist --
+        # and decide() ran once per subscribed symbol, which is how the same
+        # entry was placed three times inside one second. (QA R9)
+        if bar.symbol and bar.symbol.upper() != self.cfg.symbol.upper():
+            return
         self.bars.append(Bar(bar.open_time, bar.open, bar.high, bar.low, bar.close, bar.volume))
         self.bars = self.bars[-(self.strategy.warmup + 200):]
         self.decide()
@@ -1177,7 +1215,8 @@ class Engine:
             self.notify.send(
                 event,
                 f"{upd.symbol} closed at {upd.avg_price:,.4f} for "
-                f"{pnl:+.2f} USDT\n{prog}\nequity ${self.equity:,.2f}")
+                f"{pnl:+.2f} USDT\n{prog}\nequity ${self.equity:,.2f}",
+                symbol=upd.symbol)
             self.release(upd.symbol)
             self.check_target_reached()
 
@@ -1197,7 +1236,7 @@ class Engine:
                 Event.TRADE_OPEN,
                 f"{upd.symbol} entry filled at {upd.avg_price:,.4f} "
                 f"(asked {asked:,.4f}, slippage {slip:+.4f})\n"
-                f"{pos.status_line(upd.avg_price)}")
+                f"{pos.status_line(upd.avg_price)}", symbol=upd.symbol)
 
     # -------------------------------------------------------------- periodic
     def periodic(self) -> None:
@@ -1213,6 +1252,7 @@ class Engine:
         self.actual_equity = snap["equity"]
         self.equity = self.effective_equity(snap["equity"])
 
+        self.rebase_day_start_equity()
         if self.state.roll_day_if_needed(self.equity):
             self.schedule.start_date = self.state.schedule_start_date
             step = self.schedule.escalates_today()
@@ -1284,7 +1324,8 @@ class Engine:
             self.notify.send(
                 Event.DAILY_SUMMARY,
                 f"{symbol} is flat but {len(still_open)} protective order(s) "
-                f"were still listed. Cancelled them and released tracking.")
+                f"were still listed. Cancelled them and released tracking.",
+                symbol=symbol)
             self.release(symbol)
             self._entry_placed_at = 0.0
             return
@@ -1481,16 +1522,25 @@ class Engine:
             log.info("portfolio: %s", alloc)
             return 0
 
-        free = alloc.slots - len(self.book)
+        # A resting dry-run entry occupies a slot exactly as a filled one does.
+        # Counting only `book` let the next cycle re-enter the same symbol --
+        # duplicate "limit entry resting" alerts, the older entry silently
+        # overwritten, and the slot and leverage caps measured against a book
+        # that under-reported what was committed. (QA R9)
+        pending = self._dry_pending or {}
+        committed = {**self.book, **pending}
+
+        free = alloc.slots - len(committed)
         if free <= 0:
             return 0
-        log.info("portfolio: %s | %d held, %d free", alloc, len(self.book), free)
+        log.info("portfolio: %s | %d held, %d resting, %d free",
+                 alloc, len(self.book), len(pending), free)
 
         opened = 0
         for cand in result.ranked:
             if opened >= free:
                 break
-            if cand.symbol in self.book:
+            if cand.symbol in committed:
                 continue
             signal = self.strategy.on_bars(cand.bars, 0.0)
             if signal is None:
@@ -1505,7 +1555,7 @@ class Engine:
                          cand.symbol, sized.reason)
                 continue
 
-            gate = self.risk.check_portfolio(self.book, self.equity,
+            gate = self.risk.check_portfolio(committed, self.equity,
                                              sized.qty_notional, cand.symbol, pf)
             if not gate:
                 log.info("portfolio: %s refused -- %s", cand.symbol, gate.reason)
@@ -1515,9 +1565,11 @@ class Engine:
             # Subscribe for a RESTING entry too, not only a filled position --
             # in dry run the entry sits in _dry_pending and would otherwise
             # never receive a tick of its own.
-            tracked = (cand.symbol in self.book
-                       or cand.symbol in (self._dry_pending or {}))
-            if tracked and self.stream is not None:
+            placed = (self.book.get(cand.symbol)
+                      or (self._dry_pending or {}).get(cand.symbol))
+            if placed is not None:
+                committed[cand.symbol] = placed
+            if placed is not None and self.stream is not None:
                 self.stream.add_symbol(cand.symbol)
             opened += 1
 
@@ -1608,8 +1660,9 @@ class Engine:
                      "trade through it", price)
             self.notify.send(Event.TRADE_OPEN,
                              f"DRY RUN -- limit entry resting (not filled):\n"
-                             f"{signal.side} {qty} @ {price}\nSL {stop_price}  TP {tp_price}\n"
-                             f"{risk_note}")
+                             f"{signal.side} {qty} {symbol} @ {price}\n"
+                             f"SL {stop_price}  TP {tp_price}\n"
+                             f"{risk_note}", symbol=symbol)
             return
 
         if not self.prepare_symbol(symbol):
@@ -1663,4 +1716,4 @@ class Engine:
             Event.TRADE_OPEN,
             f"{signal.side} {qty} {symbol} @ {price}\n"
             f"SL {stop_price}   TP {tp_price}\n{risk_note}\n"
-            f"{signal.reason}\n{prog}")
+            f"{signal.reason}\n{prog}", symbol=symbol)

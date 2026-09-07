@@ -49,7 +49,13 @@ class RiskManager:
             return Decision(False, "below equity floor")
 
         if self.state.day_start_equity > 0:
-            drawdown_pct = (self.state.day_start_equity - equity) / self.state.day_start_equity * 100
+            by_equity = (self.state.day_start_equity - equity) / self.state.day_start_equity * 100
+            # Dry-run fills never reach the exchange balance, so the equity
+            # feed reports a flat day however much the simulation lost. Take
+            # the worse of the two views so the limit means something in the
+            # mode the README tells you to live in for days.
+            by_realized = -self.state.realized_today / self.state.day_start_equity * 100
+            drawdown_pct = max(by_equity, by_realized)
             if drawdown_pct >= self.cfg.daily_loss_limit_pct:
                 self.state.halt(
                     f"daily loss limit hit: -{drawdown_pct:.2f}% "
