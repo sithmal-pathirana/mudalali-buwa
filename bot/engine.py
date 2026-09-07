@@ -157,6 +157,134 @@ class Engine:
     def position_for(self, symbol: str) -> "ActivePosition | None":
         return self.book.get(symbol)
 
+    def opened_ms_for(self, symbol: str) -> int:
+        """
+        When the position currently open on `symbol` was first opened.
+
+        The exchange reports a position's updateTime, which is its LAST change
+        -- on a position that was added to, that is not the opening fill, and
+        booking realised P&L from it would miss the entry and its commission.
+        So walk the fills forward instead and keep the timestamp of whichever
+        one last took the running quantity away from flat.
+
+        Returns 0 when it cannot be determined; the caller falls back.
+        """
+        try:
+            fills = self.api.user_trades(symbol)
+        except BinanceError as e:
+            log.warning("could not date the open position on %s: %s", symbol, e)
+            return 0
+
+        running, opened = 0.0, 0
+        for f in sorted(fills, key=lambda r: int(r.get("time") or 0)):
+            try:
+                qty = float(f["qty"])
+                when = int(f["time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(running) < 1e-9:
+                opened = when                   # this fill starts a position
+            running += qty if f.get("side") == "BUY" else -qty
+            if abs(running) < 1e-9:
+                opened = 0                      # and that position is closed
+        return opened
+
+    def adopt_open_positions(self) -> int:
+        """
+        Rebuild the book from what the exchange says is actually open.
+
+        The book lived in memory only, and startup reconciled cfg.symbol alone.
+        So a restart -- including the automatic one after a crash -- forgot
+        every scanner-opened position still running: no close alert, its P&L
+        never booked, and, because the slot it occupied was forgotten with it,
+        the scanner was free to open a second position alongside the first.
+        The protective stop survived, since it lives on the exchange, so the
+        money stayed covered; the bot's picture of it did not.
+
+        Adoption is deliberately not a halt. A position found without a stop is
+        reported loudly and kept, because adopting it is what stops the bot
+        stacking another trade on top of it -- refusing to start would leave it
+        both unprotected and untracked, which is strictly worse.
+        """
+        if self.cfg.dry_run:
+            return 0
+        try:
+            live = [r for r in self.api.positions()
+                    if float(r.get("positionAmt") or 0.0) != 0.0]
+            orders = list(self.api.open_orders()) + list(self.api.open_algo_orders())
+        except BinanceError as e:
+            log.error("could not read open positions to adopt: %s", e)
+            return 0
+        if not live:
+            return 0
+
+        by_symbol: dict[str, list] = {}
+        for o in orders:
+            by_symbol.setdefault(o.get("symbol", ""), []).append(o)
+
+        unprotected = []
+        for row in live:
+            symbol = row["symbol"]
+            amt = float(row["positionAmt"])
+            stop_o = tp_o = None
+            for o in by_symbol.get(symbol, []):
+                kind = (o.get("type") or "").upper()
+                if "TAKE_PROFIT" in kind:
+                    tp_o = tp_o or o
+                elif "STOP" in kind:
+                    stop_o = stop_o or o
+
+            def price_of(o):
+                try:
+                    return float(o.get("stopPrice") or 0.0) if o else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            pos = ActivePosition(
+                symbol=symbol,
+                side="BUY" if amt > 0 else "SELL",
+                entry=float(row.get("entryPrice") or 0.0),
+                stop=price_of(stop_o),
+                take_profit=price_of(tp_o),
+                qty=abs(amt),
+                # Synthetic, and deliberately not empty: reconcile_position
+                # intersects these ids with the open-order list, and a blank
+                # would collide with any order whose id failed to normalise.
+                entry_order_id=f"adopted-{symbol}",
+                stop_order_id=(stop_o or {}).get("clientOrderId", ""),
+                tp_order_id=(tp_o or {}).get("clientOrderId", ""),
+                tag=f"adopted-{symbol}",
+                opened_ms=(self.opened_ms_for(symbol)
+                           or int(row.get("updateTime") or 0)))
+            self.book[symbol] = pos
+            # Margin type and leverage are already whatever this position was
+            # opened with, and Binance rejects changing either while it is
+            # open. Marking it prepared skips a call that can only fail.
+            self._prepared.add(symbol)
+            if not pos.stop:
+                unprotected.append(symbol)
+            log.warning("adopted %s %s %g @ %.6f (stop %.6f, tp %.6f)",
+                        symbol, pos.side, pos.qty, pos.entry, pos.stop,
+                        pos.take_profit)
+
+        lines = "\n".join(
+            f"  {p.symbol} {p.side} {p.qty:g} @ {p.entry:,.6f}"
+            + ("  NO STOP" if not p.stop else f"  SL {p.stop:,.6f}")
+            for p in self.book.values())
+        self.notify.send(
+            Event.DAILY_SUMMARY,
+            f"Resumed tracking {len(live)} position(s) already open:\n{lines}")
+
+        if unprotected:
+            log.critical("adopted position(s) with NO protective stop: %s",
+                         ", ".join(unprotected))
+            self.notify.send(
+                Event.ERROR,
+                f"{', '.join(unprotected)} is open with NO stop on the "
+                f"exchange. It is tracked, so nothing new will be stacked on "
+                f"it, but it is not protected. Close it or set a stop by hand.")
+        return len(live)
+
     def realized_from_exchange(self, pos: ActivePosition) -> float | None:
         """
         What this position actually made, read back from the exchange's fills.
@@ -809,12 +937,17 @@ class Engine:
                                          f"previous run:\n{self.state.halt_reason}")
             return False
 
-        if snap["position_amt"] != 0.0:
-            log.warning("resuming with an existing position of %s; the bot did not "
-                        "open it in this run, so it has no stop it knows about. "
-                        "Close it by hand or restart flat.", snap["position_amt"])
+        # Ask the exchange what is open and resume managing it, rather than
+        # telling the user to "close it by hand or restart flat" -- which is
+        # what this did, for cfg.symbol only, while every scanner-opened
+        # position was silently dropped.
+        adopted = self.adopt_open_positions()
+        if adopted:
+            log.info("resumed %d position(s) from the exchange", adopted)
 
-        if not self.cfg.dry_run:
+        if not self.cfg.dry_run and self.cfg.symbol not in self.book:
+            # Skipped when the configured symbol is itself an adopted position:
+            # Binance rejects a margin-type change while one is open.
             self.api.set_margin_type(self.cfg.symbol, "ISOLATED")
             self.api.set_leverage(self.cfg.symbol, self.cfg.risk.max_leverage)
 
@@ -892,6 +1025,11 @@ class Engine:
                                  "Refused to start: the websockets package is missing.\n"
                                  "sudo apt-get install -y python3-websockets")
                 return False
+            # An adopted position needs its own ticks, or it is tracked but
+            # never priced -- the same blind spot polling mode had.
+            for sym in self.book:
+                if sym.upper() != self.cfg.symbol.upper():
+                    self.stream.add_symbol(sym)
 
         step = self.schedule.escalates_today()
         if step:

@@ -281,3 +281,165 @@ class TestExchangeSideCloseIsBooked(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdoptAPI(PricingAPI):
+    """An exchange with positions and orders already open, as after a restart."""
+
+    def __init__(self, live=(), orders=(), **kw):
+        super().__init__(**kw)
+        self.live = list(live)
+        self.orders = list(orders)
+
+    def positions(self, symbol=None):
+        self.calls.append(("positions", symbol))
+        if symbol:
+            return [r for r in self.live if r["symbol"] == symbol]
+        return list(self.live)
+
+    def open_orders(self, symbol=None):
+        self.calls.append(("open_orders", symbol))
+        return [o for o in self.orders if "TAKE_PROFIT" not in o["type"]
+                and "STOP" not in o["type"]]
+
+    def open_algo_orders(self, symbol=None):
+        self.calls.append(("open_algo_orders", symbol))
+        return [o for o in self.orders if "TAKE_PROFIT" in o["type"]
+                or "STOP" in o["type"]]
+
+
+INJ_LIVE = {"symbol": "INJUSDT", "positionAmt": "2.0", "entryPrice": "6.039",
+            "unRealizedProfit": "0.06", "liquidationPrice": "5.49",
+            "updateTime": 1788809430824}
+
+INJ_STOP = {"symbol": "INJUSDT", "clientOrderId": "s-2-1788809430",
+            "type": "STOP_MARKET", "side": "SELL", "stopPrice": "5.873",
+            "origQty": "0", "price": "0"}
+
+INJ_TP = {"symbol": "INJUSDT", "clientOrderId": "t-2-1788809430",
+          "type": "TAKE_PROFIT_MARKET", "side": "SELL", "stopPrice": "6.294",
+          "origQty": "0", "price": "0"}
+
+#: Fills that opened INJUSDT and never closed it, so the walk-back must date
+#: the position from the BUY rather than from any earlier round trip.
+INJ_FILLS = [
+    {"time": 1788700000000, "side": "BUY", "qty": "1.0", "realizedPnl": "0",
+     "commission": "0", "commissionAsset": "USDT"},
+    {"time": 1788700500000, "side": "SELL", "qty": "1.0",
+     "realizedPnl": "0.5", "commission": "0", "commissionAsset": "USDT"},
+    {"time": 1788809430824, "side": "BUY", "qty": "2.0", "realizedPnl": "0",
+     "commission": "0.004", "commissionAsset": "USDT"},
+]
+
+
+def _restarted(live=(INJ_LIVE,), orders=(INJ_STOP, INJ_TP), fills=INJ_FILLS):
+    """A freshly started engine, with the book still empty."""
+    e = engine(api=AdoptAPI(live=live, orders=orders, fills=fills,
+                            prices={"BTCUSDT": 79_097.9, "INJUSDT": 6.07}))
+    e.cfg.symbol = "BTCUSDT"
+    e.cfg.realtime = False
+    e.book = {}
+    e._dry_pending = {}
+    e._prepared = set()
+    return e
+
+
+class TestARestartAdoptsOpenPositions(unittest.TestCase):
+    """
+    The book lived in memory only and startup reconciled cfg.symbol alone, so
+    a restart forgot every scanner-opened position still running on the
+    exchange. Its stop survived -- that lives on Binance -- but the bot lost
+    the trade: no close alert, no realised P&L, and the freed slot let the
+    scanner open a second position beside the first.
+    """
+
+    def tearDown(self):
+        _cleanup()
+
+    def test_the_position_is_reproduced_from_the_exchange(self):
+        e = _restarted()
+        self.assertEqual(e.adopt_open_positions(), 1)
+        pos = e.book["INJUSDT"]
+        self.assertEqual((pos.side, pos.qty, pos.entry), ("BUY", 2.0, 6.039))
+
+    def test_the_protective_levels_come_back_too(self):
+        e = _restarted()
+        e.adopt_open_positions()
+        pos = e.book["INJUSDT"]
+        self.assertEqual(pos.stop, 5.873)
+        self.assertEqual(pos.take_profit, 6.294)
+        self.assertEqual(pos.stop_order_id, "s-2-1788809430")
+
+    def test_a_short_is_adopted_as_a_short(self):
+        short = dict(INJ_LIVE, positionAmt="-2.0")
+        e = _restarted(live=(short,))
+        e.adopt_open_positions()
+        self.assertEqual(e.book["INJUSDT"].side, "SELL")
+        self.assertEqual(e.book["INJUSDT"].qty, 2.0)
+
+    def test_the_slot_is_occupied_so_nothing_stacks_on_it(self):
+        e = _restarted()
+        e.adopt_open_positions()
+        self.assertEqual(len(e.book), 1,
+                         "an adopted position must consume its slot")
+
+    def test_a_stopless_position_is_reported_but_still_adopted(self):
+        e = _restarted(orders=())
+        e.adopt_open_positions()
+        self.assertIn("INJUSDT", e.book, "dropping it would leave it untracked")
+        self.assertEqual(e.book["INJUSDT"].stop, 0.0)
+        self.assertTrue([b for _, b in e.sent if "NO stop" in b])
+
+    def test_margin_type_is_not_re_set_on_an_open_position(self):
+        e = _restarted()
+        e.adopt_open_positions()
+        self.assertIn("INJUSDT", e._prepared,
+                      "Binance rejects a margin change while a position is open")
+
+    def test_a_flat_account_adopts_nothing(self):
+        e = _restarted(live=())
+        self.assertEqual(e.adopt_open_positions(), 0)
+        self.assertEqual(e.book, {})
+
+    def test_an_unreachable_exchange_does_not_stop_the_boot(self):
+        e = _restarted()
+
+        def boom(*a, **kw):
+            from bot.binanceapi import BinanceError
+            raise BinanceError(-1001, "disconnected", "/positionRisk")
+
+        e.api.positions = boom
+        self.assertEqual(e.adopt_open_positions(), 0)
+
+    def test_dry_run_adopts_nothing_real(self):
+        e = _restarted()
+        e.cfg.dry_run = True
+        self.assertEqual(e.adopt_open_positions(), 0)
+
+
+class TestAdoptedPositionsAreDatedCorrectly(unittest.TestCase):
+    """
+    opened_ms bounds the userTrades query that books realised P&L. Dating an
+    adopted position from the exchange's updateTime would be wrong the moment
+    a position was added to, and dating it from zero would sweep in every
+    earlier round trip on the symbol.
+    """
+
+    def tearDown(self):
+        _cleanup()
+
+    def test_the_open_is_dated_from_the_fill_that_left_flat(self):
+        e = _restarted()
+        self.assertEqual(e.opened_ms_for("INJUSDT"), 1788809430824)
+
+    def test_an_earlier_round_trip_is_not_counted_on_close(self):
+        e = _restarted()
+        e.adopt_open_positions()
+        pos = e.book["INJUSDT"]
+        # The 0.5 from the earlier, already-closed round trip must not appear.
+        self.assertAlmostEqual(e.realized_from_exchange(pos), -0.004, places=6)
+
+    def test_it_falls_back_to_update_time_when_fills_are_unavailable(self):
+        e = _restarted(fills=[])
+        e.adopt_open_positions()
+        self.assertEqual(e.book["INJUSDT"].opened_ms, 1788809430824)
