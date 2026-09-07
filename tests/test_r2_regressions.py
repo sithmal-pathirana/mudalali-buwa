@@ -45,10 +45,24 @@ class StubAPI:
         return [{"positionAmt": str(self.position_amt), "entryPrice": "0.09",
                  "unRealizedProfit": "0", "liquidationPrice": "0"}]
 
+    # Since the Binance algo migration a conditional order is NOT returned by
+    # open_orders(); it comes back from open_algo_orders(). The stub splits the
+    # same way on the id prefix the engine uses ("s"top / "t"ake-profit are
+    # conditional, "e"ntry is a plain limit) so anything that reasons about
+    # "is the stop still on the book" is tested against the real shape.
+    def _rows(self, ids):
+        return [{"clientOrderId": i, "side": "SELL", "type": "STOP_MARKET",
+                 "origQty": "1", "price": "0"} for i in ids]
+
     def open_orders(self, symbol=None):
         self.calls.append(("open_orders", symbol))
-        return [{"clientOrderId": i, "side": "SELL", "type": "STOP_MARKET",
-                 "origQty": "1", "price": "0"} for i in self.open_ids]
+        return self._rows([i for i in self.open_ids
+                           if not str(i).startswith(("s-", "t-"))])
+
+    def open_algo_orders(self, symbol=None):
+        self.calls.append(("open_algo_orders", symbol))
+        return self._rows([i for i in self.open_ids
+                           if str(i).startswith(("s-", "t-"))])
 
     def usdt_equity(self):
         self.calls.append(("usdt_equity", None))
@@ -72,6 +86,17 @@ class StubAPI:
         self.calls.append(("order", kw.get("side"), kw.get("type"),
                            kw.get("reduceOnly")))
         return {"status": "NEW"}
+
+    def algo_order(self, **kw):
+        self.calls.append(("algo_order", kw.get("side"), kw.get("type"),
+                           kw.get("reduceOnly")))
+        return {"algoStatus": "NEW", "algoId": 1, "status": "NEW"}
+
+    def cancel_all_algo(self, symbol):
+        self.calls.append(("cancel_all_algo", symbol))
+
+    def cancel_algo_order(self, cid):
+        self.calls.append(("cancel_algo_order", cid))
 
     @property
     def cancelled_everything(self):

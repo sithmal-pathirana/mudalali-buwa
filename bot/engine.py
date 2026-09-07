@@ -1345,7 +1345,10 @@ class Engine:
         """
         try:
             live = {r["symbol"]: r for r in self.api.positions()}
-            orders = self.api.open_orders()
+            # Stops are algo orders now and are absent from open_orders(), so
+            # both lists are needed -- on the first alone every protected
+            # position looks like it lost its stop. (Binance algo migration)
+            orders = list(self.api.open_orders()) + list(self.api.open_algo_orders())
         except BinanceError as e:
             log.error("book reconcile failed: %s", e)
             return {}
@@ -1515,7 +1518,8 @@ class Engine:
                          single_position_cap_pct=pf.single_position_cap_pct,
                          max_leverage=self.cfg.risk.max_leverage,
                          stop_distance=pf.stop_distance,
-                         hard_cap=pf.hard_cap)
+                         hard_cap=pf.hard_cap,
+                         min_upsize=self.cfg.risk.take_minimum_order)
         pf.resolved_slots = alloc.slots
         pf.resolved_risk_pct = alloc.per_position_risk_pct
         if not alloc.slots:
@@ -1679,14 +1683,26 @@ class Engine:
         log.info("entry placed %s status=%s", entry_id, entry.get("status"))
 
         try:
-            self.api.order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                           stopPrice=stop_price, closePosition="true",
-                           workingType="MARK_PRICE", newClientOrderId=stop_id)
+            # Conditional orders live on the algo endpoint since 2025-12-09;
+            # the classic one answers -4120. stopPrice is triggerPrice here and
+            # newClientOrderId is clientAlgoId.
+            #
+            # closePosition="true" is NOT usable any more: the algo endpoint
+            # gives it a GTE time-in-force, which Binance rejects with -4509
+            # unless a position is ALREADY open. The stop is placed while the
+            # entry is still a resting limit order, so there never is one yet.
+            # quantity + reduceOnly is the equivalent that works from flat, and
+            # it cannot over-close -- Binance clamps a reduceOnly order to the
+            # position that actually exists when it triggers.
+            self.api.algo_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
+                                triggerPrice=stop_price, quantity=qty,
+                                reduceOnly="true", workingType="MARK_PRICE",
+                                clientAlgoId=stop_id)
             if signal.take_profit:
-                self.api.order(symbol=symbol, side=exit_side,
-                               type="TAKE_PROFIT_MARKET", stopPrice=tp_price,
-                               closePosition="true", workingType="MARK_PRICE",
-                               newClientOrderId=tp_id)
+                self.api.algo_order(symbol=symbol, side=exit_side,
+                                    type="TAKE_PROFIT_MARKET", triggerPrice=tp_price,
+                                    quantity=qty, reduceOnly="true",
+                                    workingType="MARK_PRICE", clientAlgoId=tp_id)
         except BinanceError as e:
             log.critical("PROTECTIVE ORDER FAILED (%s) -- cancelling entry", e)
             self.api.cancel_all(symbol)

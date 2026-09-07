@@ -108,7 +108,11 @@ def reconcile(api, symbol: str) -> dict:
     process that crashed mid-order must never assume its own last-known state.
     """
     positions = api.positions(symbol)
-    orders = api.open_orders(symbol)
+    # Include algo orders: since Binance moved conditional orders to the algo
+    # service, a protective stop is invisible to open_orders(). On boot that
+    # reads as "position with no stop", which is the one conclusion this
+    # function exists to get right.
+    orders = list(api.open_orders(symbol)) + list(api.open_algo_orders(symbol))
     equity = api.usdt_equity()
     pos = positions[0] if positions else None
     snapshot = {

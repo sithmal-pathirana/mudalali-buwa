@@ -92,12 +92,21 @@ class RiskManager:
 
         cheapest = rules.min_affordable_notional(entry)
         if notional < cheapest:
-            return Decision(
-                False,
-                f"correct size is ${notional:,.2f} but the cheapest legal order on "
-                f"{rules.symbol} is ${cheapest:,.2f}. Trading anyway would mean "
-                f"risking {cheapest * stop_distance / equity * 100:.1f}% of equity "
-                f"per trade instead of {risk_pct:.2f}%. Skipping.")
+            forced_pct = cheapest * stop_distance / equity * 100
+            if not self.cfg.take_minimum_order:
+                return Decision(
+                    False,
+                    f"correct size is ${notional:,.2f} but the cheapest legal order on "
+                    f"{rules.symbol} is ${cheapest:,.2f}. Trading anyway would mean "
+                    f"risking {forced_pct:.1f}% of equity "
+                    f"per trade instead of {risk_pct:.2f}%. Skipping.")
+            # Aggressive mode: take the trade at the exchange minimum and wear
+            # the higher risk. The leverage check below is what still bounds it.
+            log.warning("%s upsized to the $%.2f exchange minimum -- risking "
+                        "%.1f%% of equity instead of %.2f%%",
+                        rules.symbol, cheapest, forced_pct, risk_pct)
+            notional = cheapest
+            risk_usdt = cheapest * stop_distance
 
         implied_leverage = notional / equity
         if implied_leverage > self.cfg.max_leverage + 1e-9:

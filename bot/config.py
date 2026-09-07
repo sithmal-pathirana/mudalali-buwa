@@ -31,6 +31,15 @@ class RiskConfig:
     #: sizing decision unrepresentative of the account you actually intend to
     #: fund -- and hides the minimum-order constraint entirely.
     equity_cap_usdt: float = 0.0
+    #: Round a too-small position UP to the exchange minimum instead of skipping
+    #: it. Off in the safe profile, where refusing is right: the account cannot
+    #: afford the trade at the stated risk, so it should not take it. Aggressive
+    #: mode turns this on (bot/aggressive.py:apply) because on a small account
+    #: the $5 floor is above the risk-derived size for nearly every signal, and
+    #: refusing every one of them is indistinguishable from being switched off.
+    #: The leverage cap below still bounds the upsized order -- this raises the
+    #: effective risk PERCENTAGE, never the notional past equity*max_leverage.
+    take_minimum_order: bool = False
 
 
 @dataclass

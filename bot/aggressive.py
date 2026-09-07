@@ -145,6 +145,11 @@ def apply(cfg, profile: Profile):
     when aggressive is off, because this is never called then."""
     cfg.risk.max_leverage = profile.leverage
     cfg.risk.risk_per_trade_pct = profile.risk_per_trade_pct
+    # On a small account the profile percentages sit BELOW the exchange's $5
+    # floor -- 8% of $2.45 over a 7% stop is $2.80 -- so every gate refuses and
+    # aggressive mode trades strictly less than the safe profile it replaced.
+    # Taking the floor instead is the whole point of turning this on.
+    cfg.risk.take_minimum_order = True
     cfg.interval = profile.interval
     cfg.portfolio.portfolio_risk_pct = profile.portfolio_risk_pct
     cfg.portfolio.single_position_cap_pct = profile.risk_per_trade_pct

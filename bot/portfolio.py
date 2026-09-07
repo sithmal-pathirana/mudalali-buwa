@@ -167,7 +167,7 @@ class Allocation:
 def allocate(equity: float, eligible: int, portfolio_risk_pct: float = 6.0,
              single_position_cap_pct: float = 2.0, max_leverage: float = 3.0,
              stop_distance: float = 0.02, min_notional: float = 5.0,
-             hard_cap: int = 40) -> Allocation:
+             hard_cap: int = 40, min_upsize: bool = False) -> Allocation:
     """
     Split the risk budget across however many coins qualified.
 
@@ -198,7 +198,15 @@ def allocate(equity: float, eligible: int, portfolio_risk_pct: float = 6.0,
         risk, notional = sizing(n)
         limited_by = "minimum order size"
     if notional < min_notional:
-        return Allocation(0, 0.0, 0.0, 0.0, "cannot fund one position")
+        # Even one position is below the exchange floor. Normally that ends it.
+        # In aggressive mode the caller asks for the floor to be taken anyway,
+        # which is legal as long as leverage still covers it -- one $5 order on
+        # a $2.45 account is 2.04x, fine at 10x, impossible at 3x.
+        if not min_upsize or min_notional > equity * max_leverage + 1e-9:
+            return Allocation(0, 0.0, 0.0, 0.0, "cannot fund one position")
+        n, notional = 1, min_notional
+        risk = min_notional * stop_distance / equity * 100
+        limited_by = "exchange minimum (upsized)"
 
     ceiling = equity * max_leverage
     while n > 1 and notional * n > ceiling + 1e-9:

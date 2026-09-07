@@ -357,9 +357,20 @@ class _StubAPI:
         return [{"positionAmt": str(self._amt), "entryPrice": "0.09",
                  "unRealizedProfit": "-1.0", "liquidationPrice": "0.05"}]
 
-    def open_orders(self, s=None):
+    # Conditional orders live on the algo endpoint since the Binance migration,
+    # so the stub splits them out the way the exchange now does: "s"/"t" ids are
+    # algo, "e" (entry) stays a plain limit order.
+    def _rows(self, ids):
         return [{"clientOrderId": i, "side": "SELL", "type": "STOP_MARKET",
-                 "origQty": "100", "price": "0"} for i in self._open]
+                 "origQty": "100", "price": "0"} for i in ids]
+
+    def open_orders(self, s=None):
+        return self._rows([i for i in self._open
+                           if not str(i).startswith(("s-", "t-"))])
+
+    def open_algo_orders(self, s=None):
+        return self._rows([i for i in self._open
+                           if str(i).startswith(("s-", "t-"))])
 
     def usdt_equity(self):
         return 42.0
@@ -375,9 +386,19 @@ class _StubAPI:
     def cancel_all(self, s):
         self.calls.append(("cancel_all", s))
 
+    def cancel_all_algo(self, s):
+        self.calls.append(("cancel_all_algo", s))
+
+    def cancel_algo_order(self, cid):
+        self.calls.append(("cancel_algo_order", cid))
+
     def order(self, **p):
         self.calls.append(("order", p.get("type"), p.get("side")))
         return {"status": "NEW"}
+
+    def algo_order(self, **p):
+        self.calls.append(("order", p.get("type"), p.get("side")))
+        return {"algoStatus": "NEW", "algoId": 1, "status": "NEW"}
 
 
 class _MultiAPI:
@@ -402,10 +423,17 @@ class _MultiAPI:
         return [{"symbol": symbol, "positionAmt": str(amt), "entryPrice": "1.0",
                  "unRealizedProfit": "0.0", "liquidationPrice": "0.5"}]
 
-    def open_orders(self, symbol=None):
+    def _rows(self, ids):
         return [{"clientOrderId": i, "side": "SELL", "type": "STOP_MARKET",
-                 "origQty": "10", "price": "0"}
-                for i in self._orders.get(symbol, [])]
+                 "origQty": "10", "price": "0"} for i in ids]
+
+    def open_orders(self, symbol=None):
+        return self._rows([i for i in self._orders.get(symbol, [])
+                           if not str(i).startswith(("s-", "t-"))])
+
+    def open_algo_orders(self, symbol=None):
+        return self._rows([i for i in self._orders.get(symbol, [])
+                           if str(i).startswith(("s-", "t-"))])
 
     def usdt_equity(self):
         return 43.0
@@ -422,6 +450,13 @@ class _MultiAPI:
         self.calls.append(("cancel_all", symbol))
         self._orders.pop(symbol, None)
 
+    def cancel_all_algo(self, symbol):
+        self.calls.append(("cancel_all_algo", symbol))
+        self._orders.pop(symbol, None)
+
+    def cancel_algo_order(self, cid):
+        self.calls.append(("cancel_algo_order", cid))
+
     def cancel_order(self, symbol, order_id):
         self.calls.append(("cancel_order", symbol, order_id))
 
@@ -434,6 +469,17 @@ class _MultiAPI:
         if p.get("reduceOnly"):
             self.open_symbols.pop(symbol, None)
         return {"status": "NEW"}
+
+    def algo_order(self, **p):
+        """Protective stops come through here now. It must fail for the same
+        symbols as order(), or 'entry is cancelled when the stop cannot be
+        placed' would silently stop probing anything."""
+        symbol = p.get("symbol")
+        if symbol in self.fail_on:
+            from bot.binanceapi import BinanceError
+            raise BinanceError(-1001, "exchange refused", "/algoOrder")
+        self.calls.append(("order", symbol, p.get("type")))
+        return {"algoStatus": "NEW", "algoId": 1, "status": "NEW"}
 
     def touched(self, symbol):
         return any(symbol in [str(x) for x in c] for c in self.calls)
@@ -689,6 +735,15 @@ def layer_audit(report, args):
                 if p.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
                     raise BinanceError(-2021, "would immediately trigger", "/order")
                 return {"status": "NEW"}
+
+            # Stops are placed on the algo endpoint now. Failing only order()
+            # would let the stop succeed and quietly stop probing the thing
+            # this check exists for.
+            def algo_order(self, **p):
+                self.calls.append(("order", p.get("type"), p.get("side")))
+                if p.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                    raise BinanceError(-2021, "would immediately trigger", "/algoOrder")
+                return {"algoStatus": "NEW", "status": "NEW"}
 
         api = FailsOnStop()
         e = _engine(api=api)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
 import sys
 import urllib.parse
@@ -805,7 +806,18 @@ def cmd_trade(cfg: Config) -> int:
         print()
         print(banner(equity, PROFILES[cfg.aggressive.profile]))
         print()
-        if input("  Type AGGRESSIVE to continue: ").strip() != "AGGRESSIVE":
+        # Same no-tty problem as the live gate below: under systemd input()
+        # reads EOF and raises, so the service crash-loops instead of trading.
+        # Aggressive keeps its OWN variable -- opening the live gate must not
+        # silently also open this one.
+        if not sys.stdin.isatty():
+            if os.environ.get("CONFIRM_AGGRESSIVE") != "AGGRESSIVE":
+                print("  no tty and CONFIRM_AGGRESSIVE is not AGGRESSIVE -- aborted.")
+                print("  To run aggressive under systemd, add to the unit:")
+                print("    Environment=CONFIRM_AGGRESSIVE=AGGRESSIVE\n")
+                return 1
+            print("  CONFIRM_AGGRESSIVE=AGGRESSIVE accepted (no tty)\n")
+        elif input("  Type AGGRESSIVE to continue: ").strip() != "AGGRESSIVE":
             print("  aborted\n")
             return 1
 
@@ -813,7 +825,17 @@ def cmd_trade(cfg: Config) -> int:
         print("\n  !! LIVE MODE WITH REAL MONEY !!")
         print(f"     symbol={cfg.symbol}  leverage={cfg.risk.max_leverage}x  "
               f"daily loss limit={cfg.risk.daily_loss_limit_pct}%")
-        if input("     Type LIVE to continue: ").strip() != "LIVE":
+        # Under systemd there is no tty, so input() reads EOF and the service
+        # crash-loops instead of trading. The gate still has to be opened by
+        # hand -- just in the unit file rather than at a prompt.
+        if not sys.stdin.isatty():
+            if os.environ.get("CONFIRM_LIVE") != "LIVE":
+                print("     no tty and CONFIRM_LIVE is not LIVE -- aborted.")
+                print("     To run live under systemd, add to the unit:")
+                print("       Environment=CONFIRM_LIVE=LIVE\n")
+                return 1
+            print("     CONFIRM_LIVE=LIVE accepted (no tty)\n")
+        elif input("     Type LIVE to continue: ").strip() != "LIVE":
             print("     aborted\n")
             return 1
     return Engine(cfg).run()

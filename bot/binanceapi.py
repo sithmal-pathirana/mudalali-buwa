@@ -55,6 +55,12 @@ ERROR_HELP = {
             "  Fix NTP: sudo systemctl restart systemd-timesyncd (or install chrony)."),
     -1002: "Unauthorised. The key is missing, revoked, or for the wrong environment.",
     -4046: "No need to change margin type -- already set. Harmless.",
+    -4120: ("Conditional order sent to the wrong endpoint.\n"
+            "  Binance moved STOP_MARKET / TAKE_PROFIT_MARKET / STOP /\n"
+            "  TAKE_PROFIT / TRAILING_STOP_MARKET to the Algo Service on\n"
+            "  2025-12-09; /fapi/v1/order now refuses them. Place them with\n"
+            "  Binance.algo_order() (POST /fapi/v1/algoOrder), which renames\n"
+            "  stopPrice to triggerPrice and newClientOrderId to clientAlgoId."),
     -1121: "Unknown symbol for this venue. Check the symbol exists on futures.",
     -1003: ("Rate limited, and the IP may be temporarily banned.\n"
             "  Wait it out -- the ban is time-boxed and retrying extends nothing.\n"
@@ -284,8 +290,72 @@ class Binance:
                              {"symbol": symbol, "origClientOrderId": client_order_id},
                              signed=True)
 
+    # ------------------------------------------------------------ algo orders
+    # Binance migrated conditional orders to the Algo Service on 2025-12-09.
+    # STOP_MARKET, TAKE_PROFIT_MARKET, STOP, TAKE_PROFIT and
+    # TRAILING_STOP_MARKET are now REJECTED on /fapi/v1/order with -4120 and
+    # must be placed here instead. Two renames matter and are easy to miss:
+    #   stopPrice        -> triggerPrice
+    #   newClientOrderId -> clientAlgoId
+    # and the response says algoId/algoStatus, not orderId/status.
+    ALGO_TYPES = ("STOP", "STOP_MARKET", "TAKE_PROFIT",
+                  "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET")
+
+    def algo_order(self, **params):
+        """Place a conditional (algo) order. Pass a clientAlgoId so retries are
+        idempotent, exactly as with newClientOrderId on the classic endpoint."""
+        params.setdefault("algoType", "CONDITIONAL")
+        return self._request("POST", "/fapi/v1/algoOrder", params, signed=True)
+
+    def cancel_algo_order(self, client_algo_id: str):
+        """Cancel ONE algo order. symbol is not accepted by this endpoint."""
+        return self._request("DELETE", "/fapi/v1/algoOrder",
+                             {"clientAlgoId": client_algo_id}, signed=True)
+
+    def cancel_all_algo(self, symbol: str):
+        return self._request("DELETE", "/fapi/v1/algoOpenOrders",
+                             {"symbol": symbol}, signed=True)
+
+    def open_algo_orders(self, symbol: str | None = None):
+        """Open conditional orders. These do NOT appear in open_orders() any
+        more, so anything reasoning about 'is the stop still there' must ask
+        here as well or it will conclude the position is unprotected."""
+        params = {"symbol": symbol} if symbol else {}
+        rows = self._request("GET", "/fapi/v1/openAlgoOrders", params, signed=True)
+        if isinstance(rows, dict):
+            rows = rows.get("orders", []) or []
+        # Normalise onto the classic field names so callers can treat both
+        # lists the same way.
+        for r in rows:
+            r.setdefault("clientOrderId", r.get("clientAlgoId", ""))
+            r.setdefault("orderId", r.get("algoId"))
+            r.setdefault("status", r.get("algoStatus"))
+            r.setdefault("stopPrice", r.get("triggerPrice"))
+            r.setdefault("type", r.get("orderType", ""))
+            # closePosition stops carry no quantity or price; callers format
+            # these into snapshots, so give them something rather than KeyError.
+            r.setdefault("origQty", r.get("quantity", "0"))
+            r.setdefault("price", r.get("triggerPrice", "0"))
+        return rows
+
     def cancel_all(self, symbol: str):
-        return self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+        """Cancel EVERYTHING resting for a symbol -- classic and algo alike.
+
+        The halt and KILL paths call this to leave nothing behind. Since the
+        algo migration a plain /allOpenOrders no longer touches stops, so
+        cancelling only that would strand a live protective order on the book
+        while the bot believes it is flat. (QA R2)
+        """
+        result = self._request("DELETE", "/fapi/v1/allOpenOrders",
+                               {"symbol": symbol}, signed=True)
+        try:
+            self.cancel_all_algo(symbol)
+        except BinanceError as e:
+            # -2011 "unknown order" just means there were none.
+            if e.code not in (-2011,):
+                log.error("could not cancel algo orders for %s: %s", symbol, e)
+                raise
+        return result
 
     def query_order(self, symbol: str, client_order_id: str):
         return self._request("GET", "/fapi/v1/order",
