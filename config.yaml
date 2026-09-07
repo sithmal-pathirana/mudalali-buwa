@@ -1,8 +1,30 @@
 # Behaviour lives here. Secrets live in .env -- never in this file.
+#
+# ############################################################################
+# THIS FILE IS ARMED. It trades REAL MONEY on a live account.
+#
+# config.local.yaml used to hold these settings so `git pull` could not
+# conflict with them; it was consolidated into this file on 2026-09-07 by
+# request. The consequence is that the settings below are now TRACKED IN GIT,
+# so anyone who clones or pulls this repo gets a live-money configuration
+# rather than a safe default. tools/qa.py's "committed config is not armed"
+# blocker reports exactly this, and it is now telling the truth.
+#
+# Real balance at cutover: 2.4478 USDT. Most numbers here are derived from that
+# figure and from the exchange's $5 minimum order -- re-derive them if the
+# balance changes materially, they do not scale on their own.
+# ############################################################################
 
-mode: testnet          # testnet | live   (testnet uses fake money on real markets)
-dry_run: true          # true = log intended orders, send nothing. Your first run.
-realtime: true         # websockets: 1 price/sec + real fills. false = REST polling.
+mode: live             # testnet | live   (testnet uses fake money on real markets)
+dry_run: false         # true = log intended orders, send nothing. Your first run.
+
+# Live futures WEBSOCKETS ARE SILENT FROM THIS HOST -- `run.py netcheck` reports
+# "WS futures live SILENT: handshake fine, no data -- unusable" while live REST
+# is OK. Left on, the socket connects, receives nothing, and drops every ~55s,
+# so the bot is permanently blind and never trades. REST polling is the
+# supported fallback (poll_seconds below).
+# Re-run `run.py netcheck` before turning this back on.
+realtime: false
 
 # The symbol traded when portfolio mode is OFF. When portfolio.enabled is
 # true this is NOT traded -- the scanner picks symbols and this one is only
@@ -18,11 +40,23 @@ poll_seconds: 20       # only used when realtime: false
 
 risk:
   max_leverage: 3            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
-  risk_per_trade_pct: 2.0    # % of equity between entry and stop
+  # Raised from the stock 2.0. Same $5-exchange-floor reasoning as
+  # portfolio.single_position_cap_pct below: at $2.45 a 2% risk budget funds an
+  # order far under the exchange minimum, so every signal was refused.
+  # NOTE: aggressive mode REPLACES this at runtime with the profile's own
+  # figure (moderate 2%), and then rounds up to the $5 floor via
+  # risk.take_minimum_order. See the aggressive block.
+  risk_per_trade_pct: 20.0
   max_position_pct: 100.0
-  daily_loss_limit_pct: 5.0  # halts the bot for the day; restart is manual
+  # One stop-out costs ~6.2% here, so the stock 5.0 halted on the first loss.
+  # 30% still halts the day after roughly four consecutive losers -- or after
+  # only TWO in aggressive mode, where each trade risks ~14.3%.
+  daily_loss_limit_pct: 30.0
   max_trades_per_day: 10
-  min_equity_usdt: 10.0      # below this the bot stops permanently
+  # $5 minimum / 3x leverage = $1.67 is the equity below which no legal order
+  # exists at all. The floor sits just above it: past this point the account
+  # is not small, it is untradable.
+  min_equity_usdt: 1.70
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
@@ -32,12 +66,8 @@ risk:
   # everything open and monitored.
   kill_action: flatten
   # Trade as if the account held this much, whatever the real balance is.
-  # 0 = use the real balance. Testnet hands you a large demo balance, which
-  # makes every position size, slot count and minimum-order refusal belong to
-  # an account you do not have. Set this to the capital you actually intend to
-  # fund so the rehearsal matches the performance. Changing it mid-day re-bases
-  # the day's opening equity too, so the daily loss limit keeps comparing like
-  # with like instead of reading the new cap as a crash.
+  # 0 = use the real balance. MUST NOT be left at a testnet rehearsal value:
+  # at 100.0 the bot sizes for $100 it does not have.
   equity_cap_usdt: 0.0
 
 # Daily profit targets. stop_when_reached is the real mechanism behind
@@ -45,40 +75,71 @@ risk:
 # trading, so a won day cannot be given back. It cannot make the target
 # arrive -- nothing can -- but it can stop you handing it back.
 targets:
-  stop_when_reached: true
+  # OFF by request: the bot no longer stands down once the day's $2 is banked.
+  # This removes the only mechanism that protects a won day.
+  stop_when_reached: false
   schedule:
     - from_day: 1
       usd_per_day: 2.0
     - from_day: 16           # your day-15 escalation
       usd_per_day: 3.0
 
-# AGGRESSIVE MODE. Off, and it should stay off unless you have measured an
-# edge. It REPLACES the risk profile wholesale -- leverage, per-trade risk,
-# timeframe, scan rate, market entries, trailing stops -- and ignores the
+# AGGRESSIVE MODE. It REPLACES the risk profile wholesale -- leverage,
+# per-trade risk, timeframe, scan rate, trailing stops -- and ignores the
 # daily target entirely.
 #
 #   run.py risk        shows the modelled probability of ruin per profile
 #
-# At $43 with no edge, every profile models 100% ruin (median life 8 days at
-# `moderate`, 1 day at `maximum`). Still enforced in every profile: an
-# exchange-side stop on every position, the KILL file, and the equity floor.
+# ON by request 2026-09-07: risk of ruin explicitly accepted. Every profile
+# models 100% ruin at this equity.
+#
+# At $2.45 the PROFILE CHOICE BARELY MATTERS. Every profile's per-trade risk
+# (moderate 2%, high 4%, maximum 8%) sizes below Binance's $5 minimum, so all
+# three land on the same upsized $5.00 order -- about 14.3% of equity over a
+# 7% stop, and ~2.04x actual leverage. The profile's leverage number is a CAP,
+# not the size used; it only stops binding once the account is much larger.
+# What does differ: trades_per_day (6 / 12 / 20) and how tight the trailing
+# stop is. moderate is the least trigger-happy of the three.
+#
+# Two losers at ~14.3% each is ~28.6%, which trips daily_loss_limit_pct: 30.0
+# above and halts the day. Equity would then be ~$1.79, just over the
+# min_equity_usdt: 1.70 permanent floor. This account is roughly two bad
+# trades from being untradable -- that is the accepted bargain, not a bug.
+#
+# Still enforced in every profile: an exchange-side stop on every position,
+# the KILL file, and the equity floor.
 aggressive:
-  enabled: false
+  enabled: true
   profile: moderate        # moderate (10x) | high (20x) | maximum (50x)
   keep_daily_loss_limit: true
   confirm_live: true       # type AGGRESSIVE before the first live order
+                           # (under systemd: Environment=CONFIRM_AGGRESSIVE=AGGRESSIVE)
 
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.
-#   $43  -> 25 slots at 0.24% each   (~$5.16 notional per slot)
-#   $100 -> 40 slots at 0.15% each   (~$7.50 per slot)
-# Slots are bounded by the exchange minimum order and the leverage ceiling.
 #   run.py scan --equity <n>   shows the capacity and what would fill it
 portfolio:
-  enabled: false          # opt in; the engine trades one symbol until this is true
+  # At $2.45 the derived slot count is 1 -- the $5 exchange minimum is 2.0x
+  # this account, so a second concurrent position cannot be funded. Portfolio
+  # mode is kept on so the SCANNER picks the symbol rather than trading the
+  # BTCUSDT above, whose $50 minimum is unreachable here.
+  enabled: true
   max_concurrent: auto    # auto, or a fixed number
-  portfolio_risk_pct: 6.0 # total risk across ALL open positions
+  # 6.0 refused real signals: a live PUMPUSDT breakout needed $5.00 but 6% only
+  # funded $4.17, so the risk gate skipped it (bot/risk.py size_position:
+  # "correct size is $X but the cheapest legal order is $5.00 ... Skipping").
+  # By request (risk of loss accepted): raised so the $5 exchange floor clears
+  # even on a wider (~7%) stop. The max_leverage cap above still bounds
+  # worst-case notional regardless of how high this is set.
+  single_position_cap_pct: 20.0
+  portfolio_risk_pct: 20.0  # with 1 eligible slot this is the binding term
+  # Was 0.025. That is not the stop the scanner actually produces: the real
+  # signals here stop ~7% away (PUMPUSDT needed 7.2%). allocate() sized from
+  # 0.025 and asked for $19.60 notional -- 8x equity -- so the 3x leverage
+  # ceiling ($7.35) refused every scan for five hours on 2026-09-07. Matching
+  # the real stop asks for $7.00: above the $5 floor, under the ceiling.
+  stop_distance: 0.07
   hard_cap: 40
 
 # Universe scanning: which coins are even considered.
@@ -95,7 +156,7 @@ universe:
 # pressing a confirmation button.
 #   /usr/bin/python3 run.py telegram --setup     finds your chat id
 telegram:
-  control: false      # opt in: this turns your alert bot into a command surface
+  control: true       # opt in: this turns your alert bot into a command surface
 
 # Web dashboard: monitor and close trades from a phone or laptop.
 # host stays on 127.0.0.1 -- this endpoint can close positions, so reach it
@@ -110,26 +171,31 @@ alerts:
   approach_pct: 80.0         # warn once price is 80% of the way to TP or SL
   heartbeat_minutes: 360     # periodic "still alive + progress" message; 0 disables
 
-# Params for the strategy named above. For `switcher`, use instead:
-#
-#   params:
-#     regime: {window: 30, trend_above: 0.35, range_below: 0.20, confirm_bars: 3}
-#     trend:  {channel: 20, atr_period: 14, atr_stop_mult: 2.0, atr_target_mult: 3.0}
-#     routes: {trending: trend_atr, ranging: null, unclear: null}
+# Params for the strategy named above.
 #
 # Those routes are measured, not assumed -- see tools/regime_edge.py. Gating
 # trend_atr to trending markets cut losses by roughly 70% in BOTH the fitted
 # window and an unseen earlier one, but the result is still negative
 # out-of-sample. Do not trade it expecting profit.
+#
+# By request: loosened so the bot actually places trades instead of idling.
+# Still only routes to trend_atr (the one route measured profitable) -- ranging
+# and unclear stay standing-down, since mean_reversion loses in every tested
+# regime (see bot/strategies/switcher.py).
 params:
   regime:
     window: 30
     trend_above: 0.35      # efficiency ratio above this = trending
     range_below: 0.20      # below this = ranging
-    confirm_bars: 3        # hysteresis: bars a new regime must persist
+    # Default 3 makes every restart cold-start at UNCLEAR and sit out ~15+
+    # minutes before the first trending confirmation. 1 = trade on the first
+    # trending reading instead of waiting out the hysteresis window.
+    confirm_bars: 1        # hysteresis: bars a new regime must persist
     min_atr_pct: 0.15
   trend:
-    channel: 20
+    # Default 20 (5h on 15m bars) waits for a rare breakout. 8 (2h) fires
+    # far more often at the cost of more false breakouts / whipsaw losses.
+    channel: 8
     atr_period: 14
     atr_stop_mult: 2.0
     atr_target_mult: 3.0

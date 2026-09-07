@@ -180,7 +180,10 @@ def layer_static(report, args):
     def shipped_config_is_safe():
         """The repo must never ship armed. This is the last line of defence."""
         from bot.config import Config
-        cfg = Config.load(ROOT / "config.yaml")
+        # overlay=False: audit the TRACKED file. With the gitignored
+        # config.local.yaml merged in, a committed `mode: live` is hidden by any
+        # local file that says testnet -- this check would pass on an armed repo.
+        cfg = Config.load(ROOT / "config.yaml", overlay=False)
         problems = []
         if not cfg.dry_run:
             problems.append("dry_run is FALSE in the committed config")
@@ -1084,7 +1087,9 @@ def layer_portfolio(report, args):
     # ------------------------------------------------------------ aggressive
     def aggressive_off_changes_nothing():
         from bot.config import Config
-        cfg = Config.load(ROOT / "config.yaml")
+        # Same reasoning as shipped_config_is_safe: this asks what the repo
+        # ships with aggressive off, not what this deployment happens to run.
+        cfg = Config.load(ROOT / "config.yaml", overlay=False)
         if cfg.aggressive.enabled:
             return False, "aggressive mode is ENABLED in the committed config"
         problems = []

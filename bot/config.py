@@ -134,16 +134,22 @@ class Config:
         return self.mode != "live"
 
     @classmethod
-    def load(cls, path: str | Path = ROOT / "config.yaml") -> "Config":
+    def load(cls, path: str | Path = ROOT / "config.yaml",
+             overlay: bool = True) -> "Config":
         raw = yaml.safe_load(Path(path).read_text()) or {}
 
         # config.local.yaml overlays the tracked defaults and is gitignored.
         # Editing the tracked file directly means every `git pull` conflicts
         # with your own deployment settings, which is a fight you lose weekly.
+        #
+        # overlay=False reads ONLY the tracked file. Auditing what the repo
+        # SHIPS needs this: with the overlay applied, a committed `mode: live`
+        # is masked by any local file that happens to say testnet, so a check
+        # meant to catch an armed repo passes and fails open.
         local = Path(path).with_name("config.local.yaml")
-        if local.exists():
-            overlay = yaml.safe_load(local.read_text()) or {}
-            raw = _deep_merge(raw, overlay)
+        if overlay and local.exists():
+            overlay_raw = yaml.safe_load(local.read_text()) or {}
+            raw = _deep_merge(raw, overlay_raw)
 
         # Table-driven so adding a section cannot be half-wired: forgetting an
         # entry here would let the raw dict flow through into the field, which
@@ -169,7 +175,10 @@ class Config:
         cfg = cls(**built, **{k: v for k, v in raw.items() if k in known})
         cfg.unknown_keys = unknown
         cfg.config_path = str(Path(path))
-        if local.exists():
+        # Only claim the overlay when it was actually merged. Naming a file that
+        # was deliberately skipped makes an audit report the wrong source for
+        # the values it just checked.
+        if overlay and local.exists():
             cfg.config_path += f" + {local.name}"
 
         # Every declared section must be its dataclass, never a passed-through dict.

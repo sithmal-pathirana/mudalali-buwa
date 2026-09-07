@@ -239,6 +239,10 @@ class TestF13ConfigTypos(unittest.TestCase):
 
         import yaml
         raw = yaml.safe_load((ROOT / "config.yaml").read_text())
+        # Pin the baseline rather than inheriting whatever config.yaml ships:
+        # the point is that the TYPO cannot move dry_run, which is unprovable
+        # if the real file already has it false for its own reasons.
+        raw["dry_run"] = True
         raw["dry_runn"] = False
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             yaml.safe_dump(raw, f)
