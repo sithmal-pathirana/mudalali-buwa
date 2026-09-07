@@ -485,9 +485,7 @@ class Engine:
                          f"({origin or 'local'})... this takes about a minute.",
                          symbol="market")
         try:
-            budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
-                      / self.cfg.portfolio.stop_distance)
-            res = self.scanner.scan(risk_budget_notional=budget,
+            res = self.scanner.scan(risk_budget_notional=self._scan_budget(),
                                     rules_for=self.rules_for)
         except Exception as e:
             log.exception("forced scan failed")
@@ -742,9 +740,7 @@ class Engine:
             # dashboard reported nothing for up to a full interval after start,
             # which reads exactly like a broken scanner.
             try:
-                budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
-                          / self.cfg.portfolio.stop_distance)
-                self.scanner.scan(risk_budget_notional=budget,
+                self.scanner.scan(risk_budget_notional=self._scan_budget(),
                                   rules_for=self.rules_for)
             except Exception as e:
                 log.warning("initial scan failed (%s); the loop will retry", e)
@@ -1334,6 +1330,31 @@ class Engine:
         self.release(symbol)
         self._entry_placed_at = 0.0
 
+    def _scan_budget(self) -> float:
+        """
+        The largest order the scanner should treat as fundable.
+
+        Normally this is the risk-derived size: a symbol whose minimum order
+        costs more than that cannot be traded at the configured risk, so it is
+        not a candidate and the scanner drops it.
+
+        take_minimum_order (aggressive mode) changes that -- the bot rounds UP
+        to a symbol's minimum rather than skipping it -- so the real bound
+        becomes the leverage cap, the same one risk.size_position and
+        portfolio.allocate already enforce. Leaving the risk-derived figure
+        here rejects EVERY symbol on a small account before sizing is ever
+        reached: at $2.45, 2% over a 7% stop is a $0.70 budget, under every $5
+        minimum on the venue, and the scan reports "no candidate passed the
+        filters" with no hint that the budget was the reason.
+        """
+        budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
+                  / self.cfg.portfolio.stop_distance)
+        if self.cfg.risk.take_minimum_order:
+            ceiling = (self.equity * self.cfg.risk.max_leverage
+                       * self.cfg.risk.max_position_pct / 100.0)
+            budget = max(budget, ceiling)
+        return budget
+
     def reconcile_book(self) -> dict:
         """
         Reconcile EVERY held symbol in two REST calls, as the plan specified.
@@ -1504,9 +1525,7 @@ class Engine:
             return 0
 
         if self.scanner.due() or self.scanner.last is None:
-            budget = (self.equity * self.cfg.risk.risk_per_trade_pct / 100
-                      / pf.stop_distance)
-            self.scanner.scan(risk_budget_notional=budget,
+            self.scanner.scan(risk_budget_notional=self._scan_budget(),
                               rules_for=self.rules_for)
 
         result = self.scanner.last

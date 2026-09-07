@@ -93,8 +93,24 @@ class ScanResult:
 
     def summary(self) -> str:
         if not self.ranked:
-            return (f"no candidate passed the filters "
+            # Name the filter that actually did the damage. "no candidate
+            # passed" alone reads like a quiet market, so a budget or config
+            # mistake that rejects all 100 symbols looks identical to a genuine
+            # lull -- and stays invisible for as long as you are willing to
+            # wait for the next scan.
+            line = (f"no candidate passed the filters "
                     f"({self.considered} considered, {self.elapsed:.1f}s)")
+            if self.rejected:
+                import re
+                from collections import Counter
+
+                def kind(reason: str) -> str:
+                    return re.sub(r"\$[\d.,]+", "$_", reason.split("(")[0].strip())
+
+                top, n = Counter(kind(c.rejected) for c in self.rejected).most_common(1)[0]
+                example = next(c.rejected for c in self.rejected if kind(c.rejected) == top)
+                line += f" -- {n}/{self.considered} rejected: {example}"
+            return line
         b = self.best
         return (f"best {b.symbol} score {b.score:.3f} "
                 f"(ER {b.efficiency:.2f}, ATR {b.atr_pct:.2f}%) -- "
