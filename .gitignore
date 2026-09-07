@@ -1,4 +1,9 @@
 .env
+# Backups and variants too: .gitignore matched only the exact
+# name, so a `.env.bak` sat in the working tree as an untracked
+# file that `git add -A` would have committed.
+.env.*
+!.env.example
 config.local.yaml
 data/
 logs/
