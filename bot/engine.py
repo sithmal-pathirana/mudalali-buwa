@@ -100,6 +100,7 @@ class Engine:
         self._last_heartbeat = time.time()
         self._last_publish = 0.0
         self._last_guard = 0.0
+        self._last_price_poll = 0.0
         self.events: deque = deque(maxlen=40)
         self.position_amt = 0.0
         self.last_prices: dict[str, float] = {}
@@ -288,6 +289,7 @@ class Engine:
             "trades_today": self.state.trades_today,
             "position": pos, "events": list(self.events),
             "stream_ok": bool(self.stream and self.stream.connected.is_set()),
+            "feed": self._feed_state(),
             "clock_offset_ms": getattr(self.api, "_offset_ms", 0),
             "clock_rtt_ms": getattr(self.api, "last_rtt_ms", 0),
             "regime": self._regime_note(),
@@ -302,6 +304,22 @@ class Engine:
             "config": self._config_summary(),
             "scan": self._scan_summary(),
         }
+
+    def _feed_state(self) -> str:
+        """
+        What is actually supplying prices. `stream_ok` alone reported the
+        supported polling setup on this host as "stream DOWN", which reads as
+        a fault rather than the configuration it is.
+        """
+        if self.cfg.realtime:
+            return "live" if (self.stream
+                              and self.stream.connected.is_set()) else "DOWN"
+        if not self._last_price_poll:
+            return "polling -- no prices yet"
+        age = time.time() - self._last_price_poll
+        if age > max(60.0, self.cfg.poll_seconds * 3):
+            return f"polling STALLED ({age:.0f}s since last price)"
+        return f"polling every {self.cfg.poll_seconds}s"
 
     def _pending_book(self) -> list[dict]:
         """Dry-run entries that are resting, not yet filled."""
@@ -325,7 +343,12 @@ class Engine:
             book.append({
                 "symbol": sym, "side": p.side, "qty": p.qty, "entry": p.entry,
                 "stop": p.stop, "take_profit": p.take_profit,
-                "price": (self.last_prices or {}).get(sym, self.last_price),
+                # `px`, NOT a fallback to self.last_price: that fallback is the
+                # very cross-symbol leak the comment above describes, and it
+                # survived here after the P&L lines were fixed -- an unpriced
+                # AEROUSDT position was published at BTCUSDT's 79,097. Zero
+                # means "no price yet", which the surfaces render as such.
+                "price": px,
                 "unrealized": p.unrealized(px) if px else 0.0,
                 "to_tp": p.progress_to_tp(px) if px else 0.0,
                 "to_sl": p.progress_to_stop(px) if px else 0.0,
@@ -1481,8 +1504,38 @@ class Engine:
             log.info("clock offset moved %+d ms since the last check",
                      after - before)
 
+    def poll_prices(self) -> None:
+        """
+        Refresh the price cache over REST, for the configured symbol and every
+        symbol actually held or resting.
+
+        Polling mode never populated `last_prices` at all: on_tick is its only
+        writer and on_tick only runs off the websocket. So with realtime false
+        -- the supported configuration on this host -- every price-derived
+        reading was dead. Unrealised P&L, and distance to TP and SL, sat at
+        0.00 because _position_book found no price for the symbol; /status
+        showed the configured symbol's mark price fetched once at startup and
+        never updated again; and approach alerts could not fire.
+
+        Routed through on_tick so the polling path and the stream path share
+        one set of consequences, rather than growing a second, quieter copy.
+        """
+        symbols = {self.cfg.symbol.upper()}
+        symbols.update(s.upper() for s in self.book)
+        symbols.update(s.upper() for s in (self._dry_pending or {}))
+        try:
+            prices = self.api.mark_prices(sorted(symbols))
+        except BinanceError as e:
+            log.error("price poll failed: %s", e)
+            return
+        now_ms = int(time.time() * 1000)
+        for sym, px in prices.items():
+            self.on_tick(Tick(symbol=sym, mark_price=px, event_time=now_ms))
+        self._last_price_poll = time.time()
+
     def poll_once(self) -> None:
         """Fallback path when realtime is disabled."""
+        self.poll_prices()
         klines = self.api.klines(self.cfg.symbol, self.cfg.interval,
                                  limit=self.strategy.warmup + 10)
         bars = [Bar.from_kline(k) for k in klines[:-1]]

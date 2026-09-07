@@ -369,7 +369,7 @@ class TelegramControl:
             f"price       {s.get('price', 0):,.4f}",
             f"today       {s.get('realized_today', 0):+.2f} USDT",
             f"trades      {s.get('trades_today', 0)} today",
-            f"stream      {'live' if s.get('stream_ok') else 'DOWN'}",
+            f"feed        {s.get('feed') or ('live' if s.get('stream_ok') else 'DOWN')}",
         ]
         off = s.get("clock_offset_ms")
         if off is not None:
@@ -384,7 +384,13 @@ class TelegramControl:
         if p:
             lines += [
                 "",
+                f"{p.get('symbol', s.get('symbol','?'))} "
                 f"{p['side']} {p['qty']:g} @ {p['entry']:,.4f}",
+                # The held coin's OWN price. /status used to print only the
+                # configured symbol's, which in portfolio mode is a market the
+                # bot is not even trading.
+                f"now         " + (f"{p['price']:,.4f}" if p.get('price')
+                                   else "no price yet"),
                 f"unrealised  {p['unrealized']:+.2f} USDT",
                 f"to TP       {p['to_tp']*100:5.1f}%  ({p['take_profit']:,.4f})",
                 f"to SL       {p['to_sl']*100:5.1f}%  ({p['stop']:,.4f})",

@@ -200,6 +200,36 @@ class Binance:
     def mark_price(self, symbol: str):
         return self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
 
+    def mark_prices(self, symbols: list[str] | None = None) -> dict[str, float]:
+        """
+        Mark price for several symbols at once, as {SYMBOL: price}.
+
+        premiumIndex costs weight 1 for one symbol and 10 for the whole board,
+        so a handful is cheaper fetched individually. One bad symbol must not
+        cost the caller the rest of the book, hence the per-symbol guard.
+        """
+        wanted = [s.upper() for s in symbols] if symbols else None
+        if wanted is not None and len(wanted) <= 2:
+            out = {}
+            for sym in wanted:
+                try:
+                    out[sym] = float(self.mark_price(sym)["markPrice"])
+                except (BinanceError, KeyError, TypeError, ValueError) as e:
+                    log.warning("mark price for %s unavailable: %s", sym, e)
+            return out
+
+        rows = self._request("GET", "/fapi/v1/premiumIndex", {})
+        keep = set(wanted) if wanted is not None else None
+        out = {}
+        for r in rows:
+            sym = r.get("symbol", "")
+            if keep is None or sym in keep:
+                try:
+                    out[sym] = float(r["markPrice"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return out
+
     def funding_history(self, symbol: str, limit: int = 500):
         return self._request("GET", "/fapi/v1/fundingRate", {"symbol": symbol, "limit": limit})
 
