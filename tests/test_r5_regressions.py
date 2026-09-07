@@ -32,13 +32,38 @@ from bot.positions import ActivePosition                      # noqa: E402
 from test_r2_regressions import StubAPI, engine, _cleanup     # noqa: E402
 
 
+#: The real fills Binance recorded for the AEROUSDT trade of 2026-09-07, which
+#: is the trade whose P&L never reached /pnl. Gross 0.16262, commission
+#: 0.01059, net 0.15203 -- and the balance moved 2.44788 -> 2.59991, which is
+#: the net to five decimal places.
+AERO_FILLS = [
+    {"time": 1788807621451, "side": "BUY", "price": "0.6075000", "qty": "17.3",
+     "realizedPnl": "0", "commission": "0.00525487", "commissionAsset": "USDT"},
+    {"time": 1788809142015, "side": "SELL", "price": "0.6169000", "qty": "0.4",
+     "realizedPnl": "0.00376000", "commission": "0.00012338",
+     "commissionAsset": "USDT"},
+    {"time": 1788809142015, "side": "SELL", "price": "0.6169000", "qty": "16.9",
+     "realizedPnl": "0.15886000", "commission": "0.00521280",
+     "commissionAsset": "USDT"},
+]
+
+
 class PricingAPI(StubAPI):
     """A stub that can quote a mark price, which StubAPI never needed to."""
 
-    def __init__(self, prices=None, **kw):
+    def __init__(self, prices=None, fills=None, **kw):
         super().__init__(**kw)
         self.prices = dict(prices or {})
         self.mark_price_calls = []
+        self.fills = list(fills) if fills is not None else list(AERO_FILLS)
+        self.user_trades_calls = []
+
+    def user_trades(self, symbol, start_ms=None, limit=1000):
+        self.user_trades_calls.append((symbol, start_ms))
+        return list(self.fills)
+
+    def cancel_all(self, symbol):
+        self.calls.append(("cancel_all", symbol))
 
     def mark_price(self, symbol):
         self.mark_price_calls.append(symbol)
@@ -150,6 +175,108 @@ class TestFeedStateIsHonest(unittest.TestCase):
         e.cfg.realtime = True
         e.stream = None
         self.assertEqual(e._feed_state(), "DOWN")
+
+
+class TestExchangeSideCloseIsBooked(unittest.TestCase):
+    """
+    The AEROUSDT trade of 2026-09-07 closed on its take-profit while the bot
+    was in polling mode. Equity went 2.4479 -> 2.5999, and realized_today
+    stayed at 0.00 -- because realised P&L was booked in exactly one place,
+    on_order, which is fed by the user-data websocket that polling mode does
+    not have. /pnl read 0% of target with the money already in the account.
+    """
+
+    def tearDown(self):
+        _cleanup()
+
+    def _closed(self, fills=None):
+        """AEROUSDT tracked in the book, flat on the exchange, no orders left."""
+        e = _held({"BTCUSDT": 79_097.9})
+        if fills is not None:
+            e.api.fills = list(fills)
+        e.book["AEROUSDT"].opened_ms = 1788807621000
+        e.state.realized_today = 0.0
+        return e
+
+    def _reconcile_flat(self, e):
+        e.reconcile_position({"position_amt": 0.0, "open_order_ids": set()},
+                             symbol="AEROUSDT")
+
+    def test_the_close_reaches_realized_today(self):
+        e = self._closed()
+        self._reconcile_flat(e)
+        self.assertAlmostEqual(e.state.realized_today, 0.15202895, places=6)
+
+    def test_it_matches_what_the_balance_actually_did(self):
+        e = self._closed()
+        self._reconcile_flat(e)
+        moved = 2.59991362 - 2.44788467
+        self.assertAlmostEqual(e.state.realized_today, moved, places=5,
+                               msg="booked P&L must equal the balance change")
+
+    def test_commission_is_not_ignored(self):
+        e = self._closed()
+        self._reconcile_flat(e)
+        gross = 0.00376 + 0.15886
+        self.assertLess(e.state.realized_today, gross,
+                        "gross realizedPnl overstates what the account gained")
+
+    def test_the_user_is_told_the_trade_closed(self):
+        e = self._closed()
+        self._reconcile_flat(e)
+        self.assertTrue([b for _, b in e.sent if "closed" in b],
+                        "an exchange-side close sent no alert at all")
+
+    def test_the_slot_is_still_freed(self):
+        e = self._closed()
+        self._reconcile_flat(e)
+        self.assertNotIn("AEROUSDT", e.book)
+
+    def test_only_fills_from_this_position_are_counted(self):
+        """An earlier trade on the same symbol must not be booked again."""
+        earlier = dict(AERO_FILLS[2], time=1788700000000,
+                       realizedPnl="99.0", commission="0")
+        e = self._closed(fills=[earlier] + AERO_FILLS)
+        self._reconcile_flat(e)
+        self.assertAlmostEqual(e.state.realized_today, 0.15202895, places=6)
+
+    def test_fees_paid_in_bnb_are_not_subtracted_from_usdt(self):
+        fills = [dict(AERO_FILLS[1], commission="0.5", commissionAsset="BNB")]
+        e = self._closed(fills=fills)
+        self._reconcile_flat(e)
+        self.assertAlmostEqual(e.state.realized_today, 0.00376, places=6)
+
+    def test_an_unreachable_exchange_books_nothing_rather_than_guessing(self):
+        e = self._closed()
+
+        def boom(*a, **kw):
+            from bot.binanceapi import BinanceError
+            raise BinanceError(-1001, "disconnected", "/userTrades")
+
+        e.api.user_trades = boom
+        self._reconcile_flat(e)
+        self.assertEqual(e.state.realized_today, 0.0)
+        self.assertNotIn("AEROUSDT", e.book, "the slot must still be freed")
+
+    def test_a_crash_while_booking_still_frees_the_slot(self):
+        """
+        With one slot configured, a position left in the book stops the bot
+        trading at all. Bookkeeping must never be able to cause that.
+        """
+        e = self._closed()
+
+        def boom(*a, **kw):
+            raise RuntimeError("something nobody predicted")
+
+        e.api.user_trades = boom
+        self._reconcile_flat(e)
+        self.assertNotIn("AEROUSDT", e.book)
+
+    def test_a_stale_protective_order_close_is_booked_too(self):
+        e = self._closed()
+        e.reconcile_position(
+            {"position_amt": 0.0, "open_order_ids": {"s-1"}}, symbol="AEROUSDT")
+        self.assertAlmostEqual(e.state.realized_today, 0.15202895, places=6)
 
 
 if __name__ == "__main__":

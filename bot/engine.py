@@ -157,6 +157,76 @@ class Engine:
     def position_for(self, symbol: str) -> "ActivePosition | None":
         return self.book.get(symbol)
 
+    def realized_from_exchange(self, pos: ActivePosition) -> float | None:
+        """
+        What this position actually made, read back from the exchange's fills.
+
+        Realised P&L was booked in exactly one place: on_order, which is fed by
+        the user-data websocket. With realtime false there is no websocket, so
+        a stop or take-profit filling -- how almost every trade here ends --
+        moved nothing. realized_today sat at 0.00 while the balance changed
+        under it, /pnl showed 0% of target forever, the daily target could
+        never fire, and no "closed" alert was ever sent.
+
+        Returns None when the exchange cannot be asked; the caller then
+        releases the position without inventing a number.
+
+        Commission is subtracted. The gross realizedPnl is not what the account
+        gained: this trade grossed 0.1626 and netted 0.1520 after 0.0106 of
+        fees, and the balance moved by the latter. On a $2.45 account against a
+        $2/day target that difference is not a rounding detail.
+        """
+        try:
+            fills = self.api.user_trades(pos.symbol, start_ms=pos.opened_ms or None)
+        except BinanceError as e:
+            log.error("could not read %s fills to book realised P&L: %s",
+                      pos.symbol, e)
+            return None
+
+        total = 0.0
+        for f in fills:
+            try:
+                if pos.opened_ms and int(f.get("time", 0)) < pos.opened_ms:
+                    continue
+                total += float(f.get("realizedPnl") or 0.0)
+                # Fees in BNB do not come out of the USDT balance, so counting
+                # them here would understate a trade that was actually flat.
+                if f.get("commissionAsset") == "USDT":
+                    total -= float(f.get("commission") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    def book_exchange_close(self, pos: ActivePosition) -> None:
+        """
+        Record a position that the exchange closed while we were not looking.
+
+        Nothing in here may raise. The caller releases the position -- frees
+        its slot -- immediately afterwards, and a slot that is never freed is
+        worse than a P&L figure that is never booked: with one slot configured,
+        one stuck entry stops the bot trading entirely, silently, until someone
+        restarts it. Bookkeeping is best-effort; releasing is not.
+        """
+        try:
+            pnl = self.realized_from_exchange(pos)
+            if pnl is None:
+                return
+            self.state.realized_today += pnl
+            self.state.save()
+            prog = self.schedule.progress(self.state.realized_today)
+            log.info("%s closed exchange-side for %+.4f USDT "
+                     "(realised today %+.4f)",
+                     pos.symbol, pnl, self.state.realized_today)
+            self.notify.send(
+                Event.TP_HIT if pnl >= 0 else Event.SL_HIT,
+                f"{pos.symbol} closed for {pnl:+.2f} USDT\n{prog}\n"
+                f"equity ${self.equity:,.2f}",
+                symbol=pos.symbol)
+            self.check_target_reached()
+        except Exception:
+            log.exception("could not book the close of %s; releasing it anyway",
+                          pos.symbol)
+
     def release(self, symbol: str) -> None:
         """Forget ONE position and free its slot. Never touches the others."""
         p = self.book.pop(symbol, None)
@@ -1345,11 +1415,13 @@ class Engine:
                 f"{symbol} is flat but {len(still_open)} protective order(s) "
                 f"were still listed. Cancelled them and released tracking.",
                 symbol=symbol)
+            self.book_exchange_close(pos)
             self.release(symbol)
             self._entry_placed_at = 0.0
             return
 
         log.info("%s closed exchange-side and no orders remain; clearing", symbol)
+        self.book_exchange_close(pos)
         self.release(symbol)
         self._entry_placed_at = 0.0
 
@@ -1787,7 +1859,7 @@ class Engine:
             symbol=symbol, side=signal.side, entry=float(price),
             stop=float(stop_price), take_profit=float(tp_price), qty=float(qty),
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
-            tag=entry_id)
+            tag=entry_id, opened_ms=int(time.time() * 1000))
         self.state.entry_order_id = entry_id
         self.state.stop_order_id = stop_id
         self.risk.record_attempt()

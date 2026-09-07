@@ -68,6 +68,15 @@ class StubAPI:
         self.calls.append(("usdt_equity", None))
         return 5000.0
 
+    def user_trades(self, symbol, start_ms=None, limit=1000):
+        """
+        No fills by default: these tests assert on tracking, not on P&L, and
+        an empty list books nothing. Subclasses that care about realised P&L
+        return real rows (see tests/test_r5_regressions.py).
+        """
+        self.calls.append(("user_trades", symbol))
+        return []
+
     def set_margin_type(self, symbol, margin_type="ISOLATED"):
         self.calls.append(("set_margin_type", symbol, margin_type))
         return {"msg": "ok"}

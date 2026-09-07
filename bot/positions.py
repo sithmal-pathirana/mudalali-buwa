@@ -23,6 +23,10 @@ class ActivePosition:
     stop_order_id: str = ""
     tp_order_id: str = ""
     tag: str = ""             # used to scope alert de-duplication
+    #: When the entry was placed, exchange clock. Bounds the userTrades query
+    #: that recovers realised P&L for a position closed exchange-side, so an
+    #: earlier trade on the same symbol can never be counted a second time.
+    opened_ms: int = 0
 
     @property
     def is_long(self) -> bool:
