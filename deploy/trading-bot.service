@@ -13,6 +13,12 @@ Wants=network-online.target
 # Signed requests fail if the clock drifts, so do not start before time sync.
 After=time-sync.target
 
+# StartLimit* are [Unit] directives. Left in [Service] systemd ignores
+# StartLimitIntervalSec entirely, so the crash-loop guard never armed and a
+# bot failing on every start would retry forever against the rate limits.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=trader
@@ -25,8 +31,6 @@ ExecStart=/usr/bin/python3 /opt/trading-bot/run.py trade
 # stay up should page you, not thrash against the exchange's rate limits.
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Stop cleanly: SIGINT is what the engine's shutdown path listens for, so it
 # cancels open orders before exiting.
