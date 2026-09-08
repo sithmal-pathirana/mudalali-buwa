@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 @dataclass
@@ -58,19 +58,45 @@ class SymbolRules:
         """
         if price <= 0:
             return None
+        px = Decimal(str(price))
         raw_qty = notional / price
         qty_s = self.round_qty(raw_qty)
         qty = Decimal(qty_s)
+        if qty * px < self.min_notional and Decimal(str(notional)) >= self.min_notional:
+            # The caller asked for a legal amount and only the step rounding
+            # put it back under the floor -- the case that matters on a small
+            # account, where every order is sized at exactly MIN_NOTIONAL and
+            # flooring therefore ALWAYS lands a fraction of a step below it.
+            # One step up is the cheapest legal order and overshoots the ask
+            # by less than the exchange's own granularity. Asking for less
+            # than MIN_NOTIONAL is still refused, never quietly enlarged.
+            stepped = qty + self.step_size
+            if stepped <= self.max_qty:
+                qty = stepped
+                qty_s = f"{qty:.{self.qty_precision}f}"
         if qty < self.min_qty or qty <= 0:
             return None
-        if qty * Decimal(str(price)) < self.min_notional:
+        if qty * px < self.min_notional:
             return None
         return qty_s, self.round_price(price)
 
     def min_affordable_notional(self, price: float) -> float:
-        """Cheapest legal order for this symbol right now, in USDT."""
-        by_qty = float(self.min_qty) * price
-        return max(by_qty, float(self.min_notional))
+        """
+        Cheapest legal order for this symbol right now, in USDT.
+
+        Quantity has to sit on a step boundary, so the honest floor is the
+        notional of the smallest step-aligned quantity that clears both minQty
+        and MIN_NOTIONAL -- not MIN_NOTIONAL itself. Reporting the bare $5
+        floor is what had the allocator ask for exactly $5.00 of a $0.144 coin,
+        get 34 units worth $4.91 back, and refuse every order.
+        """
+        if price <= 0:
+            return float(self.min_notional)
+        px = Decimal(str(price))
+        by_notional = ((self.min_notional / px / self.step_size)
+                       .to_integral_value(ROUND_UP) * self.step_size)
+        qty = max(by_notional, self.min_qty)
+        return float(qty * px)
 
     def describe(self, price: float) -> str:
         return (f"{self.symbol}: tick={self.tick_size} step={self.step_size} "

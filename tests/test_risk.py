@@ -128,8 +128,37 @@ class TestFilters(unittest.TestCase):
         self.assertIsNotNone(r.size_for_notional(60.0, 80_000))
 
     def test_min_affordable_uses_the_binding_constraint(self):
-        self.assertAlmostEqual(btc_rules().min_affordable_notional(80_000), 50.0)
+        # 50/80_000 = 0.000625 BTC, which is not on the 0.0001 step -- the
+        # cheapest order you can actually send is 0.0007 BTC, i.e. $56.
+        self.assertAlmostEqual(btc_rules().min_affordable_notional(80_000), 56.0)
         self.assertAlmostEqual(btc_rules().min_affordable_notional(800_000), 80.0)  # minQty binds
+
+    def test_the_cheapest_legal_order_is_actually_sendable(self):
+        """
+        The floor min_affordable_notional reports has to survive being handed
+        straight back to size_for_notional. It did not: on a small account the
+        allocator sizes every position at exactly the exchange minimum, and
+        flooring the quantity to the step then always landed a fraction under
+        it, so every single order was refused and the bot stopped trading.
+        """
+        for rules, price in ((cheap_rules(), 0.14447),      # step 1, ~$0.14
+                             (cheap_rules(), 0.012331),     # step 1, ~$0.012
+                             (btc_rules(), 80_000.0),
+                             (btc_rules(), 63_412.7)):
+            floor = rules.min_affordable_notional(price)
+            sized = rules.size_for_notional(floor, price)
+            self.assertIsNotNone(sized, f"{rules.symbol} @ {price} refused its own floor")
+            qty, _ = sized
+            self.assertGreaterEqual(float(qty) * price, float(rules.min_notional))
+
+    def test_an_ask_at_the_minimum_is_rounded_up_not_refused(self):
+        r = cheap_rules()
+        self.assertEqual(r.size_for_notional(5.0, 0.14447)[0], "35")   # not 34 ($4.91)
+
+    def test_an_ask_below_the_minimum_is_still_refused(self):
+        """The step-up must never enlarge an order the caller asked to be small."""
+        self.assertIsNone(cheap_rules().size_for_notional(4.0, 0.14447))
+        self.assertIsNone(btc_rules().size_for_notional(40.0, 80_000))
 
 
 class TestStrategy(unittest.TestCase):
