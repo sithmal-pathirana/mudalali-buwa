@@ -52,7 +52,10 @@ risk:
   # 30% still halts the day after roughly four consecutive losers -- or after
   # only TWO in aggressive mode, where each trade risks ~14.3%.
   daily_loss_limit_pct: 30.0
-  max_trades_per_day: 10
+  # Raised from 10 to match the maximum profile's own trades_per_day (20).
+  # The pool-widening below roughly triples the entry rate, and 10 would have
+  # become the new binding constraint by mid-afternoon.
+  max_trades_per_day: 20
   # $5 minimum / 3x leverage = $1.67 is the equity below which no legal order
   # exists at all. The floor sits just above it: past this point the account
   # is not small, it is untradable.
@@ -110,7 +113,7 @@ targets:
 # the KILL file, and the equity floor.
 aggressive:
   enabled: true
-  profile: moderate        # moderate (10x) | high (20x) | maximum (50x)
+  profile: maximum         # moderate (10x) | high (20x) | maximum (50x)
   keep_daily_loss_limit: true
   confirm_live: true       # type AGGRESSIVE before the first live order
                            # (under systemd: Environment=CONFIRM_AGGRESSIVE=AGGRESSIVE)
@@ -146,7 +149,14 @@ portfolio:
 universe:
   max_symbols: 100
   min_quote_volume: 20000000
-  min_efficiency: 0.30
+  # THE bottleneck, measured 2026-09-08: of 97 liquid perps, 59 clear the
+  # ATR >= 0.6% filter aggressive mode forces, but only THREE clear ER 0.30.
+  # With 3 candidates and a ~2.3% per-bar chance of a breakout, the bot got
+  # one entry roughly every 3.6 hours. Passing symbols by threshold:
+  #     0.30 -> 3    0.25 -> 4    0.20 -> 7    0.15 -> 13    0.10 -> 25
+  # 0.20 is aggressive mode's own intended default -- it sets it with
+  # setdefault(), so this key being present here is what was overriding it.
+  min_efficiency: 0.20
   min_atr_pct: 0.25
   rescan_seconds: 300
 
@@ -185,7 +195,14 @@ alerts:
 params:
   regime:
     window: 30
-    trend_above: 0.35      # efficiency ratio above this = trending
+    # Lowered with universe.min_efficiency, and it has to move WITH it: a
+    # symbol admitted by the scanner at ER 0.22 was then called "unclear"
+    # here and routed to null, so loosening the scanner alone bought nothing.
+    # Measured over 14 symbols x 3 days of 15m bars, trend-only routing:
+    #     0.35 -> 28.5 signals/day     0.25 -> 48.6 signals/day
+    # The extra entries sit in the ER 0.25-0.35 band, where trend_atr's
+    # measured edge is thinner than in the 0.35+ band it was fitted on.
+    trend_above: 0.25      # efficiency ratio above this = trending
     range_below: 0.20      # below this = ranging
     # Default 3 makes every restart cold-start at UNCLEAR and sit out ~15+
     # minutes before the first trending confirmation. 1 = trade on the first
@@ -195,7 +212,11 @@ params:
   trend:
     # Default 20 (5h on 15m bars) waits for a rare breakout. 8 (2h) fires
     # far more often at the cost of more false breakouts / whipsaw losses.
-    channel: 8
+    # Measured: under trend-only routing this is a weak lever -- 8 -> 4 moved
+    # signals only 28.5 -> 34.9/day, because the regime gate above, not the
+    # channel, is what actually withholds entries. 6 takes the cheap part of
+    # that and leaves the whipsaw of 3-4 alone.
+    channel: 6
     atr_period: 14
     atr_stop_mult: 2.0
     atr_target_mult: 3.0
