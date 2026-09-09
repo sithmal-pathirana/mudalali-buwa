@@ -217,7 +217,7 @@ class TestARestingEntryHoldsItsSlot(unittest.TestCase):
             "symbol": sym,
             "min_affordable_notional": lambda s, px: 5.0})()
         e.placed = []
-        e.place = lambda sig, notional, note, symbol=None: e.placed.append(symbol)
+        e.place = lambda sig, notional, note, symbol=None, atr_pct=0.0: e.placed.append(symbol)
         e.stream = None
         return e
 

@@ -27,6 +27,14 @@ class ActivePosition:
     #: that recovers realised P&L for a position closed exchange-side, so an
     #: earlier trade on the same symbol can never be counted a second time.
     opened_ms: int = 0
+    #: Set when the protective stop on the exchange is a TRAILING_STOP_MARKET
+    #: rather than a fixed STOP_MARKET, to the same callbackRate (percent)
+    #: sent to Binance. 0 means the stop is fixed and never moves.
+    trailing_pct: float = 0.0
+    #: Best price seen since entry, in the favourable direction. Only used
+    #: when trailing_pct > 0, to mirror the exchange's own trailing math
+    #: locally so status lines and proximity alerts stay accurate.
+    high_water: float = 0.0
 
     @property
     def is_long(self) -> bool:
@@ -39,6 +47,30 @@ class ActivePosition:
     def unrealized(self, price: float) -> float:
         move = (price - self.entry) if self.is_long else (self.entry - price)
         return move * self.qty
+
+    def update_trailing_stop(self, price: float) -> None:
+        """
+        Mirror what a TRAILING_STOP_MARKET order is doing on the exchange,
+        purely for display. This never sends anything -- the real stop lives
+        on Binance and moves itself -- but without a local mirror, `stop`
+        would stay frozen at its entry-time value and every proximity alert
+        and status line would quietly go stale the moment price ran in our
+        favour.
+
+        Like the order it mirrors, this only ever tightens: `stop` can move
+        toward price, never away from it, matching Binance's own guarantee
+        that a trailing stop cannot get worse.
+        """
+        if self.trailing_pct <= 0:
+            return
+        if self.high_water == 0.0:
+            self.high_water = self.entry
+        if self.is_long:
+            self.high_water = max(self.high_water, price)
+            self.stop = max(self.stop, self.high_water * (1 - self.trailing_pct / 100))
+        else:
+            self.high_water = min(self.high_water, price)
+            self.stop = min(self.stop, self.high_water * (1 + self.trailing_pct / 100))
 
     # ------------------------------------------------------------- progress
     def progress_to_tp(self, price: float) -> float:

@@ -40,6 +40,15 @@ class RiskConfig:
     #: The leverage cap below still bounds the upsized order -- this raises the
     #: effective risk PERCENTAGE, never the notional past equity*max_leverage.
     take_minimum_order: bool = False
+    #: Multiple of realised volatility (mean true range, as a % of price) used
+    #: as the callbackRate for a Binance-native TRAILING_STOP_MARKET, placed
+    #: instead of the fixed STOP_MARKET the strategy would otherwise get. The
+    #: stop then ratchets in the position's favour on the exchange itself --
+    #: it keeps trailing even if this process is down -- and never gets worse
+    #: than the fixed stop it replaces. 0 keeps the fixed stop. 0 in the safe
+    #: profile on purpose: an exit rule that has not been backtested has no
+    #: business touching money. Aggressive profiles set this (bot/aggressive.py).
+    trailing_atr_mult: float = 0.0
 
 
 @dataclass

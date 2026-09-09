@@ -1107,9 +1107,18 @@ def layer_portfolio(report, args):
         problems = []
         for name, profile in PROFILES.items():
             cfg = Config.load(ROOT / "config.yaml")
+            ceiling = cfg.risk.max_leverage
             apply(cfg, profile)
-            if cfg.risk.max_leverage != profile.leverage:
-                problems.append(f"{name}: leverage not applied")
+            # config.yaml's max_leverage is a ceiling a profile may lower but
+            # never raise: liquidation has to stay outside the strategy's stop,
+            # and raising it to 50x is what liquidated two positions on
+            # 2026-09-08 before their stops could trigger.
+            if cfg.risk.max_leverage != min(ceiling, profile.leverage):
+                problems.append(
+                    f"{name}: leverage is {cfg.risk.max_leverage}x, expected "
+                    f"{min(ceiling, profile.leverage)}x")
+            if cfg.risk.max_leverage > ceiling:
+                problems.append(f"{name}: leverage raised past the config ceiling")
             if cfg.portfolio.portfolio_risk_pct != profile.portfolio_risk_pct:
                 problems.append(f"{name}: portfolio risk not applied")
             warning = short_warning(43.0, profile)

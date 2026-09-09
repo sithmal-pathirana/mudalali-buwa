@@ -34,15 +34,35 @@ class TestOptIn(unittest.TestCase):
 class TestProfileApplication(unittest.TestCase):
     def test_replaces_the_risk_profile(self):
         cfg = Config()
-        before = cfg.risk.max_leverage
         apply(cfg, PROFILES["high"])
-        self.assertNotEqual(cfg.risk.max_leverage, before)
-        self.assertEqual(cfg.risk.max_leverage, 20)
         self.assertEqual(cfg.risk.risk_per_trade_pct, 4.0)
         # Interval comes from the profile, whatever the measurement says it
         # should be -- asserted against the profile rather than a literal, so
         # this test does not have to be edited every time the data moves it.
         self.assertEqual(cfg.interval, PROFILES["high"].interval)
+
+    def test_leverage_is_capped_by_the_configured_ceiling(self):
+        """
+        A profile may lower leverage but never raise it.
+
+        `maximum` asking for 50x on a config that says 3 is what put the
+        liquidation price ~0.7% from entry on an alt perp (1/50 minus a ~1.3%
+        maintenance margin) while the strategy's own stops sat 1.7-2.9% away.
+        The protective stop could never fire: Binance liquidated PROMUSDT and
+        ORCAUSDT first and charged a clearance fee about twice each trade's
+        market loss. (2026-09-08)
+        """
+        cfg = Config()
+        self.assertEqual(cfg.risk.max_leverage, 3)
+        apply(cfg, PROFILES["maximum"])
+        self.assertEqual(cfg.risk.max_leverage, 3)
+
+    def test_a_profile_may_still_lower_leverage(self):
+        """The clamp is a ceiling, not a freeze."""
+        cfg = Config()
+        cfg.risk.max_leverage = 25
+        apply(cfg, PROFILES["high"])          # high asks for 20x
+        self.assertEqual(cfg.risk.max_leverage, 20)
 
     def test_loosens_trendiness_and_demands_movement(self):
         cfg = Config()

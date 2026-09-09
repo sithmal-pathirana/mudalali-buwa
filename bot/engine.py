@@ -14,10 +14,14 @@ position is never opened without its protective stop.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .binanceapi import Binance, BinanceError
 from .dashboard import Dashboard, generate_token
@@ -25,6 +29,7 @@ from .filters import SymbolRules
 from .notify import Event, Notifier
 from .portfolio import allocate
 from .positions import ActivePosition
+from .regime import realised_vol_pct
 from .risk import KILL_FILE, RiskManager
 from .state import State, client_order_id, reconcile
 from .telegram_control import TelegramControl
@@ -34,6 +39,60 @@ from .strategies.base import Bar
 from .targets import TargetSchedule
 
 log = logging.getLogger("engine")
+
+#: RestartSec in the systemd unit. Only used to set expectations in the message
+#: a /restart sends back, so being a few seconds out is harmless.
+RESTART_DELAY_HINT = 15
+
+#: systemd's start rate limit, mirrored from deploy/trading-bot.service
+#: (StartLimitIntervalSec and StartLimitBurst). Unlike RESTART_DELAY_HINT
+#: these are load-bearing, so tests assert the unit file still agrees with
+#: them -- a silent drift here hands out a restart budget that does not exist.
+START_LIMIT_INTERVAL = 300
+START_LIMIT_BURST = 5
+
+#: How many of those starts /restart may spend. The rest are held back for
+#: crash recovery, because systemd counts every start against one budget and
+#: does not care which were deliberate. Spending the last one is not a
+#: throttle you can wait out: the unit enters `failed` and stays down until
+#: someone runs `systemctl reset-failed` -- from a shell, which is exactly
+#: what a Telegram-only operator does not have. Refusing the fourth restart
+#: costs a minute; allowing it can cost the whole session.
+RESTART_BUDGET = START_LIMIT_BURST - 2
+
+#: Timestamps of restarts this bot asked for, kept across the restart itself.
+#: In data/ because ProtectSystem=strict leaves that as one of the few
+#: writable paths.
+RESTART_LEDGER = Path(__file__).resolve().parent.parent / "data" / "restarts.json"
+
+
+def recent_restarts(now: float, path: Path = RESTART_LEDGER) -> list[float]:
+    """Deliberate restarts still inside systemd's rate-limit window.
+
+    A missing or corrupt ledger reads as empty rather than raising: losing the
+    history spends budget the bot did not know it had, which is survivable,
+    while an exception here would take down the command loop.
+    """
+    try:
+        stamps = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(stamps, list):
+        return []
+    # Clock changes can leave stamps in the future; treat them as current
+    # rather than trusting them to expire.
+    return [float(t) for t in stamps
+            if isinstance(t, (int, float)) and now - float(t) < START_LIMIT_INTERVAL]
+
+
+def record_restart(now: float, path: Path = RESTART_LEDGER) -> None:
+    """Charge one start against the budget. Best effort -- a restart that
+    cannot be written down is still better than one that does not happen."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(recent_restarts(now, path) + [now]))
+    except OSError as e:
+        log.warning("could not record the restart in %s: %s", path, e)
 
 
 # The KILL file used to raise a KillSwitch exception from emergency_check().
@@ -62,6 +121,18 @@ class Engine:
     _last_reconcile = 0.0
     _stopping = False
     _stop_reason = ""
+    #: Exit code run() hands back to systemd. `Restart=on-failure` in the unit
+    #: is what turns this into process control: 0 leaves the bot down, any
+    #: non-zero code brings it back after RestartSec. That is the only lever
+    #: available -- NoNewPrivileges and the @privileged syscall filter mean the
+    #: bot cannot call systemctl on itself.
+    _exit_code = 0
+    #: False when the loop is being left by a request that has NOT already done
+    #: the exchange work, so shutdown() still cancels resting orders.
+    _stop_exchange_done = True
+    #: Where deliberate restarts are counted. An attribute rather than a
+    #: constant so a test can spend the budget without touching the real one.
+    restart_ledger = RESTART_LEDGER
     _seq = 0
     position_amt = 0.0
     last_prices: dict = None
@@ -111,6 +182,8 @@ class Engine:
         self._flat_reconciles = 0
         self._stopping = False
         self._stop_reason = ""
+        self._exit_code = 0
+        self._stop_exchange_done = True
         self.dashboard: Dashboard | None = None
         self.telegram: TelegramControl | None = None
         from .signals import SignalChannel
@@ -500,6 +573,8 @@ class Engine:
             "positions": book,
             "pending": self._pending_book(),
             "config": self._config_summary(),
+            "editable": self._editable_summary(),
+            "restarts_left": self.restarts_left(),
             "scan": self._scan_summary(),
         }
 
@@ -582,6 +657,27 @@ class Engine:
             "target": (f"${self.schedule.today_target():.2f}/day"
                        if self.schedule.stop_when_reached else "not enforced"),
         }
+
+    def restarts_left(self) -> int:
+        """How many more /restart requests the budget allows right now, so
+        the confirmation can say so before the button is pressed rather than
+        refusing afterwards."""
+        return max(0, RESTART_BUDGET - len(recent_restarts(time.time(),
+                                                           self.restart_ledger)))
+
+    def _editable_summary(self) -> dict:
+        """
+        Current value of every allowlisted setting, for /set to display.
+
+        These come from the RUNNING config, which for the risk block is what
+        aggressive.apply() left behind rather than what config.yaml says. That
+        is the honest number to show next to a proposed edit -- it is what the
+        bot is actually using -- and /set's reply is explicit that the write
+        goes to the file and needs a restart.
+        """
+        from . import settings as settings_mod
+        return {key: settings_mod.current_value(self.cfg, key)
+                for key in settings_mod.EDITABLE}
 
     def _scan_summary(self) -> dict:
         """
@@ -669,6 +765,99 @@ class Engine:
                     self.state.save()
                     self.notify.send(Event.STARTUP,
                                      f"Resumed ({origin}).\nCleared halt: {previous}")
+                elif cmd.action == "set":
+                    self.apply_setting(cmd.value, origin)
+                elif cmd.action == "restart":
+                    self.request_restart(origin)
+                elif cmd.action == "stop":
+                    self.notify.send(Event.HALT,
+                                     f"Stopping ({origin}). The bot will NOT come "
+                                     f"back on its own -- nothing will be polling "
+                                     f"Telegram, so this cannot be undone from here. "
+                                     f"Start it from a shell:\n"
+                                     f"  sudo systemctl start trading-bot\n\n"
+                                     f"Open positions and their stops stay on the "
+                                     f"exchange, unmonitored.")
+                    self.request_stop(f"stop requested ({origin})", 0)
+
+    def request_restart(self, origin: str = "") -> None:
+        """
+        Restart the process, unless doing so would spend systemd's last start.
+
+        There is no way to restart from inside the unit: NoNewPrivileges and
+        the @privileged syscall filter mean the bot cannot call systemctl on
+        itself, so the only lever is exiting non-zero and letting
+        `Restart=on-failure` bring it back. That lever is rate limited, and
+        running it out does not merely delay the next restart -- the unit
+        enters `failed` and needs `systemctl reset-failed` from a shell. So a
+        restart that would exhaust the budget is refused with the time to
+        wait, which is recoverable, instead of taken, which is not.
+        """
+        now = time.time()
+        spent = recent_restarts(now, self.restart_ledger)
+        if len(spent) >= RESTART_BUDGET:
+            wait = int(START_LIMIT_INTERVAL - (now - min(spent))) + 1
+            self.notify.send(
+                Event.ERROR,
+                f"Restart refused ({origin}): {len(spent)} already in the last "
+                f"{START_LIMIT_INTERVAL // 60} minutes.\n\nsystemd allows "
+                f"{START_LIMIT_BURST} starts per {START_LIMIT_INTERVAL // 60} "
+                f"minutes and stops the service for good once that runs out -- "
+                f"which would need a shell to undo, not Telegram. The remaining "
+                f"starts are kept for crash recovery.\n\nTry again in about "
+                f"{wait}s. The bot is still running and trading normally.")
+            return
+        record_restart(now, self.restart_ledger)
+        self.notify.send(Event.STARTUP,
+                         f"Restarting ({origin}). Back in about "
+                         f"{RESTART_DELAY_HINT}s; config.yaml is re-read "
+                         f"on the way up.\nOpen positions and their stops "
+                         f"stay on the exchange.")
+        self.request_stop(f"restart requested ({origin})",
+                          self.RESTART_EXIT_CODE)
+
+    def apply_setting(self, spec: str, origin: str = "") -> None:
+        """
+        Write one allowlisted setting to config.yaml.
+
+        Runs on the engine thread like every other command, but unlike the
+        others it does NOT change the running bot: most of these are read once
+        during startup, and aggressive.apply() overwrites the risk block
+        wholesale, so there is no honest way to un-apply a profile in place.
+        The write lands in the file and the next restart picks it up -- which
+        is what the reply says, rather than implying a change that has not
+        happened.
+        """
+        from . import settings as settings_mod
+
+        key, _, raw = (spec or "").partition("=")
+        key, raw = key.strip(), raw.strip()
+        setting = settings_mod.EDITABLE.get(key)
+        if setting is None:
+            self.notify.send(Event.ERROR, f"{key!r} is not an editable setting.")
+            return
+        try:
+            value = settings_mod.parse_value(setting, raw)
+            target = (self.cfg.config_path or "").split(" + ")[0]
+            old, new = settings_mod.write_setting(key, value, target)
+        except (ValueError, KeyError) as e:
+            self.notify.send(Event.ERROR, f"Refused: {e}")
+            return
+        except OSError as e:
+            # ProtectSystem=strict makes config.yaml read-only unless the unit
+            # lists it in ReadWritePaths. Say which, rather than "permission
+            # denied" against a path the operator cannot place.
+            self.notify.send(Event.ERROR,
+                             f"Could not write {target}: {e}\n\n"
+                             f"If this is a permission error, the systemd unit "
+                             f"needs config.yaml in ReadWritePaths.")
+            return
+        log.warning("config edit (%s): %s %s -> %s", origin, key, old, new)
+        self.notify.send(Event.STARTUP,
+                         f"config.yaml updated ({origin})\n\n"
+                         f"{key}\n  {old}  ->  {new}\n\n"
+                         f"Not live yet -- this is read at startup. "
+                         f"Send /restart to apply it.")
 
     #: A scan is ~101 REST calls and 40-60s of work. Cheap enough to ask for,
     #: expensive enough that it should not be spammable.
@@ -870,6 +1059,18 @@ class Engine:
                           self.cfg.aggressive.profile)
                 return False
             apply_aggressive(self.cfg, profile)
+            # config.yaml's max_leverage is a ceiling the profile cannot raise,
+            # so the leverage actually in force may be lower than the one the
+            # profile names. Report the effective figure: the banner, the
+            # P(ruin) model and the dashboard all read this, and a banner
+            # advertising 50x while the bot places 3x orders is the same class
+            # of misreporting that hid the 2026-09-08 liquidations.
+            if self.cfg.risk.max_leverage != profile.leverage:
+                log.warning("aggressive %s asks for %dx; config.yaml caps "
+                            "leverage at %dx, which is what will be used",
+                            profile.name, profile.leverage,
+                            self.cfg.risk.max_leverage)
+                profile = replace(profile, leverage=self.cfg.risk.max_leverage)
             self.aggressive_profile = profile
             if not self.cfg.aggressive.keep_daily_loss_limit:
                 self.cfg.risk.daily_loss_limit_pct = 100.0
@@ -1092,10 +1293,33 @@ class Engine:
         except KeyboardInterrupt:
             self.shutdown(reason="interrupted")
             return 0
-        # Left the loop because trigger_kill() set the flag: the exchange work
-        # is already done, so shutdown only tears down threads.
-        self.shutdown(reason=self._stop_reason or "stopped", exchange_done=True)
-        return 0
+        # Left the loop because a stop was requested. trigger_kill() has
+        # already done the exchange work; a /stop or /restart has not, so it
+        # still needs its resting orders cancelled.
+        self.shutdown(reason=self._stop_reason or "stopped",
+                      exchange_done=self._stop_exchange_done)
+        return self._exit_code
+
+    #: Exit code that means "bring me back". Any non-zero value works with
+    #: Restart=on-failure; a distinct one makes the journal say why the process
+    #: went away rather than looking like a crash.
+    RESTART_EXIT_CODE = 75
+
+    def request_stop(self, reason: str, exit_code: int) -> None:
+        """
+        Leave the run loop cleanly and tell systemd whether to come back.
+
+        Used by /stop (exit 0, stays down) and /restart (exit 75, comes back
+        after RestartSec). Open positions and their protective stops are left
+        on the exchange either way -- only resting entry orders are cancelled,
+        by the shutdown path, exactly as `systemctl stop` already does.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        self._stop_reason = reason
+        self._exit_code = exit_code
+        self._stop_exchange_done = False
 
     def trigger_kill(self, reason: str) -> None:
         """
@@ -1279,6 +1503,12 @@ class Engine:
         threshold = self.cfg.alerts.approach_pct / 100.0
         price = tick.mark_price
 
+        # Mirrors a TRAILING_STOP_MARKET's own math locally; a no-op for any
+        # position without one (trailing_pct == 0). Must run before the
+        # progress checks below so "% of the way to the stop" reflects where
+        # the stop actually is right now, not where it was at entry.
+        pos.update_trailing_stop(price)
+
         to_tp = pos.progress_to_tp(price)
         if to_tp >= threshold:
             self.notify.send(
@@ -1423,7 +1653,8 @@ class Engine:
             return
 
         # A stop or take-profit filling means the position is closed.
-        closing = (upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+        closing = (upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET",
+                                       "TRAILING_STOP_MARKET")
                    or upd.client_order_id == pos.stop_order_id)
 
         if closing:
@@ -1847,7 +2078,8 @@ class Engine:
                 log.info("portfolio: %s refused -- %s", cand.symbol, gate.reason)
                 continue
 
-            self.place(signal, sized.qty_notional, sized.reason, symbol=cand.symbol)
+            self.place(signal, sized.qty_notional, sized.reason,
+                      symbol=cand.symbol, atr_pct=cand.atr_pct)
             # Subscribe for a RESTING entry too, not only a filled position --
             # in dry run the entry sits in _dry_pending and would otherwise
             # never receive a tick of its own.
@@ -1902,11 +2134,12 @@ class Engine:
             log.warning("signal rejected by risk: %s", sized.reason)
             return
 
-        self.place(signal, sized.qty_notional, sized.reason)
+        self.place(signal, sized.qty_notional, sized.reason,
+                  atr_pct=realised_vol_pct(self.bars, 14))
 
     # ---------------------------------------------------------------- orders
     def place(self, signal, notional: float, risk_note: str,
-              symbol: str | None = None) -> None:
+              symbol: str | None = None, atr_pct: float = 0.0) -> None:
         symbol = symbol or self.cfg.symbol
         rules = self.rules if symbol == self.cfg.symbol else self.rules_for(symbol)
         sized = rules.size_for_notional(notional, signal.entry)
@@ -1917,6 +2150,36 @@ class Engine:
         stop_price = rules.round_price(signal.stop)
         tp_price = rules.round_price(signal.take_profit) if signal.take_profit else "0"
         exit_side = "SELL" if signal.side == "BUY" else "BUY"
+
+        # A trailing stop needs a callbackRate in whatever range Binance
+        # accepts; a signal with no volatility reading (atr_pct == 0, e.g. the
+        # scanner not being involved) or the safe profile (trailing_atr_mult
+        # == 0) falls straight back to the fixed stop below.
+        #
+        # The callback can never sit CLOSER to entry than the stop the strategy
+        # asked for. This order replaces the fixed stop rather than joining it,
+        # and Binance trails from the best price since the order lands -- which
+        # on a position that never goes into profit is the entry itself. So a
+        # callbackRate under the stop distance is not a tighter trail, it is a
+        # narrower stop: both JUPUSDT trades on 2026-09-08 were cut at 0.68%
+        # and 0.93% adverse against a planned 1.72% stop, well inside the noise
+        # the ATR-derived stop was sized to sit outside of.
+        callback_pct = 0.0
+        if self.cfg.risk.trailing_atr_mult > 0 and atr_pct > 0:
+            stop_pct = 0.0
+            if float(price) > 0:
+                stop_pct = abs(float(price) - float(stop_price)) / float(price) * 100
+            wanted = max(self.cfg.risk.trailing_atr_mult * atr_pct, stop_pct, 0.1)
+            # Round UP, so rounding to Binance's one decimal can only ever
+            # widen the stop, never shave it back inside stop_pct.
+            callback_pct = math.ceil(wanted * 10) / 10
+            if callback_pct > 5.0:
+                # Binance caps callbackRate at 5%. A stop wider than that
+                # cannot be expressed as a trailing stop at all, so keep the
+                # fixed STOP_MARKET instead of silently tightening the exit.
+                log.info("%s: %.2f%% stop is wider than the 5%% trailing cap; "
+                         "using a fixed stop", symbol, stop_pct)
+                callback_pct = 0.0
 
         log.info("SIGNAL %s %s %s @ %s stop %s tp %s | %s | %s",
                  signal.side, qty, symbol, price, stop_price, tp_price,
@@ -1939,7 +2202,8 @@ class Engine:
             self._dry_pending[symbol] = ActivePosition(
                 symbol=symbol, side=signal.side, entry=float(price),
                 stop=float(stop_price), take_profit=float(tp_price),
-                qty=float(qty), entry_order_id=tag, tag=tag)
+                qty=float(qty), entry_order_id=tag, tag=tag,
+                trailing_pct=callback_pct)
             self._entry_placed_at = time.time()
             self.risk.record_attempt()
             log.info("dry_run: entry resting at %s; waiting for the market to "
@@ -1976,10 +2240,22 @@ class Engine:
             # quantity + reduceOnly is the equivalent that works from flat, and
             # it cannot over-close -- Binance clamps a reduceOnly order to the
             # position that actually exists when it triggers.
-            self.api.algo_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                                triggerPrice=stop_price, quantity=qty,
-                                reduceOnly="true", workingType="MARK_PRICE",
-                                clientAlgoId=stop_id)
+            if callback_pct > 0:
+                # activationPrice is left unset on purpose: Binance then
+                # trails from the price prevailing when the order lands,
+                # which is effectively the entry price, so the worst case is
+                # unchanged from the fixed stop it replaces -- it only ever
+                # improves from there as the market moves in our favour.
+                self.api.algo_order(symbol=symbol, side=exit_side,
+                                    type="TRAILING_STOP_MARKET",
+                                    callbackRate=f"{callback_pct:.1f}",
+                                    quantity=qty, reduceOnly="true",
+                                    workingType="MARK_PRICE", clientAlgoId=stop_id)
+            else:
+                self.api.algo_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
+                                    triggerPrice=stop_price, quantity=qty,
+                                    reduceOnly="true", workingType="MARK_PRICE",
+                                    clientAlgoId=stop_id)
             if signal.take_profit:
                 self.api.algo_order(symbol=symbol, side=exit_side,
                                     type="TAKE_PROFIT_MARKET", triggerPrice=tp_price,
@@ -1997,7 +2273,8 @@ class Engine:
             symbol=symbol, side=signal.side, entry=float(price),
             stop=float(stop_price), take_profit=float(tp_price), qty=float(qty),
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
-            tag=entry_id, opened_ms=int(time.time() * 1000))
+            tag=entry_id, opened_ms=int(time.time() * 1000),
+            trailing_pct=callback_pct)
         self.state.entry_order_id = entry_id
         self.state.stop_order_id = stop_id
         self.risk.record_attempt()

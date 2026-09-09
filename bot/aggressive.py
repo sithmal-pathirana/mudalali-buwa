@@ -143,13 +143,28 @@ def short_warning(equity: float, profile: Profile) -> str:
 def apply(cfg, profile: Profile):
     """Overlay the profile onto a config. Safe settings are left untouched
     when aggressive is off, because this is never called then."""
-    cfg.risk.max_leverage = profile.leverage
+    # A profile may LOWER leverage but never raise it past the configured
+    # ceiling. Overwriting it outright is what liquidated PROMUSDT and
+    # ORCAUSDT on 2026-09-08: `maximum` set 50x, and on an alt perp with a
+    # ~1.3% maintenance margin rate that leaves 1/50 - 1.3% = 0.7% before
+    # liquidation, while the strategy's own stops sat 1.7-2.9% from entry.
+    # The protective stop could never trigger -- Binance closed both
+    # positions first (clientOrderId `autoclose-...`) and charged an
+    # INSURANCE_CLEAR fee roughly twice each trade's actual market loss.
+    # The invariant: liquidation must sit OUTSIDE the stop, and `max_leverage`
+    # in config.yaml is the operator's statement of how much room that needs.
+    cfg.risk.max_leverage = min(cfg.risk.max_leverage, profile.leverage)
     cfg.risk.risk_per_trade_pct = profile.risk_per_trade_pct
     # On a small account the profile percentages sit BELOW the exchange's $5
     # floor -- 8% of $2.45 over a 7% stop is $2.80 -- so every gate refuses and
     # aggressive mode trades strictly less than the safe profile it replaced.
     # Taking the floor instead is the whole point of turning this on.
     cfg.risk.take_minimum_order = True
+    # Was defined per-profile but never read anywhere -- the banner advertised
+    # "trailing stops" while every position actually got a fixed one. This is
+    # the wiring that makes it real: engine.place() reads it to decide between
+    # a fixed STOP_MARKET and a TRAILING_STOP_MARKET.
+    cfg.risk.trailing_atr_mult = profile.trailing_atr_mult
     cfg.interval = profile.interval
     cfg.portfolio.portfolio_risk_pct = profile.portfolio_risk_pct
     cfg.portfolio.single_position_cap_pct = profile.risk_per_trade_pct

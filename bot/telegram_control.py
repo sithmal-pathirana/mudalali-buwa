@@ -67,6 +67,18 @@ CONTROL  (each asks for confirmation)
 /halt                 stop opening new trades
 /resume               clear a halt
 
+SETTINGS  (written to config.yaml, applied on restart)
+/set                  every setting you can change, and its value
+/set <key>            one setting: value, range, what it does
+/set <key> <value>    change it
+/aggressive           aggressive mode and profile
+/aggressive on|off    turn it on or off
+/aggressive <profile> moderate | high | maximum
+
+PROCESS
+/restart              restart the bot, applying config.yaml
+/stop                 stop the bot  (CANNOT be undone from Telegram)
+
 Every message shows the active mode and strategy on its second line."""
 
 
@@ -208,6 +220,7 @@ class TelegramControl:
         parts = text.split()
         cmd = parts[0].lower().split("@")[0]
         arg = parts[1].lower() if len(parts) > 1 else ""
+        rest = parts[2:]
         handlers = {
             "/start": lambda: self.send(HELP),
             "/help": lambda: self.send(HELP),
@@ -222,6 +235,12 @@ class TelegramControl:
                                         value=arg.upper()),
             "/halt": lambda: self._ask("halt", "Stop opening new trades?"),
             "/resume": lambda: self._ask("resume", "Clear the halt and resume trading?"),
+            "/set": lambda: self._set(arg, rest),
+            "/aggressive": lambda: self._aggressive(arg),
+            "/restart": lambda: self._ask(
+                "restart", "Restart the bot?"),
+            "/stop": lambda: self._ask(
+                "stop", "Stop the bot?"),
         }
         handler = handlers.get(cmd)
         if handler is None:
@@ -266,6 +285,95 @@ class TelegramControl:
         lines = [s.get("mode_line", ""), ""]
         lines += [f"{k:<22}{v}" for k, v in cfg.items()]
         self.send("\n".join(lines))
+
+    # -------------------------------------------------------------- settings
+    def _fmt_current(self, key: str):
+        """What the running bot currently holds for `key`, or '?' if unknown."""
+        current = (self.read().get("editable") or {})
+        if key not in current:
+            return "?"
+        value = current[key]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return value
+
+    def _set(self, key: str, rest: list[str]) -> None:
+        """
+        `/set` lists, `/set <key>` explains, `/set <key> <value>` changes.
+
+        Validation happens here so a bad value is refused instantly instead of
+        making a round trip through a confirmation button and the engine queue.
+        The registry is pure data -- no exchange call -- so this thread may
+        read it, in keeping with the rule that control surfaces never trade.
+        """
+        from .settings import EDITABLE, parse_value
+
+        if not key:
+            lines = [self.read().get("mode_line", ""), "",
+                     "Editable settings (send /set <key> <value>):", ""]
+            for k in EDITABLE:
+                lines.append(f"{k}\n    {self._fmt_current(k)}")
+            lines += ["", "Changes are written to config.yaml and applied by "
+                          "/restart.", "",
+                      "mode, dry_run and the API keys are deliberately not "
+                      "editable from here -- arming the bot for real money "
+                      "needs a shell."]
+            self.send("\n".join(lines))
+            return
+
+        setting = EDITABLE.get(key)
+        if setting is None:
+            near = [k for k in EDITABLE if key in k]
+            hint = ("\n\nDid you mean:\n  " + "\n  ".join(near)) if near else \
+                   "\n\nSend /set for the full list."
+            self.send(f"{key!r} is not an editable setting.{hint}")
+            return
+
+        if not rest:
+            self.send(f"{setting.key}\n\n"
+                      f"now      {self._fmt_current(setting.key)}\n"
+                      f"allowed  {setting.describe_range()}\n\n"
+                      f"{setting.note}\n\n"
+                      f"Change it with:\n/set {setting.key} <value>")
+            return
+
+        try:
+            value = parse_value(setting, rest[0])
+        except ValueError as e:
+            self.send(f"Refused: {e}")
+            return
+
+        self._ask("set", f"Change {setting.key}?", value=f"{setting.key}={value}")
+
+    def _aggressive(self, arg: str) -> None:
+        """A shorthand over /set for the two keys that get changed most."""
+        from .settings import EDITABLE, parse_value
+
+        if not arg:
+            self.send(f"{self.read().get('mode_line', '')}\n\n"
+                      f"aggressive.enabled   {self._fmt_current('aggressive.enabled')}\n"
+                      f"aggressive.profile   {self._fmt_current('aggressive.profile')}\n\n"
+                      f"/aggressive on | off\n"
+                      f"/aggressive moderate | high | maximum\n\n"
+                      f"Written to config.yaml; /restart applies it.")
+            return
+
+        profiles = EDITABLE["aggressive.profile"].choices
+        if arg in profiles:
+            key = "aggressive.profile"
+        elif arg in ("on", "off", "true", "false", "yes", "no", "1", "0"):
+            key = "aggressive.enabled"
+        else:
+            self.send(f"{arg!r} is neither on/off nor a profile "
+                      f"({' | '.join(profiles)}).")
+            return
+
+        try:
+            value = parse_value(EDITABLE[key], arg)
+        except ValueError as e:
+            self.send(f"Refused: {e}")
+            return
+        self._ask("set", f"Change {key}?", value=f"{key}={value}")
 
     def _scan(self, arg: str) -> None:
         """`/scan` reports the last result; `/scan now` asks for a fresh one."""
@@ -316,6 +424,27 @@ class TelegramControl:
                       f"unrealised {p['unrealized']:+.2f} USDT")
         elif action == "resume":
             detail = f"\n\nHalt reason:\n{snap.get('halt_reason', '')}"
+        elif action == "set":
+            key, _, new = value.partition("=")
+            detail = (f"\n\n{key}\n  {self._fmt_current(key)}  ->  {new}"
+                      f"\n\nWritten to config.yaml. Not live until /restart.")
+        elif action == "restart":
+            # systemd rate-limits starts, and the engine holds some back for
+            # crash recovery. Say what is left up front: finding out by being
+            # refused is a worse way to learn it.
+            left = snap.get("restarts_left")
+            budget = ("" if left is None else
+                      f"\n\n{left} restart(s) left in this 5-minute window; "
+                      f"the rest are reserved for crash recovery.")
+            detail = ("\n\nconfig.yaml is re-read on the way up, so this is what "
+                      "applies a /set.\n\nOpen positions and their stops stay on "
+                      "the exchange. Resting entry orders are cancelled." + budget)
+        elif action == "stop":
+            detail = ("\n\nThis CANNOT be undone from Telegram -- once the bot is "
+                      "down nothing is polling for your commands. Restarting it "
+                      "needs a shell:\n  sudo systemctl start trading-bot"
+                      "\n\nOpen positions and their stops stay on the exchange, "
+                      "unmonitored.")
         self.send(f"{question}{detail}\n\nExpires in {CONFIRM_TTL}s.",
                   keyboard=[[{"text": f"Yes, {action}", "callback_data": f"{action}:{nonce}"},
                              {"text": "Cancel", "callback_data": f"cancel:{nonce}"}]])
