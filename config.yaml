@@ -10,9 +10,14 @@
 # rather than a safe default. tools/qa.py's "committed config is not armed"
 # blocker reports exactly this, and it is now telling the truth.
 #
-# Real balance at cutover: 2.4478 USDT. Most numbers here are derived from that
-# figure and from the exchange's $5 minimum order -- re-derive them if the
-# balance changes materially, they do not scale on their own.
+# Sizing basis: a 12.00 USDT balance. Re-derived on 2026-09-10 by request
+# ("trade with 12USD, do not take high risks"), replacing the 2.4478 USDT
+# cutover basis. Every number below follows from that figure and from the
+# exchange's $5 minimum order -- re-derive them if the balance changes
+# materially, they do not scale on their own.
+#
+# The futures wallet held 1.69 USDT when this was written, so the bot stays
+# halted on risk.min_equity_usdt until the account is actually funded to $12.
 # ############################################################################
 
 mode: live             # testnet | live   (testnet uses fake money on real markets)
@@ -40,26 +45,33 @@ poll_seconds: 20       # only used when realtime: false
 
 risk:
   max_leverage: 3            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
-  # Raised from the stock 2.0. Same $5-exchange-floor reasoning as
-  # portfolio.single_position_cap_pct below: at $2.45 a 2% risk budget funds an
-  # order far under the exchange minimum, so every signal was refused.
-  # NOTE: aggressive mode REPLACES this at runtime with the profile's own
-  # figure (moderate 2%), and then rounds up to the $5 floor via
-  # risk.take_minimum_order. See the aggressive block.
-  risk_per_trade_pct: 20.0
+  # 3.5% of $12 = $0.42 risked between entry and stop, down from 20.0.
+  # MUST STAY EQUAL to portfolio.single_position_cap_pct below. Portfolio mode
+  # sizes from that cap, but engine._scan_budget filters the universe from
+  # THIS number ($12 x 3.5% / 7% stop = $6.00 affordable). If this one is the
+  # larger, the scanner admits symbols the allocator then refuses and signals
+  # disappear with no visible reason.
+  #
+  # 2.92% is the arithmetic FLOOR at $12, not a preference: any lower and the
+  # budget cannot fund the exchange's $5 minimum over a 7% stop, so every
+  # signal is skipped. 3.5% is that floor plus a working margin -- it keeps
+  # the account tradable down to $10.00.
+  risk_per_trade_pct: 3.5
   max_position_pct: 100.0
-  # One stop-out costs ~6.2% here, so the stock 5.0 halted on the first loss.
-  # 30% still halts the day after roughly four consecutive losers -- or after
-  # only TWO in aggressive mode, where each trade risks ~14.3%.
-  daily_loss_limit_pct: 30.0
-  # Raised from 10 to match the maximum profile's own trades_per_day (20).
-  # The pool-widening below roughly triples the entry rate, and 10 would have
-  # become the new binding constraint by mid-afternoon.
-  max_trades_per_day: 20
-  # $5 minimum / 3x leverage = $1.67 is the equity below which no legal order
-  # exists at all. The floor sits just above it: past this point the account
-  # is not small, it is untradable.
-  min_equity_usdt: 1.70
+  # 10% of $12 = $1.20: roughly three consecutive stop-outs at 3.5% each ends
+  # the day. Was 30.0, which was sized for aggressive mode's ~14.3% trades.
+  daily_loss_limit_pct: 10.0
+  # Back to a conservative 6 (was 20, which matched the aggressive maximum
+  # profile). Six attempts a day at 3.5% each cannot outrun the 10% daily loss
+  # limit above, so that limit stays the thing that actually binds.
+  max_trades_per_day: 6
+  # Raised from 1.70 to match this risk profile rather than the exchange's
+  # hard limit. At 3.5% over a 7% stop the order size is equity x 0.5, so
+  # below $10.00 it no longer reaches the $5 exchange minimum and every signal
+  # would be skipped in silence. Halting here says so out loud instead, and it
+  # preserves $10 of the $12 -- the point of "do not take high risks".
+  # Clear it with /resume in Telegram once you have decided what to do.
+  min_equity_usdt: 10.00
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
@@ -93,26 +105,25 @@ targets:
 #
 #   run.py risk        shows the modelled probability of ruin per profile
 #
-# ON by request 2026-09-07: risk of ruin explicitly accepted. Every profile
-# models 100% ruin at this equity.
+# OFF by request 2026-09-10. It was on from 2026-09-07 with risk of ruin
+# explicitly accepted; the $12 reset asks for the opposite, so it stays off.
 #
-# At $2.45 the PROFILE CHOICE BARELY MATTERS. Every profile's per-trade risk
-# (moderate 2%, high 4%, maximum 8%) sizes below Binance's $5 minimum, so all
-# three land on the same upsized $5.00 order -- about 14.3% of equity over a
-# 7% stop, and ~2.04x actual leverage. The profile's leverage number is a CAP,
-# not the size used; it only stops binding once the account is much larger.
-# What does differ: trades_per_day (6 / 12 / 20) and how tight the trailing
-# stop is. moderate is the least trigger-happy of the three.
+# Turning it back on does NOT just raise leverage. It overwrites
+# risk.risk_per_trade_pct and portfolio.single_position_cap_pct with the
+# profile's own figures and sets risk.take_minimum_order = True, which lets
+# the bot round an order UP to the $5 exchange minimum and wear whatever
+# percentage of equity that turns out to be. With it off, an order that would
+# land under $5 is refused instead -- that refusal is the main reason the
+# numbers below can stay conservative.
 #
-# Two losers at ~14.3% each is ~28.6%, which trips daily_loss_limit_pct: 30.0
-# above and halts the day. Equity would then be ~$1.79, just over the
-# min_equity_usdt: 1.70 permanent floor. This account is roughly two bad
-# trades from being untradable -- that is the accepted bargain, not a bug.
+# The CONFIRM_AGGRESSIVE=AGGRESSIVE line in the systemd drop-in is left in
+# place, so /aggressive in Telegram can still arm it without a root edit.
+# Delete that line if you want the gate closed at the host level too.
 #
-# Still enforced in every profile: an exchange-side stop on every position,
-# the KILL file, and the equity floor.
+# Still enforced either way: an exchange-side stop on every position, the KILL
+# file, and the equity floor.
 aggressive:
-  enabled: true
+  enabled: false
   profile: maximum         # moderate (10x) | high (20x) | maximum (50x)
   keep_daily_loss_limit: true
   confirm_live: true       # type AGGRESSIVE before the first live order
@@ -123,25 +134,28 @@ aggressive:
 # so the count scales with equity instead of being tuned for one account size.
 #   run.py scan --equity <n>   shows the capacity and what would fill it
 portfolio:
-  # At $2.45 the derived slot count is 1 -- the $5 exchange minimum is 2.0x
-  # this account, so a second concurrent position cannot be funded. Portfolio
-  # mode is kept on so the SCANNER picks the symbol rather than trading the
-  # BTCUSDT above, whose $50 minimum is unreachable here.
+  # At $12 the derived slot count is still 1: splitting a 3.5% budget over two
+  # positions asks for $3.00 each, under the $5 exchange minimum, so allocate()
+  # trims back to one. Portfolio mode is kept on so the SCANNER picks the
+  # symbol rather than trading the BTCUSDT above, whose $50 minimum (and
+  # ETHUSDT's $22) is still out of reach on this account.
   enabled: true
   max_concurrent: auto    # auto, or a fixed number
-  # 6.0 refused real signals: a live PUMPUSDT breakout needed $5.00 but 6% only
-  # funded $4.17, so the risk gate skipped it (bot/risk.py size_position:
-  # "correct size is $X but the cheapest legal order is $5.00 ... Skipping").
-  # By request (risk of loss accepted): raised so the $5 exchange floor clears
-  # even on a wider (~7%) stop. The max_leverage cap above still bounds
-  # worst-case notional regardless of how high this is set.
-  single_position_cap_pct: 20.0
-  portfolio_risk_pct: 20.0  # with 1 eligible slot this is the binding term
-  # Was 0.025. That is not the stop the scanner actually produces: the real
-  # signals here stop ~7% away (PUMPUSDT needed 7.2%). allocate() sized from
-  # 0.025 and asked for $19.60 notional -- 8x equity -- so the 3x leverage
-  # ceiling ($7.35) refused every scan for five hours on 2026-09-07. Matching
-  # the real stop asks for $7.00: above the $5 floor, under the ceiling.
+  # THE number that sets trade size in portfolio mode, and the one that was
+  # 20.0. At $12 over the representative 7% stop below:
+  #     $12 x 3.5% = $0.42 risked  ->  $6.00 notional  ->  0.50x actual leverage
+  # $6.00 clears the $5 exchange minimum with room for equity to drift down to
+  # $10.00, which is exactly where min_equity_usdt now halts. Keep this equal
+  # to risk.risk_per_trade_pct -- see the note there.
+  single_position_cap_pct: 3.5
+  # Equal to the single-position cap on purpose: one position at a time, so
+  # the most a correlated selloff takes in one event is 3.5%, not a multiple
+  # of it. Raise this one alone if you later want concurrency.
+  portfolio_risk_pct: 3.5
+  # Left at the MEASURED stop distance, not lowered to flatter the sizing.
+  # Real signals here stop ~7% away (PUMPUSDT needed 7.2%); the earlier 0.025
+  # was fiction and made allocate() ask for 8x equity. Lowering it would shrink
+  # the apparent risk per trade while the actual stop stayed where it is.
   stop_distance: 0.07
   hard_cap: 40
 
