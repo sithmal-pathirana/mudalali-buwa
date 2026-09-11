@@ -877,6 +877,9 @@ def layer_portfolio(report, args):
         def due(self):
             return False
 
+        def stale(self):
+            return False
+
         def scan(self, **k):
             return self.last
 

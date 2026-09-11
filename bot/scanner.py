@@ -232,3 +232,35 @@ class Scanner:
 
     def due(self) -> bool:
         return time.time() - self._last_scan >= self.cfg.rescan_seconds
+
+    def stale(self, now: float | None = None) -> bool:
+        """
+        True when a bar has closed since the last scan's newest bar.
+
+        The cached candidates carry the bars the scan fetched, and the entry
+        decision reuses them. rescan_seconds alone does not keep them current:
+        a /scan at 05:13 on 15m bars caches data ending at the 04:45 close, and
+        the 05:15 bar-close cycle -- under 300s later -- traded AKEUSDT off it.
+        The signal was priced at 0.013395 with the market at 0.0120, so its
+        take-profit was already crossed, Binance answered -2021, and the bot
+        halted. A signal must never be computed from a bar that is not the
+        latest one closed.
+        """
+        res = self.last
+        if res is None or not res.ranked or not res.ranked[0].bars:
+            return False
+        step = interval_ms(self.cfg.interval)
+        if not step:
+            return False
+        now_ms = int((time.time() if now is None else now) * 1000)
+        newest_closed = (now_ms // step) * step - step
+        return res.ranked[0].bars[-1].open_time < newest_closed
+
+
+def interval_ms(interval: str) -> int:
+    """Binance kline interval ("15m", "1h", "1d", ...) in ms; 0 if unknown."""
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+    try:
+        return int(interval[:-1]) * units[interval[-1]]
+    except (KeyError, ValueError, IndexError, TypeError):
+        return 0

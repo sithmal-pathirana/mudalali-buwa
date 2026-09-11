@@ -202,6 +202,7 @@ class TestARestingEntryHoldsItsSlot(unittest.TestCase):
             for s in pending}
         e.scanner = type("S", (), {
             "due": lambda s: False,
+            "stale": lambda s: False,
             "last": ScanResult(ranked=[
                 Candidate(symbol="ARBUSDT", price=1.0, quote_volume=1e7,
                           efficiency=0.5, atr_pct=1.0, min_notional=5.0,

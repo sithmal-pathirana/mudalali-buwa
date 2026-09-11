@@ -103,6 +103,10 @@ def record_restart(now: float, path: Path = RESTART_LEDGER) -> None:
 # inline and checked by the loop. (QA R2)
 
 RECONCILE_SECONDS = 60
+# How long a manual close waits for its fills to show up in userTrades before
+# booking what is there. A market order is acknowledged before it is listed.
+FILL_WAIT_ATTEMPTS = 4
+FILL_WAIT_SECONDS = 0.5
 CLOCK_RESYNC_SECONDS = 1800   # a long-running process drifts; startup-only was not enough
 
 
@@ -358,7 +362,8 @@ class Engine:
                 f"it, but it is not protected. Close it or set a stop by hand.")
         return len(live)
 
-    def realized_from_exchange(self, pos: ActivePosition) -> float | None:
+    def realized_from_exchange(self, pos: ActivePosition,
+                               expect_order_id=None) -> float | None:
         """
         What this position actually made, read back from the exchange's fills.
 
@@ -376,13 +381,27 @@ class Engine:
         gained: this trade grossed 0.1626 and netted 0.1520 after 0.0106 of
         fees, and the balance moved by the latter. On a $2.45 account against a
         $2/day target that difference is not a rounding detail.
+
+        expect_order_id is the closing order we just sent. Its fills can lag
+        the order acknowledgement by a moment, and booking before they land
+        would credit only the entry commission. Wait briefly for them; after
+        that, book what is there rather than never booking at all.
         """
-        try:
-            fills = self.api.user_trades(pos.symbol, start_ms=pos.opened_ms or None)
-        except BinanceError as e:
-            log.error("could not read %s fills to book realised P&L: %s",
-                      pos.symbol, e)
-            return None
+        for attempt in range(FILL_WAIT_ATTEMPTS):
+            try:
+                fills = self.api.user_trades(pos.symbol, start_ms=pos.opened_ms or None)
+            except BinanceError as e:
+                log.error("could not read %s fills to book realised P&L: %s",
+                          pos.symbol, e)
+                return None
+            if expect_order_id is None or any(
+                    str(f.get("orderId")) == str(expect_order_id) for f in fills):
+                break
+            if attempt + 1 < FILL_WAIT_ATTEMPTS:
+                time.sleep(FILL_WAIT_SECONDS)
+        else:
+            log.warning("%s: close order %s not in the fills yet; booking "
+                        "what is there", pos.symbol, expect_order_id)
 
         total = 0.0
         for f in fills:
@@ -398,6 +417,35 @@ class Engine:
                 continue
         return total
 
+    def book_close(self, pos: ActivePosition, how: str,
+                   expect_order_id=None) -> float | None:
+        """
+        Credit a finished trade's realised P&L and count it. Returns the P&L,
+        or None when the exchange could not be asked.
+
+        Nothing in here may raise: every caller releases the position straight
+        afterwards, and a slot that is never freed is worse than a P&L figure
+        that is never booked.
+
+        total_trades is counted here in polling mode because record_fill is
+        only reached from on_order, i.e. the websocket. With realtime false it
+        never ran, and total_trades read 0 after a week of live trading.
+        """
+        try:
+            pnl = self.realized_from_exchange(pos, expect_order_id=expect_order_id)
+            if pnl is None:
+                return None
+            self.state.realized_today += pnl
+            if not self.cfg.realtime:
+                self.state.total_trades += 1
+            self.state.save()
+            log.info("%s closed %s for %+.4f USDT (realised today %+.4f)",
+                     pos.symbol, how, pnl, self.state.realized_today)
+            return pnl
+        except Exception:
+            log.exception("could not book the close of %s", pos.symbol)
+            return None
+
     def book_exchange_close(self, pos: ActivePosition) -> None:
         """
         Record a position that the exchange closed while we were not looking.
@@ -409,15 +457,10 @@ class Engine:
         restarts it. Bookkeeping is best-effort; releasing is not.
         """
         try:
-            pnl = self.realized_from_exchange(pos)
+            pnl = self.book_close(pos, "exchange-side")
             if pnl is None:
                 return
-            self.state.realized_today += pnl
-            self.state.save()
             prog = self.schedule.progress(self.state.realized_today)
-            log.info("%s closed exchange-side for %+.4f USDT "
-                     "(realised today %+.4f)",
-                     pos.symbol, pnl, self.state.realized_today)
             self.notify.send(
                 Event.TP_HIT if pnl >= 0 else Event.SL_HIT,
                 f"{pos.symbol} closed for {pnl:+.2f} USDT\n{prog}\n"
@@ -938,6 +981,17 @@ class Engine:
                          + (f"\n\nCurrent market reading: {reading}" if reading else ""))
         return result
 
+    def _booked_line(self, pos: ActivePosition | None, how: str,
+                     expect_order_id=None) -> str:
+        """Book a close this engine made or found, as a line for its alert."""
+        if pos is None:
+            return ""
+        pnl = self.book_close(pos, how, expect_order_id=expect_order_id)
+        if pnl is None:
+            return "\nP&L could not be read from the exchange; not booked."
+        return (f"\nresult {pnl:+.2f} USDT\n"
+                f"{self.schedule.progress(self.state.realized_today)}")
+
     def close_all(self, reason: str) -> int:
         """
         Flatten every open position, one at a time.
@@ -992,9 +1046,14 @@ class Engine:
             self.notify.send(Event.ERROR, f"Close failed reading position: {e}")
             return False
 
+        pos = self.book.get(symbol)
         if not live:
             log.info("close requested but %s is already flat", symbol)
-            self.notify.send(Event.DAILY_SUMMARY, f"Close requested; {symbol} already flat.")
+            # Closed on Binance by hand before the next reconcile noticed:
+            # releasing here without booking lost the trade's P&L entirely.
+            booked = self._booked_line(pos, "exchange-side")
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"Close requested; {symbol} already flat.{booked}")
             self.release(symbol)
             return True
 
@@ -1015,9 +1074,9 @@ class Engine:
         # cannot conflict with a stop that fires concurrently. (QA R2)
         try:
             self._seq += 1
-            self.api.order(symbol=symbol, side=side, type="MARKET",
-                           quantity=qty, reduceOnly="true",
-                           newClientOrderId=client_order_id("x", self._seq))
+            resp = self.api.order(symbol=symbol, side=side, type="MARKET",
+                                  quantity=qty, reduceOnly="true",
+                                  newClientOrderId=client_order_id("x", self._seq))
             log.info("flattened %s %s (%s)", side, qty, reason)
         except BinanceError as e:
             log.error("close failed: %s", e)
@@ -1030,8 +1089,13 @@ class Engine:
             self.api.cancel_all(symbol)
         except BinanceError as e:
             log.error("close succeeded but cancelling leftovers failed: %s", e)
+        # A close from Telegram or the dashboard released the position without
+        # booking it: realized_today, /pnl and the daily target never saw the
+        # AKEUSDT +3.09 of 2026-09-11. Book it from the exchange's fills.
+        close_id = resp.get("orderId") if isinstance(resp, dict) else None
+        booked = self._booked_line(pos, "manually", expect_order_id=close_id)
         self.notify.send(Event.DAILY_SUMMARY,
-                         f"{symbol} closed: {side} {qty} at market.\n{reason}",
+                         f"{symbol} closed: {side} {qty} at market.\n{reason}{booked}",
                          symbol=symbol)
         # release(symbol), NEVER `self.active = None`. The latter goes through
         # the property setter, which replaces the whole book -- so closing one
@@ -2018,7 +2082,9 @@ class Engine:
         if not pf.enabled or self.scanner is None:
             return 0
 
-        if self.scanner.due() or self.scanner.last is None:
+        # stale(): a bar closed after the cached scan, so its bars would price
+        # the signal off a market that has moved on. (AKEUSDT, 2026-09-11)
+        if self.scanner.due() or self.scanner.last is None or self.scanner.stale():
             self.scanner.scan(risk_budget_notional=self._scan_budget(),
                               rules_for=self.rules_for)
 
@@ -2138,6 +2204,35 @@ class Engine:
                   atr_pct=realised_vol_pct(self.bars, 14))
 
     # ---------------------------------------------------------------- orders
+    def protective_levels_crossed(self, symbol: str, side: str,
+                                  stop: float, tp: float) -> str:
+        """
+        Why this trade's stop or take-profit is already on the wrong side of
+        the market, or "" when both are placeable.
+
+        Binance rejects a trigger the mark price has already passed (-2021),
+        and place() halts on any protective-order failure -- correctly, since
+        it cannot tell a transient refusal from a real one. A signal priced
+        off stale bars is not a fault to halt over, it is a trade that no
+        longer exists, so it is caught here, before anything is sent.
+
+        An unreadable mark price returns "" and leaves the halt as the
+        backstop, rather than skipping a trade on a guess.
+        """
+        try:
+            mark = float(self.api.mark_price(symbol)["markPrice"])
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError) as e:
+            log.warning("%s: no mark price to check the stop against (%s)", symbol, e)
+            return ""
+        if mark <= 0:
+            return ""
+        long = side == "BUY"
+        if stop and (mark <= stop if long else mark >= stop):
+            return f"mark {mark} is already through the stop {stop}"
+        if tp and (mark >= tp if long else mark <= tp):
+            return f"mark {mark} is already through the take-profit {tp}"
+        return ""
+
     def place(self, signal, notional: float, risk_note: str,
               symbol: str | None = None, atr_pct: float = 0.0) -> None:
         symbol = symbol or self.cfg.symbol
@@ -2215,6 +2310,12 @@ class Engine:
                              f"{risk_note}", symbol=symbol)
             return
 
+        crossed = self.protective_levels_crossed(symbol, signal.side,
+                                                 float(stop_price), float(tp_price))
+        if crossed:
+            log.warning("%s signal skipped: %s", symbol, crossed)
+            return
+
         if not self.prepare_symbol(symbol):
             return          # never trade a symbol on the account's defaults
 
@@ -2228,6 +2329,7 @@ class Engine:
                                newClientOrderId=entry_id)
         log.info("entry placed %s status=%s", entry_id, entry.get("status"))
 
+        leg = "stop"
         try:
             # Conditional orders live on the algo endpoint since 2025-12-09;
             # the classic one answers -4120. stopPrice is triggerPrice here and
@@ -2257,15 +2359,20 @@ class Engine:
                                     reduceOnly="true", workingType="MARK_PRICE",
                                     clientAlgoId=stop_id)
             if signal.take_profit:
+                leg = "take-profit"
                 self.api.algo_order(symbol=symbol, side=exit_side,
                                     type="TAKE_PROFIT_MARKET", triggerPrice=tp_price,
                                     quantity=qty, reduceOnly="true",
                                     workingType="MARK_PRICE", clientAlgoId=tp_id)
         except BinanceError as e:
-            log.critical("PROTECTIVE ORDER FAILED (%s) -- cancelling entry", e)
+            # Name the leg. Both used to be reported as "protective stop", so
+            # the AKEUSDT halt of 2026-09-11 -- a take-profit already crossed
+            # -- read as a stop failure and sent the diagnosis the wrong way.
+            log.critical("PROTECTIVE ORDER FAILED on the %s (%s) -- cancelling entry",
+                         leg, e)
             self.api.cancel_all(symbol)
-            self.state.halt(f"could not place protective stop on {symbol}: {e}")
-            self.notify.send(Event.HALT, f"Could not place a stop: {e}\n"
+            self.state.halt(f"could not place protective {leg} on {symbol}: {e}")
+            self.notify.send(Event.HALT, f"Could not place the {leg}: {e}\n"
                                          "Entry cancelled, bot halted. Nothing is open.")
             return
 
