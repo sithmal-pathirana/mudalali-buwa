@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+
+from .supervise import SuperviseConfig
 from pathlib import Path
 
 import yaml
@@ -119,6 +121,7 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
+    supervise: SuperviseConfig = field(default_factory=SuperviseConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -165,7 +168,8 @@ class Config:
         # is precisely how the `telegram:` section broke once.
         sections = {"risk": RiskConfig, "alerts": AlertConfig,
                     "dashboard": DashboardConfig, "telegram": TelegramConfig,
-                    "portfolio": PortfolioConfig, "aggressive": AggressiveConfig}
+                    "portfolio": PortfolioConfig, "aggressive": AggressiveConfig,
+                    "supervise": SuperviseConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}

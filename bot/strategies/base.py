@@ -26,6 +26,10 @@ class Signal:
     stop: float          # protective stop price -- required, never optional
     reason: str = ""
     take_profit: float = 0.0
+    #: The price level whose break produced this signal, when the strategy has
+    #: one. bot/supervise.py treats price returning through it as the breakout
+    #: failing. 0 means "not reported" and that rule stays off.
+    ref_level: float = 0.0
 
 
 class Strategy:

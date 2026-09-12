@@ -129,6 +129,87 @@ aggressive:
   confirm_live: true       # type AGGRESSIVE before the first live order
                            # (under systemd: Environment=CONFIRM_AGGRESSIVE=AGGRESSIVE)
 
+# THE POSITION SUPERVISOR. What happens to a trade AFTER it is open.
+#
+# Before this existed the bot could not change its mind: the stop and the
+# take-profit went to the exchange in the same second as the entry and were
+# never revisited, so every trade was a coin flip between two numbers chosen
+# before the market had shown anything. Over the first 15 self-managed closes
+# that was a 27% win rate at a 1.73 payoff -- expectancy -$0.10 a trade --
+# while the three positions closed BY HAND, at prices the bot had no
+# instrument to reach, all made money.
+#
+# Four rules. Every threshold is in R (the money between entry and the
+# ORIGINAL stop), never in percent: measured stop distances on this account
+# run from 1.0% to 12.1% across symbols, so a percent rule is hair-trigger on
+# NEARUSDT and inert on the 6-9%-ATR microcaps the scanner keeps picking.
+#
+#   run.py trade      the supervisor logs every level it moves and why
+supervise:
+  enabled: true
+
+  # Round-trip cost as a percent of notional, and the margin above entry that
+  # "break even" actually means. Fees are only ~0.07% of it (0.02% maker in,
+  # 0.05% taker out = about $0.006 on an $8 order); the rest is slippage,
+  # which on a thin microcap is the larger half. Do NOT cut this to the fee
+  # figure -- a break-even stop that does not clear slippage is a losing stop.
+  cost_buffer_pct: 0.15
+
+  # RULE 1 -- break even. Once the trade has been this far ahead at any point,
+  # the stop moves to entry + cost_buffer and the trade can no longer lose.
+  # Measured on the peak, not the current price, so giving back an advance
+  # still banks the protection.
+  breakeven_at_r: 1.0
+
+  # RULE 2 -- the runner. Approaching the target with the trend intact, bank
+  # half at the original target and let the rest run on a trail with no
+  # ceiling. Arms at this FRACTION of the way to the target, never at the
+  # target itself: params.trend below sets atr_stop_mult 2.0 and
+  # atr_target_mult 3.0, so the take-profit already sits at exactly 1.5R, and
+  # a rule that fired there would cancel an order about to fill and gamble a
+  # booked win on a trail. 0.8 of 1.5R = 1.2R, comfortably before the fill.
+  #
+  # THIS RULE ENABLES ITSELF. Splitting a position needs BOTH halves to clear
+  # the $5 exchange minimum, so it stays dormant until the position is worth
+  # $10. At risk 3.5% over a 7% stop the order is equity x 0.5, which puts the
+  # switch-on point at $20.00 of equity -- about $3 above where the account is
+  # now. Nothing to remember to turn on: engine.scale_out_qty returns 0 below
+  # that and the rule simply does not fire.
+  runner_at_target_frac: 0.8
+  trail_atr_mult: 1.5
+
+  # RULE 3 -- the horizon. Not a timeout: nothing is force-closed for being
+  # old. On every tick the bot asks whether the target can still arrive inside
+  # this many hours --
+  #     distance to target  /  (efficiency ratio x ATR per bar)  =  bars needed
+  # -- and if it cannot, it stops reaching for it: pull the target in to
+  # something reachable and tighten to harvest_trail when the trade is in
+  # profit, leave at market when it is not. The second case is the one that
+  # matters most here: it frees the only position slot. That slot was occupied
+  # 86% of 2026-09-12 while the scanner ranked the rest of the board every 300
+  # seconds and discarded the result.
+  #
+  # The forecast is an EXTRAPOLATION of the velocity the symbol has just had,
+  # not a prediction, and it is wrong exactly when the regime turns. It is
+  # used only to stop reaching for a target, never to justify holding one.
+  horizon_hours: 5.0
+  harvest_trail_atr_mult: 0.5
+  # Left alone for this long first. Without it a position that ticks adverse
+  # in its first seconds is closed before the setup has had one bar to work --
+  # 龙虾USDT was 95% of the way to its stop 103 seconds after entry on
+  # 2026-09-12, and cutting there would have been noise, not judgement.
+  grace_minutes: 20
+  # Keep at or above params.regime.trend_above below, or the supervisor calls
+  # a trend healthy that the router would not have entered on.
+  min_trend_efficiency: 0.25
+
+  # RULE 4 -- a breakout that gives back its own trigger level is over. The
+  # level comes from the strategy (Signal.ref_level, the channel high or low
+  # it broke). Only ever banks a PROFIT: underwater, the resting stop is a
+  # better price than a market exit, so this rule stands aside. Adopted
+  # positions have no recorded level, so it is off for them.
+  failed_breakout_exit: true
+
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.

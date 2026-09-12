@@ -31,10 +31,24 @@ class ActivePosition:
     #: rather than a fixed STOP_MARKET, to the same callbackRate (percent)
     #: sent to Binance. 0 means the stop is fixed and never moves.
     trailing_pct: float = 0.0
-    #: Best price seen since entry, in the favourable direction. Only used
-    #: when trailing_pct > 0, to mirror the exchange's own trailing math
-    #: locally so status lines and proximity alerts stay accurate.
+    #: Best price seen since entry, in the favourable direction. Maintained
+    #: on every tick by track_peak() whether or not the exchange-side trail is
+    #: in use, because bot/supervise.py measures maximum favourable excursion
+    #: from it and that has to be true on a fixed stop too.
     high_water: float = 0.0
+    #: The stop and target as first placed. `stop` and `take_profit` above move
+    #: once the supervisor starts managing the position, and 1R has to stay
+    #: measured against the original -- after a move to break even the
+    #: remaining risk is ~0 and every later R reading would divide by it.
+    initial_stop: float = 0.0
+    initial_target: float = 0.0
+    #: The channel level whose break triggered the entry. Price returning
+    #: through it is a failed breakout; 0 means the strategy did not report one
+    #: and that rule stays off for this position.
+    ref_level: float = 0.0
+    #: Set once the position has been split: part banked at the original
+    #: target, the remainder left to run on a trail with no ceiling.
+    runner: bool = False
 
     @property
     def is_long(self) -> bool:
@@ -47,6 +61,21 @@ class ActivePosition:
     def unrealized(self, price: float) -> float:
         move = (price - self.entry) if self.is_long else (self.entry - price)
         return move * self.qty
+
+    def track_peak(self, price: float) -> None:
+        """
+        Record the best price seen since entry, in our favour.
+
+        Separate from update_trailing_stop because that one is a mirror of an
+        exchange-side order and returns immediately when there is no such order
+        (trailing_pct == 0, which is the safe profile). Maximum favourable
+        excursion still has to be tracked in that case -- it is what every rule
+        in bot/supervise.py is gated on.
+        """
+        if self.high_water == 0.0:
+            self.high_water = self.entry
+        self.high_water = (max(self.high_water, price) if self.is_long
+                           else min(self.high_water, price))
 
     def update_trailing_stop(self, price: float) -> None:
         """

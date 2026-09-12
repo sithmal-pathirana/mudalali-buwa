@@ -29,13 +29,15 @@ from .filters import SymbolRules
 from .notify import Event, Notifier
 from .portfolio import allocate
 from .positions import ActivePosition
-from .regime import realised_vol_pct
+from .regime import efficiency_ratio, realised_vol_pct
 from .risk import KILL_FILE, RiskManager
 from .state import State, client_order_id, reconcile
 from .telegram_control import TelegramControl
 from .stream import BarClosed, Disconnected, MarketStream, OrderUpdate, StreamStale, Tick
 from .strategies import build
 from .strategies.base import Bar
+from .strategies.trend_atr import atr as true_range
+from .supervise import Reading, supervise
 from .targets import TargetSchedule
 
 log = logging.getLogger("engine")
@@ -332,7 +334,16 @@ class Engine:
                 tp_order_id=(tp_o or {}).get("clientOrderId", ""),
                 tag=f"adopted-{symbol}",
                 opened_ms=(self.opened_ms_for(symbol)
-                           or int(row.get("updateTime") or 0)))
+                           or int(row.get("updateTime") or 0)),
+                # Pin 1R to the stop as adopted. Without this the supervisor's
+                # risk_per_unit falls back to the LIVE stop, so the first move
+                # to break even would collapse 1R to ~0 and every later R
+                # reading -- which is what each rule is gated on -- would
+                # divide by it. ref_level stays 0: the strategy that opened
+                # this position is not around to say what it broke, so the
+                # failed-breakout rule stays off for adopted trades.
+                initial_stop=price_of(stop_o),
+                initial_target=price_of(tp_o))
             self.book[symbol] = pos
             # Margin type and leverage are already whatever this position was
             # opened with, and Binance rejects changing either while it is
@@ -1572,6 +1583,10 @@ class Engine:
         # progress checks below so "% of the way to the stop" reflects where
         # the stop actually is right now, not where it was at entry.
         pos.update_trailing_stop(price)
+        # Maximum favourable excursion, which every supervisor rule is gated
+        # on. Tracked whether or not an exchange-side trail exists.
+        pos.track_peak(price)
+        self.supervise_position(pos, price)
 
         to_tp = pos.progress_to_tp(price)
         if to_tp >= threshold:
@@ -1589,6 +1604,191 @@ class Engine:
 
         if self.cfg.dry_run:
             self.simulate_exit(price, tick.symbol)
+
+    # ----------------------------------------------------------- supervision
+    #: How stale the held symbol's bars may get before they are refetched. ATR
+    #: and the efficiency ratio are computed from 15-minute bars and barely
+    #: move inside one minute, so refreshing on every 20-second tick would be
+    #: three requests to learn the same number.
+    HELD_BARS_MAX_AGE = 60.0
+
+    #: Do not cancel and replace a protective order for a move smaller than
+    #: this fraction of price. A trail recomputed every tick would otherwise
+    #: churn two API calls a tick for a stop moving by a tick size.
+    MIN_STOP_MOVE_PCT = 0.10
+
+    def interval_seconds(self) -> float:
+        """cfg.interval ("15m", "1h", "4h") as seconds."""
+        raw = str(self.cfg.interval).strip().lower()
+        unit = raw[-1]
+        try:
+            n = float(raw[:-1])
+        except ValueError:
+            return 900.0
+        return n * {"m": 60.0, "h": 3600.0, "d": 86400.0}.get(unit, 60.0)
+
+    def held_bars(self, symbol: str) -> list:
+        """
+        Recent bars for a symbol we are HOLDING, cached and refreshed slowly.
+
+        poll_once fetches klines for cfg.symbol only, and in portfolio mode
+        that symbol is not the one being traded -- its bars exist to notice
+        when a bar has closed. Repointing that request at the held symbol
+        would move the bar-close clock around as positions open and close, so
+        this is a second, cached one instead.
+        """
+        cache = getattr(self, "_held_bars", None)
+        if cache is None:
+            cache = self._held_bars = {}
+        hit = cache.get(symbol)
+        if hit and time.time() - hit[0] < self.HELD_BARS_MAX_AGE:
+            return hit[1]
+        try:
+            raw = self.api.klines(symbol, self.cfg.interval,
+                                  limit=self.strategy.warmup + 10)
+        except BinanceError as e:
+            log.debug("held bars for %s unavailable: %s", symbol, e)
+            return hit[1] if hit else []
+        bars = [Bar.from_kline(k) for k in raw[:-1]]
+        cache[symbol] = (time.time(), bars)
+        return bars
+
+    def scale_out_qty(self, pos) -> float:
+        """
+        The quantity to leave on the take-profit when splitting the position,
+        or 0.0 when this account cannot legally split it.
+
+        BOTH halves have to clear the exchange minimum -- the half being banked
+        and the half left running -- so this returns 0 until the position is
+        worth at least twice the minimum notional. That is the whole enable
+        switch for the runner rule: no flag to remember to turn on later, it
+        starts working by itself once the account can afford it.
+        """
+        rules = self.rules_for(pos.symbol)
+        if rules is None or pos.qty <= 0 or pos.entry <= 0:
+            return 0.0
+        try:
+            floor = float(rules.min_notional)
+        except (TypeError, ValueError):
+            return 0.0
+        half = pos.qty / 2.0
+        try:
+            half = float(rules.round_qty(half))
+        except Exception:
+            return 0.0
+        if half <= 0:
+            return 0.0
+        # Both sides, priced at entry: the banked half and what remains.
+        if half * pos.entry < floor or (pos.qty - half) * pos.entry < floor:
+            return 0.0
+        return half
+
+    def supervise_position(self, pos, price: float) -> None:
+        """Run bot/supervise.py against one open position and act on the plan."""
+        cfg = getattr(self.cfg, "supervise", None)
+        if cfg is None or not cfg.enabled or self.cfg.dry_run:
+            return
+        bars = self.held_bars(pos.symbol)
+        params = self.cfg.params or {}
+        atr_period = int((params.get("trend") or {}).get("atr_period", 14))
+        er_window = int((params.get("regime") or {}).get("window", 30))
+        # -1 means "unknown", and the supervisor treats it as such. Passing
+        # efficiency_ratio's 0.0-for-too-few-bars straight through would read
+        # as a dead market and trip the horizon rule on a cold start.
+        a = true_range(bars, atr_period) if len(bars) > atr_period else 0.0
+        er = efficiency_ratio(bars, er_window) if len(bars) > er_window else -1.0
+        # Signed, in market terms: the supervisor applies the position's own
+        # direction. Measured to the LIVE price rather than the last closed
+        # bar, so a turn inside the forming bar is not invisible for 15 minutes.
+        w = int(cfg.drift_window_bars)
+        drift = ((price - bars[-w].close) / w) if len(bars) >= w and w > 0 else 0.0
+        age = (time.time() * 1000 - pos.opened_ms) / 1000.0 if pos.opened_ms else 0.0
+        reading = Reading(price=price, atr=a, efficiency=er, age_seconds=age,
+                          net_move_per_bar=drift,
+                          bar_seconds=self.interval_seconds())
+        plan = supervise(pos, reading, cfg, scale_out_qty=self.scale_out_qty(pos))
+        if plan:
+            self.apply_plan(pos, plan, price)
+
+    def apply_plan(self, pos, plan, price: float) -> None:
+        """
+        Execute a supervisor Plan. The only place in this module that spends
+        money on the strength of one.
+        """
+        if plan.exit_now:
+            log.info("%s supervisor exit: %s", pos.symbol, plan.why)
+            self.close_position(f"supervisor -- {plan.why}", symbol=pos.symbol)
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"{pos.symbol} closed by the supervisor.\n{plan.why}",
+                             symbol=pos.symbol)
+            return
+
+        if plan.stop is not None:
+            move = abs(plan.stop - pos.stop) / price * 100 if price else 0.0
+            if move >= self.MIN_STOP_MOVE_PCT:
+                if self.replace_protective(pos, "stop", plan.stop):
+                    log.info("%s stop -> %.8g: %s", pos.symbol, plan.stop, plan.why)
+                    pos.stop = plan.stop
+
+        if plan.target is not None or plan.target_qty is not None:
+            level = plan.target if plan.target is not None else pos.take_profit
+            qty = plan.target_qty if plan.target_qty is not None else pos.qty
+            if self.replace_protective(pos, "tp", level, qty=qty):
+                log.info("%s take-profit -> %.8g x %g: %s",
+                         pos.symbol, level, qty, plan.why)
+                pos.take_profit = level
+                if plan.target_qty is not None:
+                    pos.runner = True
+                    self.notify.send(
+                        Event.DAILY_SUMMARY,
+                        f"{pos.symbol}: banking {qty:g} at {level:,.6g} and "
+                        f"letting the rest run.\n{plan.why}", symbol=pos.symbol)
+
+    def replace_protective(self, pos, leg: str, level: float,
+                           qty: float | None = None) -> bool:
+        """
+        Move one protective order. Returns True only if the new one is live.
+
+        PLACE FIRST, CANCEL SECOND, for the same reason close_position closes
+        before it cancels. Cancelling first opens a window where the position
+        has no protection, and if the replacement then fails the account sits
+        naked. Both legs are reduceOnly, so a brief overlap is harmless: the
+        one that triggers second can only close what is already gone, and
+        Binance clamps it to nothing.
+        """
+        old_id = pos.stop_order_id if leg == "stop" else pos.tp_order_id
+        exit_side = "SELL" if pos.is_long else "BUY"
+        rules = self.rules_for(pos.symbol)
+        price_s = rules.round_price(level) if rules else f"{level}"
+        qty_s = rules.round_qty(qty if qty is not None else pos.qty) if rules \
+            else f"{qty if qty is not None else pos.qty}"
+        self._seq += 1
+        new_id = client_order_id("s" if leg == "stop" else "t", self._seq)
+        kind = "STOP_MARKET" if leg == "stop" else "TAKE_PROFIT_MARKET"
+        try:
+            self.api.algo_order(symbol=pos.symbol, side=exit_side, type=kind,
+                                triggerPrice=price_s, quantity=qty_s,
+                                reduceOnly="true", workingType="MARK_PRICE",
+                                clientAlgoId=new_id)
+        except BinanceError as e:
+            # The old order is still on the book. Nothing is unprotected.
+            log.warning("%s: could not move the %s to %s (%s); leaving it where "
+                        "it is", pos.symbol, leg, price_s, e)
+            return False
+        if old_id:
+            try:
+                self.api.cancel_algo_order(old_id)
+            except BinanceError as e:
+                log.error("%s: new %s %s is live but cancelling the old one (%s) "
+                          "failed: %s. Both are reduceOnly, so the tighter one "
+                          "wins and the other closes nothing.",
+                          pos.symbol, leg, new_id, old_id, e)
+        if leg == "stop":
+            pos.stop_order_id = new_id
+            self.state.stop_order_id = new_id
+        else:
+            pos.tp_order_id = new_id
+        return True
 
     def simulate_entry(self, price: float, symbol: str | None = None) -> None:
         """
@@ -2381,7 +2581,13 @@ class Engine:
             stop=float(stop_price), take_profit=float(tp_price), qty=float(qty),
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
             tag=entry_id, opened_ms=int(time.time() * 1000),
-            trailing_pct=callback_pct)
+            trailing_pct=callback_pct,
+            # The supervisor measures 1R against these for the life of the
+            # trade. `stop` and `take_profit` above are the LIVE levels and
+            # start moving the moment it takes over.
+            initial_stop=float(stop_price),
+            initial_target=float(tp_price) if signal.take_profit else 0.0,
+            ref_level=float(getattr(signal, "ref_level", 0.0) or 0.0))
         self.state.entry_order_id = entry_id
         self.state.stop_order_id = stop_id
         self.risk.record_attempt()

@@ -56,10 +56,12 @@ class TrendATR(Strategy):
             return Signal("BUY", last.close,
                           stop=last.close - self.atr_stop_mult * a,
                           take_profit=last.close + self.atr_target_mult * a,
+                          ref_level=hi,
                           reason=f"close {last.close:.2f} broke {self.channel}-bar high {hi:.2f}, ATR {a:.2f}")
         if last.close < lo:
             return Signal("SELL", last.close,
                           stop=last.close + self.atr_stop_mult * a,
                           take_profit=last.close - self.atr_target_mult * a,
+                          ref_level=lo,
                           reason=f"close {last.close:.2f} broke {self.channel}-bar low {lo:.2f}, ATR {a:.2f}")
         return None
