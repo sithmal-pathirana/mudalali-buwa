@@ -284,6 +284,15 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
                     plan.note(f"target needs {bars_needed:.0f} bars; pulled in "
                               f"to {pull:.6g}")
                 tight = peak - sign * cfg.harvest_trail_atr_mult * reading.atr
+                # Never settle for a harvest that the costs would eat. The
+                # runner branch floors its trail at break even and this one
+                # has to as well: "take the profit that is there" is not
+                # satisfied by a level below the round trip. When the floor is
+                # already through the market the safety net below turns it
+                # into a market exit, which is the right answer -- a profit
+                # that cannot hold a cost-covering stop should be taken now.
+                if favour(pos, breakeven) > favour(pos, tight):
+                    tight = breakeven
                 moved = _tighter(pos, plan.stop if plan.stop is not None else pos.stop, tight)
                 if moved is not None:
                     plan.stop = moved

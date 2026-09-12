@@ -202,6 +202,28 @@ class TestHorizon(unittest.TestCase):
         self.assertIsNotNone(plan.target)
         self.assertLess(plan.target, p.take_profit)     # pulled in, not pushed out
 
+    def test_a_harvest_never_locks_in_less_than_the_round_trip(self):
+        """UAIUSDT, 2026-09-12 09:17: the first live harvest set a stop at
+        0.76476 on a 0.7639 entry -- $0.0077 banked against a $0.0104 cost
+        buffer. The runner branch floored at break even; this one did not."""
+        p = long_pos(entry=0.7639, stop=0.6968, tp=0.8644, qty=9.0, peak=0.7800)
+        r = ok(0.7800, atr=0.0300, efficiency=0.3, net_move_per_bar=0.0002,
+               age_seconds=7200.0)
+        plan = supervise(p, r, cfg())
+        breakeven = 0.7639 + 0.7639 * 0.0015
+        if plan.stop is not None:
+            self.assertGreaterEqual(plan.stop, breakeven)
+        else:
+            self.assertTrue(plan.exit_now)
+
+    def test_a_cost_floor_through_the_market_becomes_an_exit(self):
+        """In profit but too thinly to hold a cost-covering stop: take it."""
+        p = long_pos(entry=100.0, stop=98.0, tp=103.0, peak=100.2)
+        r = ok(100.2, atr=5.0, efficiency=0.3, net_move_per_bar=0.001,
+               age_seconds=7200.0)
+        plan = supervise(p, r, cfg())
+        self.assertTrue(plan.exit_now or (plan.stop or 0) >= 100.15)
+
     def test_unknown_trend_does_not_trigger_an_exit(self):
         """A cold start knows least; it must not close the position for it."""
         p = long_pos()
