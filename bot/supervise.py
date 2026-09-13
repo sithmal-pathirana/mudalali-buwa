@@ -137,12 +137,26 @@ def favour(pos, price: float) -> float:
 
 
 def risk_per_unit(pos) -> float:
-    """1R in price units, measured against the ORIGINAL stop.
+    """1R in price units, as sized at entry. 0.0 when that is not known.
 
-    Against the original, never the current one: once rule 1 has moved the
-    stop to break even the remaining risk is ~0, and every R reading after
-    that would divide by it and explode.
+    `initial_risk` is authoritative, because the engine records it straight
+    from the sizing decision. Only when it was never recorded at all does this
+    fall back to the original stop, and only then to the live one: once rule 1
+    has moved the stop to break even the remaining risk is ~0, and every R
+    reading after that would divide by it and explode.
+
+    Returning 0.0 is a real answer, not a failure -- `supervise` stands down
+    on it. An adopted position whose stop has already been walked to break
+    even cannot have its 1R reconstructed from anything on the exchange, and
+    guessing produced UAIUSDT "peak reached 19.70R" on a 0.6R trade
+    (2026-09-12), with every R-gated rule firing off an 84x-distorted number.
+    Standing down leaves the exchange stop and take-profit in charge, which is
+    the honest outcome when the bot does not know what it risked.
     """
+    if pos.initial_risk > 0:
+        return pos.initial_risk
+    if pos.initial_risk < 0:
+        return 0.0                  # recorded as unknown; do NOT fall back
     base = pos.initial_stop or pos.stop
     return abs(pos.entry - base)
 

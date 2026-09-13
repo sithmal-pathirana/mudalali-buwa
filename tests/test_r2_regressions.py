@@ -346,7 +346,9 @@ class TestR6Slippage(unittest.TestCase):
                           realized_pnl=0.0, raw={})
         e.on_order(upd)
         body = " ".join(b for _, b in e.sent)
-        self.assertIn("asked 0.0900", body,
+        # 6 significant digits, not 4 decimals: this account trades coins at
+        # 0.075530, where .4f would round away more than the cost buffer.
+        self.assertIn("asked 0.09", body,
                       "the alert printed the fill price as the asked price")
         self.assertIn("0.0915", body)
 

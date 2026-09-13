@@ -28,7 +28,7 @@ from .dashboard import Dashboard, generate_token
 from .filters import SymbolRules
 from .notify import Event, Notifier
 from .portfolio import allocate
-from .positions import ActivePosition
+from .positions import RISK_UNKNOWN, ActivePosition
 from .regime import efficiency_ratio, realised_vol_pct
 from .risk import KILL_FILE, RiskManager
 from .state import State, client_order_id, reconcile
@@ -38,7 +38,7 @@ from .strategies import build
 from .strategies.base import Bar
 from .strategies.trend_atr import atr as true_range
 from .supervise import Reading, supervise
-from .targets import TargetSchedule
+from .targets import TargetSchedule, format_duration, seconds_to_day_end
 
 log = logging.getLogger("engine")
 
@@ -268,6 +268,40 @@ class Engine:
                 opened = 0                      # and that position is closed
         return opened
 
+    #: A stop this close to entry, as a fraction of price, is a stop that has
+    #: already been walked to break even -- not an original. Real stops on this
+    #: account have ranged 0.88% to 12.1%; the round-trip cost buffer the
+    #: supervisor parks a break-even stop at is 0.15%. 0.4% sits clear of both.
+    ADOPTED_BREAKEVEN_PCT = 0.4
+
+    def adopted_risk(self, entry: float, stop: float, symbol: str = "?") -> float:
+        """
+        1R for a position being adopted, or RISK_UNKNOWN when it cannot be.
+
+        The stop resting on the exchange is the only risk figure a restart can
+        see, and it is the ORIGINAL one only if nothing has moved it. Once the
+        supervisor has walked it to break even the gap to entry is ~0, and
+        pinning 1R to it does not preserve the trade's risk, it destroys it:
+        UAIUSDT was re-adopted on 2026-09-12 with a stop 0.1% from entry, so
+        1R read 0.0008 instead of 0.0671 and the supervisor reported a 0.6R
+        trade as "peak reached 19.70R".
+
+        There is no way to reconstruct the real number from the exchange, so
+        this does not invent one. On RISK_UNKNOWN supervise() stands down and
+        the exchange-side stop and take-profit run the position -- which is
+        exactly what was protecting it while the bot was down.
+        """
+        if entry <= 0 or stop <= 0:
+            return RISK_UNKNOWN
+        gap = abs(entry - stop)
+        if gap / entry * 100.0 < self.ADOPTED_BREAKEVEN_PCT:
+            log.warning("%s adopted with a stop %.3f%% from entry: that is a "
+                        "break-even stop, not an original, so 1R is unknown "
+                        "and the supervisor stands down on this position",
+                        symbol, gap / entry * 100.0)
+            return RISK_UNKNOWN
+        return gap
+
     def adopt_open_positions(self) -> int:
         """
         Rebuild the book from what the exchange says is actually open.
@@ -335,15 +369,19 @@ class Engine:
                 tag=f"adopted-{symbol}",
                 opened_ms=(self.opened_ms_for(symbol)
                            or int(row.get("updateTime") or 0)),
-                # Pin 1R to the stop as adopted. Without this the supervisor's
-                # risk_per_unit falls back to the LIVE stop, so the first move
-                # to break even would collapse 1R to ~0 and every later R
-                # reading -- which is what each rule is gated on -- would
-                # divide by it. ref_level stays 0: the strategy that opened
-                # this position is not around to say what it broke, so the
-                # failed-breakout rule stays off for adopted trades.
+                # 1R, or RISK_UNKNOWN -- see adopted_risk above. The stop as
+                # adopted is pinned too, but it is consulted only when the gap
+                # is still a plausible original.
+                # ref_level stays 0: the strategy that opened this position is
+                # not around to say what it broke, so the failed-breakout rule
+                # stays off for adopted trades.
                 initial_stop=price_of(stop_o),
-                initial_target=price_of(tp_o))
+                initial_target=price_of(tp_o),
+                initial_risk=self.adopted_risk(
+                    float(row.get("entryPrice") or 0.0), price_of(stop_o),
+                    symbol),
+                # The exchange says this position is open, so it is.
+                filled=True)
             self.book[symbol] = pos
             # Margin type and leverage are already whatever this position was
             # opened with, and Binance rejects changing either while it is
@@ -607,6 +645,9 @@ class Engine:
             "price": self.last_price,
             "realized_today": self.state.realized_today,
             "day": prog.day, "target": prog.target, "target_pct": prog.pct,
+            # How long today's target has left to run. /status only -- the
+            # alerts carry the progress bar and do not need a clock on it.
+            "day_ends_in": format_duration(seconds_to_day_end()),
             "target_reached": prog.reached,
             "stop_when_reached": self.schedule.stop_when_reached,
             "target_note": self.schedule.describe(self.equity),
@@ -1578,6 +1619,15 @@ class Engine:
         threshold = self.cfg.alerts.approach_pct / 100.0
         price = tick.mark_price
 
+        # An entry still resting as a limit order is not a position. Peak
+        # tracking, the supervisor and the proximity alerts all measure from a
+        # fill that has not happened, so they wait for one: reconcile_position
+        # sets `filled` the moment the exchange reports a size. Without this
+        # gate KAVAUSDT was trailed, split and alerted on for 34 minutes on
+        # 2026-09-13 against an order that never filled.
+        if not pos.filled:
+            return
+
         # Mirrors a TRAILING_STOP_MARKET's own math locally; a no-op for any
         # position without one (trailing_pct == 0). Must run before the
         # progress checks below so "% of the way to the stop" reflects where
@@ -1688,6 +1738,8 @@ class Engine:
         cfg = getattr(self.cfg, "supervise", None)
         if cfg is None or not cfg.enabled or self.cfg.dry_run:
             return
+        if not pos.filled:
+            return          # a resting entry has nothing to supervise
         bars = self.held_bars(pos.symbol)
         params = self.cfg.params or {}
         atr_period = int((params.get("trend") or {}).get("atr_period", 14))
@@ -1831,6 +1883,10 @@ class Engine:
                 continue
 
             del self._dry_pending[sym]
+            # The simulated fill is this path's fill confirmation: without it
+            # on_tick would stand the position down as an unfilled entry and
+            # dry-run mode would never manage or close anything.
+            pending.filled = True
             self.book[sym] = pending
             self.risk.record_fill()
             log.info("dry_run: %s entry filled at %.6f", sym, px)
@@ -1947,18 +2003,14 @@ class Engine:
             # both progress bars, the 80% proximity thresholds -- was being
             # computed against the limit price we asked for rather than the
             # price we got. (QA F9)
-            asked = pos.entry                  # capture BEFORE overwriting (QA R6)
-            if upd.avg_price:
-                pos.entry = upd.avg_price
-            if upd.cumulative_qty:
-                pos.qty = upd.cumulative_qty
-            self.risk.record_fill()
-            slip = (upd.avg_price - asked) if upd.avg_price else 0.0
-            self.notify.send(
-                Event.TRADE_OPEN,
-                f"{upd.symbol} entry filled at {upd.avg_price:,.4f} "
-                f"(asked {asked:,.4f}, slippage {slip:+.4f})\n"
-                f"{pos.status_line(upd.avg_price)}", symbol=upd.symbol)
+            #
+            # Guarded because reconcile_position reaches the same handler off
+            # the polling path, and whichever of the two observes the fill
+            # first must be the only one to count it: record_fill increments
+            # total_trades, so a race between them would book the trade twice.
+            if not pos.filled:
+                pos.filled = True
+                self.on_entry_filled(pos, upd.cumulative_qty, upd.avg_price)
 
     # -------------------------------------------------------------- periodic
     def periodic(self) -> None:
@@ -2002,6 +2054,36 @@ class Engine:
                              f"position: {'yes' if self.active else 'flat'}  "
                              f"trades today {self.state.trades_today}")
 
+    def on_entry_filled(self, pos, qty: float, entry_price: float = 0.0) -> None:
+        """
+        A resting entry has become a real position. Correct the book to what
+        was actually bought and tell the user once, here, rather than when the
+        order was merely placed.
+
+        With realtime false there is no user-data stream, so this is reached
+        from reconcile_position -- the only thing on that path that ever sees
+        a fill. Before it existed `pos.entry` kept the LIMIT price the bot
+        asked for for the life of the trade, and every reading measured
+        against it was off by the slippage: UAIUSDT logged "the trade is not
+        in profit" on 2026-09-12 and then booked +0.0319.
+        """
+        asked = pos.entry
+        if entry_price > 0:
+            pos.entry = entry_price
+        if qty > 0:
+            pos.qty = qty
+        self.risk.record_fill()
+        slip = (pos.entry - asked) if entry_price > 0 else 0.0
+        log.info("%s entry filled: %g @ %.8g (asked %.8g, slippage %+.8g)",
+                 pos.symbol, pos.qty, pos.entry, asked, slip)
+        self.notify.send(
+            Event.TRADE_OPEN,
+            f"{pos.symbol} entry filled: {pos.side} {pos.qty:g} @ "
+            f"{pos.entry:,.6g}\n"
+            f"asked {asked:,.6g}, slippage {slip:+.6g}\n"
+            f"SL {pos.stop:,.6g}   TP {pos.take_profit:,.6g}",
+            symbol=pos.symbol)
+
     def reconcile_position(self, snap: dict, symbol: str | None = None) -> None:
         """
         Decide whether ONE tracked position is really gone.
@@ -2019,6 +2101,13 @@ class Engine:
             return                      # dry-run positions are simulated locally
 
         if snap["position_amt"] != 0.0:
+            # The exchange reporting a size IS the fill confirmation on the
+            # polling path, where there is no user-data stream to deliver one.
+            # Everything gated on `filled` starts here.
+            if not pos.filled:
+                pos.filled = True
+                self.on_entry_filled(pos, abs(float(snap["position_amt"])),
+                                     float(snap.get("entry_price") or 0.0))
             self._entry_placed_at = self._entry_placed_at or time.time()
             self._flat_reconciles = 0
             return
@@ -2110,6 +2199,9 @@ class Engine:
             row = live.get(symbol)
             self.reconcile_position(
                 {"position_amt": float(row["positionAmt"]) if row else 0.0,
+                 # The average price actually paid. On the polling path this is
+                 # the only place the real fill price is ever seen.
+                 "entry_price": float(row.get("entryPrice") or 0.0) if row else 0.0,
                  "open_order_ids": by_symbol.get(symbol, set())},
                 symbol=symbol)
         return live
@@ -2358,7 +2450,7 @@ class Engine:
             opened += 1
 
         if opened:
-            log.info("portfolio: opened %d position(s), %d held",
+            log.info("portfolio: placed %d entry order(s), %d tracked",
                      opened, len(self.book))
         return opened
 
@@ -2587,6 +2679,9 @@ class Engine:
             # start moving the moment it takes over.
             initial_stop=float(stop_price),
             initial_target=float(tp_price) if signal.take_profit else 0.0,
+            # 1R straight from the sizing decision, so it survives every later
+            # move of `stop` without having to be inferred back out of it.
+            initial_risk=abs(float(price) - float(stop_price)),
             ref_level=float(getattr(signal, "ref_level", 0.0) or 0.0))
         self.state.entry_order_id = entry_id
         self.state.stop_order_id = stop_id
@@ -2600,8 +2695,13 @@ class Engine:
                                reason=signal.reason)
 
         prog = self.schedule.progress(self.state.realized_today)
+        # "resting", not "opened". The entry is a GTC limit and may never fill
+        # -- saying it had opened was how a phantom KAVAUSDT position came to
+        # be reported, supervised and alerted on for 34 minutes on 2026-09-13.
+        # on_entry_filled sends TRADE_OPEN when the exchange confirms a size.
         self.notify.send(
-            Event.TRADE_OPEN,
+            Event.DAILY_SUMMARY,
+            f"entry resting (not filled yet):\n"
             f"{signal.side} {qty} {symbol} @ {price}\n"
             f"SL {stop_price}   TP {tp_price}\n{risk_note}\n"
             f"{signal.reason}\n{prog}", symbol=symbol)

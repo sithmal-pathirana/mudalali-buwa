@@ -498,6 +498,7 @@ class TelegramControl:
             f"price       {s.get('price', 0):,.4f}",
             f"today       {s.get('realized_today', 0):+.2f} USDT",
             f"trades      {s.get('trades_today', 0)} today",
+            f"day ends in {s.get('day_ends_in', '?')}",
             f"feed        {s.get('feed') or ('live' if s.get('stream_ok') else 'DOWN')}",
         ]
         off = s.get("clock_offset_ms")

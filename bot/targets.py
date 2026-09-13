@@ -16,9 +16,36 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 log = logging.getLogger("targets")
+
+
+def seconds_to_day_end(now: datetime | None = None) -> float:
+    """
+    Seconds until the trading day rolls.
+
+    The day boundary is UTC midnight, because that is where
+    State.roll_day_if_needed puts it -- that is the moment realized_today,
+    trades_today and the daily loss limit all reset, so it is the deadline the
+    daily target is actually running against.
+    """
+    now = now or datetime.now(timezone.utc)
+    end = (datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+           + timedelta(days=1))
+    return max(0.0, (end - now).total_seconds())
+
+
+def format_duration(seconds: float) -> str:
+    """Compact enough for one status line: "4h 12m", "47m", "under a minute"."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m"
+    return "under a minute"
 
 
 @dataclass

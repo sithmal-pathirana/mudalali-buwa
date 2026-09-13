@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: `initial_risk` when the bot KNOWS it cannot know what the trade risked --
+#: distinct from 0.0, which only means "never recorded" and still allows the
+#: fallback to the original stop. Negative-means-unknown is the same idiom
+#: bot/supervise.py's Reading.efficiency uses, and for the same reason: a
+#: missing reading must never be read as a real one.
+RISK_UNKNOWN = -1.0
+
 
 @dataclass
 class ActivePosition:
@@ -46,9 +53,23 @@ class ActivePosition:
     #: through it is a failed breakout; 0 means the strategy did not report one
     #: and that rule stays off for this position.
     ref_level: float = 0.0
+    #: 1R in PRICE units, as sized at entry, and authoritative when positive.
+    #: 0.0 means "never recorded" and falls back to `initial_stop` above;
+    #: RISK_UNKNOWN means the bot has established that 1R is NOT recoverable
+    #: and bot/supervise.py must stand down rather than guess. See
+    #: Engine.adopted_risk.
+    initial_risk: float = 0.0
     #: Set once the position has been split: part banked at the original
     #: target, the remainder left to run on a trail with no ceiling.
     runner: bool = False
+    #: Whether the entry order is known to have FILLED. Entries rest as GTC
+    #: limits, so a position exists in this book from the moment the order is
+    #: placed -- which is not the moment there is anything to manage. Until
+    #: the exchange confirms a non-zero position the supervisor, the peak
+    #: tracker and the proximity alerts all stand down: on 2026-09-13 KAVAUSDT
+    #: was supervised for 34 minutes, had its stop moved 11 times and had its
+    #: take-profit split, on an entry that never filled.
+    filled: bool = False
 
     @property
     def is_long(self) -> bool:

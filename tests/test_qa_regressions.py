@@ -57,6 +57,9 @@ class TestF1PositionTracking(unittest.TestCase):
     def test_open_position_is_never_cleared(self):
         e = self._engine()
         from bot.engine import Engine
+        # reconcile_position now confirms the fill it just observed, which
+        # goes through the risk manager; the stub engine needs one.
+        e.risk = type("RM", (), {"record_fill": lambda s, p=0.0: None})()
         Engine.reconcile_position(e, {"position_amt": 0.5, "open_order_ids": set()})
         self.assertIsNotNone(e.active)
 
