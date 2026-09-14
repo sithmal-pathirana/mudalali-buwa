@@ -20,7 +20,7 @@
 # halted on risk.min_equity_usdt until the account is actually funded to $12.
 # ############################################################################
 
-mode: live             # testnet | live   (testnet uses fake money on real markets)
+mode: live              # testnet | live   (testnet uses fake money on real markets)
 dry_run: false         # true = log intended orders, send nothing. Your first run.
 
 # Live futures WEBSOCKETS ARE SILENT FROM THIS HOST -- `run.py netcheck` reports
@@ -56,7 +56,12 @@ risk:
   # budget cannot fund the exchange's $5 minimum over a 7% stop, so every
   # signal is skipped. 3.5% is that floor plus a working margin -- it keeps
   # the account tradable down to $10.00.
-  risk_per_trade_pct: 3.5
+  #
+  # Raised to 3.75 on 2026-09-14 by request. At $10.00, 3.5% funds exactly
+  # $5.00, and per-lot rounding puts most symbols' minimum order at
+  # $5.01-$5.33, so the scanner rejected every trending symbol by cents.
+  # $10 x 3.75% / 7% = $5.36 clears them; about $0.37 risked per trade.
+  risk_per_trade_pct: 3.75
   max_position_pct: 100.0
   # 10% of $12 = $1.20: roughly three consecutive stop-outs at 3.5% each ends
   # the day. Was 30.0, which was sized for aggressive mode's ~14.3% trades.
@@ -64,14 +69,18 @@ risk:
   # Back to a conservative 6 (was 20, which matched the aggressive maximum
   # profile). Six attempts a day at 3.5% each cannot outrun the 10% daily loss
   # limit above, so that limit stays the thing that actually binds.
-  max_trades_per_day: 6
+  max_trades_per_day: 12
   # Raised from 1.70 to match this risk profile rather than the exchange's
   # hard limit. At 3.5% over a 7% stop the order size is equity x 0.5, so
   # below $10.00 it no longer reaches the $5 exchange minimum and every signal
   # would be skipped in silence. Halting here says so out loud instead, and it
   # preserves $10 of the $12 -- the point of "do not take high risks".
   # Clear it with /resume in Telegram once you have decided what to do.
-  min_equity_usdt: 10.00
+  # Lowered to 8.00 on 2026-09-14 by request, while LIT's open loss had
+  # equity at $9.70 and the $10.00 floor halted the bot. Below about $9.33,
+  # 3.75% over the 7% stop no longer funds the $5 exchange minimum, so
+  # signals are skipped (logged) well before this floor is reached.
+  min_equity_usdt: 8.00
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
@@ -228,11 +237,11 @@ portfolio:
   # $6.00 clears the $5 exchange minimum with room for equity to drift down to
   # $10.00, which is exactly where min_equity_usdt now halts. Keep this equal
   # to risk.risk_per_trade_pct -- see the note there.
-  single_position_cap_pct: 3.5
+  single_position_cap_pct: 3.75
   # Equal to the single-position cap on purpose: one position at a time, so
   # the most a correlated selloff takes in one event is 3.5%, not a multiple
   # of it. Raise this one alone if you later want concurrency.
-  portfolio_risk_pct: 3.5
+  portfolio_risk_pct: 3.75
   # Left at the MEASURED stop distance, not lowered to flatter the sizing.
   # Real signals here stop ~7% away (PUMPUSDT needed 7.2%); the earlier 0.025
   # was fiction and made allocate() ask for 8x equity. Lowering it would shrink
@@ -251,7 +260,9 @@ universe:
   #     0.30 -> 3    0.25 -> 4    0.20 -> 7    0.15 -> 13    0.10 -> 25
   # 0.20 is aggressive mode's own intended default -- it sets it with
   # setdefault(), so this key being present here is what was overriding it.
-  min_efficiency: 0.20
+  # Back to 0.30 on 2026-09-14 with params.regime.trend_above below; the two
+  # move together. See the note on params.
+  min_efficiency: 0.30
   min_atr_pct: 0.25
   rescan_seconds: 300
 
@@ -297,12 +308,22 @@ params:
     #     0.35 -> 28.5 signals/day     0.25 -> 48.6 signals/day
     # The extra entries sit in the ER 0.25-0.35 band, where trend_atr's
     # measured edge is thinner than in the 0.35+ band it was fitted on.
-    trend_above: 0.25      # efficiency ratio above this = trending
+    #
+    # 2026-09-14: restored to 0.35 / confirm_bars 3 / channel 20 after the
+    # loosened settings lost in backtest on the 30 coins this bot trades
+    # ($10 each, 3.75% risk, 3x, 15m, two back-to-back ~15-day windows):
+    #     loosened (0.25, ch 6)       -28.06 / -11.52   8,10 of 30 coins up
+    #     original (0.35, ch 20)       +7.62 /  +6.38  17,18 of 30 coins up
+    #     original + recent ER filter +10.25 /  +8.36  18,18 of 30, DD ~18-25%
+    # LITUSDT on 2026-09-14 is the trade this refuses: ER 0.50 over 30 bars
+    # only because the window still held a pump from 7h earlier, a 6-bar high
+    # broken under the real 20-bar high. No scanner or supervisor in the test.
+    trend_above: 0.35      # efficiency ratio above this = trending
     range_below: 0.20      # below this = ranging
     # Default 3 makes every restart cold-start at UNCLEAR and sit out ~15+
     # minutes before the first trending confirmation. 1 = trade on the first
     # trending reading instead of waiting out the hysteresis window.
-    confirm_bars: 1        # hysteresis: bars a new regime must persist
+    confirm_bars: 3        # hysteresis: bars a new regime must persist
     min_atr_pct: 0.15
   trend:
     # Default 20 (5h on 15m bars) waits for a rare breakout. 8 (2h) fires
@@ -311,7 +332,11 @@ params:
     # signals only 28.5 -> 34.9/day, because the regime gate above, not the
     # channel, is what actually withholds entries. 6 takes the cheap part of
     # that and leaves the whipsaw of 3-4 alone.
-    channel: 6
+    channel: 20
+    # The trend must be CURRENT: ER over the last 20 bars (5h), not just the
+    # 30-bar regime window, which can still be counting an old move.
+    recent_er_window: 20
+    min_recent_er: 0.25
     atr_period: 14
     atr_stop_mult: 2.0
     atr_target_mult: 3.0
