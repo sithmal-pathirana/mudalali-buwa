@@ -36,7 +36,8 @@ class TestF1PositionTracking(unittest.TestCase):
         e.notify = type("N", (), {"clear_position_alerts": lambda *a: None,
                                   "send": lambda *a, **k: None})()
         e._entry_placed_at = 0.0
-        e.api = type("A", (), {"cancel_all": lambda *a, **k: None})()
+        e.api = type("A", (), {"cancel_all": lambda *a, **k: None,
+                               "positions": lambda *a, **k: []})()
         e.stream = None
         return e
 

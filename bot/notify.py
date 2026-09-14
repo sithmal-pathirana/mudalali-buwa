@@ -120,7 +120,11 @@ class Notifier:
             telegram=TelegramChannel(cfg.telegram_token, cfg.telegram_chat_id),
             email=EmailChannel(cfg.smtp_host, cfg.smtp_port, cfg.smtp_user,
                                cfg.smtp_password, cfg.alert_email),
-            symbol=cfg.symbol,
+            # In portfolio mode cfg.symbol is only the bar-feed symbol, so an
+            # alert about the account ("HALTED", "daily summary") titled with
+            # it read as being about BTCUSDT.
+            symbol=("bot" if getattr(getattr(cfg, "portfolio", None), "enabled", False)
+                    else cfg.symbol),
         )
 
     @property

@@ -126,8 +126,10 @@ def reconcile(api, symbol: str) -> dict:
                          "price": o["price"]} for o in orders],
         "open_order_ids": {o["clientOrderId"] for o in orders},
     }
-    log.info("reconciled: equity=%.2f position=%s open_orders=%d",
-             equity, snapshot["position_amt"], len(orders))
+    # Name the symbol: this reads ONE symbol, and an unlabelled "position=0.0"
+    # read as "the account is flat" while other symbols held positions.
+    log.info("reconciled: equity=%.2f %s position=%s open_orders=%d",
+             equity, symbol, snapshot["position_amt"], len(orders))
     return snapshot
 
 

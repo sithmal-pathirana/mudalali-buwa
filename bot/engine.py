@@ -1101,6 +1101,23 @@ class Engine:
         pos = self.book.get(symbol)
         if not live:
             log.info("close requested but %s is already flat", symbol)
+            # Flat does not mean nothing is resting. On 2026-09-13 a /close
+            # found KAVAUSDT flat because its limit entry had never filled,
+            # released tracking, and left that entry on the book: it filled
+            # two hours later into an untracked 529.4 long with no stop, which
+            # tripped the daily loss limit and held the margin every later
+            # signal was refused for. Clear the symbol before letting go of it.
+            try:
+                self.api.cancel_all(symbol)
+                log.info("cancelled anything still resting on %s", symbol)
+            except BinanceError as e:
+                log.error("%s is flat but its resting orders could not be "
+                          "cancelled: %s", symbol, e)
+                self.notify.send(Event.ERROR,
+                                 f"{symbol} is flat but its resting orders could "
+                                 f"not be cancelled: {e}\nCancel them on Binance "
+                                 f"by hand -- an entry left there can still fill.",
+                                 symbol=symbol)
             # Closed on Binance by hand before the next reconcile noticed:
             # releasing here without booking lost the trade's P&L entirely.
             booked = self._booked_line(pos, "exchange-side")
@@ -2041,7 +2058,9 @@ class Engine:
 
         self.position_amt = snap["position_amt"]
         self.reconcile_position(snap)
-        if self.cfg.portfolio.enabled and self.book:
+        # Even with an empty book: an empty book is exactly when a position the
+        # bot lost track of goes unnoticed (see reconcile_book).
+        if self.cfg.portfolio.enabled:
             self.reconcile_book()
 
         hb = self.cfg.alerts.heartbeat_minutes
@@ -2120,6 +2139,33 @@ class Engine:
         if pos.entry_order_id in still_open:
             self.expire_stale_entry(snap, symbol)
             return
+
+        # Flat with the entry gone is ambiguous until the fill is confirmed.
+        # reconcile_book reads positions BEFORE open orders, so an entry that
+        # fills between the two reads looks exactly like a finished trade:
+        # no size, no entry, a stop still listed. On 2026-09-14 that cancelled
+        # LITUSDT's stop and take-profit one second after its entry filled and
+        # left a live 3.7 long unprotected and untracked. Ask again, for this
+        # symbol alone, before letting go of anything.
+        if not pos.filled:
+            try:
+                rows = self.api.positions(symbol)
+            except BinanceError as e:
+                log.error("%s reads flat with its entry gone and the position "
+                          "could not be re-checked (%s); keeping it for the "
+                          "next reconcile", symbol, e)
+                return
+            row = next((r for r in rows or []
+                        if float(r.get("positionAmt") or 0.0) != 0.0), None)
+            if row is not None:
+                log.warning("%s entry filled between reconcile reads; keeping "
+                            "its protective orders", symbol)
+                self.reconcile_position(
+                    {"position_amt": float(row["positionAmt"]),
+                     "entry_price": float(row.get("entryPrice") or 0.0),
+                     "open_order_ids": snap.get("open_order_ids", set())},
+                    symbol=symbol)
+                return
 
         # Anything else still listed is a leftover STOP or TAKE_PROFIT, which
         # carry closePosition:true -- with the account flat the trade is over
@@ -2204,7 +2250,38 @@ class Engine:
                  "entry_price": float(row.get("entryPrice") or 0.0) if row else 0.0,
                  "open_order_ids": by_symbol.get(symbol, set())},
                 symbol=symbol)
+        self.warn_untracked(live)
         return live
+
+    def warn_untracked(self, live: dict) -> None:
+        """
+        Say so, loudly, when the exchange holds a position the book does not.
+
+        Nothing else would. The per-minute "reconciled:" line only ever read
+        cfg.symbol, so on 2026-09-13 it logged "position=0.0" for four hours
+        while an untracked KAVAUSDT long sat open with no stop, holding the
+        margin that every new signal was then refused for. Report only; the
+        bot does not trade a position it did not size.
+        """
+        for symbol, row in live.items():
+            try:
+                amt = float(row.get("positionAmt") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amt == 0.0 or symbol in self.book:
+                continue
+            log.warning("%s: exchange holds %s that the bot is NOT tracking "
+                        "(entry %s, unrealised %s); no stop is managed for it",
+                        symbol, amt, row.get("entryPrice"),
+                        row.get("unRealizedProfit"))
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol}: the exchange holds {amt:g} (entry "
+                f"{row.get('entryPrice')}) that the bot is NOT tracking. It has "
+                f"no managed stop and is using margin. Set a stop-loss on "
+                f"Binance or close it there. A restart makes the bot track it "
+                f"again but does NOT place a stop.",
+                dedupe_key=f"untracked:{symbol}:{amt}", symbol=symbol)
 
     def expire_stale_entry(self, snap: dict, symbol: str | None = None) -> None:
         """
