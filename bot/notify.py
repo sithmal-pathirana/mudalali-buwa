@@ -36,6 +36,7 @@ class Event(Enum):
     HALT = "HALTED"
     DAILY_SUMMARY = "daily summary"
     SCAN = "scan"
+    GAINER = "gainer mining"
     ERROR = "error"
 
 
@@ -51,7 +52,7 @@ ICON = {
     Event.TP_HIT: "[ + ]", Event.SL_HIT: "[ - ]",
     Event.TARGET_REACHED: "[ = ]", Event.TARGET_RAISED: "[ ^ ]",
     Event.HALT: "[!!!]", Event.DAILY_SUMMARY: "[ i ]", Event.SCAN: "[ o ]",
-    Event.ERROR: "[ x ]",
+    Event.GAINER: "[ G ]", Event.ERROR: "[ x ]",
 }
 
 

@@ -70,6 +70,10 @@ class ActivePosition:
     #: was supervised for 34 minutes, had its stop moved 11 times and had its
     #: take-profit split, on an entry that never filled.
     filled: bool = False
+    #: Which strategy owns the position when that is not the engine's own
+    #: signal path. "gainer" positions are managed by bot/gainer.py, and the
+    #: supervisor's R-based trend rules stand aside for them.
+    strategy: str = ""
 
     @property
     def is_long(self) -> bool:

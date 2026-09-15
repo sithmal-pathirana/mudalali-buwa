@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .gainer import GainerConfig
 from .supervise import SuperviseConfig
 from pathlib import Path
 
@@ -122,6 +123,7 @@ class Config:
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
     supervise: SuperviseConfig = field(default_factory=SuperviseConfig)
+    gainer: GainerConfig = field(default_factory=GainerConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -169,7 +171,7 @@ class Config:
         sections = {"risk": RiskConfig, "alerts": AlertConfig,
                     "dashboard": DashboardConfig, "telegram": TelegramConfig,
                     "portfolio": PortfolioConfig, "aggressive": AggressiveConfig,
-                    "supervise": SuperviseConfig}
+                    "supervise": SuperviseConfig, "gainer": GainerConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}

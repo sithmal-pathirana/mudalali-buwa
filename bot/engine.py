@@ -151,6 +151,8 @@ class Engine:
     _rules_cache: dict = None
     _exchange_info = None
     _prepared: set = None
+    #: bot/gainer.py's GainerMiner when gainer.enabled, else None
+    gainer = None
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -196,6 +198,10 @@ class Engine:
         self.signals = SignalChannel(cfg.telegram_token, cfg.signal_chat_id)
         self.notify.listener = self._record_event
         self.notify.context = self.mode_line
+        gcfg = getattr(cfg, "gainer", None)
+        if gcfg is not None and gcfg.enabled:
+            from .gainer import GainerMiner
+            self.gainer = GainerMiner(self, gcfg)
 
     # ------------------------------------------------------------ dashboard
     # ------------------------------------------------------------- the book
@@ -618,6 +624,8 @@ class Engine:
             name = f"{name}/{mode.replace('manual/', '')}"
         elif mode == "auto":
             name = f"{name}/auto"
+        if self.gainer is not None:
+            name += "+gainer" + ("(paper)" if self.gainer.paper else "")
         bits = [profile, name, self.cfg.mode]
         if self.cfg.dry_run:
             bits.append("dry-run")
@@ -1278,6 +1286,14 @@ class Engine:
         adopted = self.adopt_open_positions()
         if adopted:
             log.info("resumed %d position(s) from the exchange", adopted)
+        if self.gainer is not None:
+            self.gainer.restore()
+            g = self.gainer.cfg
+            log.info("gainer mining ON%s: top %d every %ds, $%.2f notional, "
+                     "target $%.2f, stop %.1f%%, up to %d positions",
+                     " (PAPER)" if self.gainer.paper else " (LIVE ORDERS)",
+                     g.top_n, g.poll_seconds, g.notional_usdt, g.target_usd,
+                     g.stop_pct, g.max_positions)
 
         if not self.cfg.dry_run and self.cfg.symbol not in self.book:
             # Skipped when the configured symbol is itself an adopted position:
@@ -1417,6 +1433,8 @@ class Engine:
                     self.process_commands()
                     self.publish()
                     self.periodic()
+                    if self.gainer is not None:
+                        self.gainer.tick()
                 except BinanceError as e:
                     log.error("exchange error: %s", e)
                     if e.code in (-1021, -1022):
@@ -1757,6 +1775,8 @@ class Engine:
             return
         if not pos.filled:
             return          # a resting entry has nothing to supervise
+        if getattr(pos, "strategy", "") == "gainer":
+            return          # bot/gainer.py owns its exits; the R rules do not apply
         bars = self.held_bars(pos.symbol)
         params = self.cfg.params or {}
         atr_period = int((params.get("trend") or {}).get("atr_period", 14))
@@ -2060,10 +2080,10 @@ class Engine:
         self.reconcile_position(snap)
         # Even with an empty book: an empty book is exactly when a position the
         # bot lost track of goes unnoticed (see reconcile_book).
-        if self.cfg.portfolio.enabled:
+        if self.cfg.portfolio.enabled or self.gainer is not None:
             self.reconcile_book()
 
-        hb = self.cfg.alerts.heartbeat_minutes
+        hb =self.cfg.alerts.heartbeat_minutes
         if hb and now - self._last_heartbeat > hb * 60:
             self._last_heartbeat = now
             prog = self.schedule.progress(self.state.realized_today)

@@ -219,6 +219,44 @@ supervise:
   # positions have no recorded level, so it is off for them.
   failed_breakout_exit: true
 
+# GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
+# buy it with a take-profit that nets target_usd and a stop stop_pct below.
+# When another coin takes #1, open that too; every other gainer position is
+# kept if still profitable (net of fee_pct) and closed if not. Alerts: new
+# leader, open, keep/close, each milestone, and an hourly board + positions.
+# The "likely next gainer" is an extrapolation of the last slope_minutes, not
+# a prediction. Not backtested.
+#
+# dry_run: true is PAPER: nothing is sent, fills and exits are simulated.
+#
+# LIVE since 2026-09-15 by request ("set those parameters as your wish and
+# deploy and go live"), sized for $9.23 of equity:
+#   $6.00 notional  clears the $5 minimum after per-lot rounding
+#   5% stop         ~$0.31 with fees per stop-out, ~3.4% of equity
+#   2 positions     two stop-outs ~$0.62, inside the 10% daily loss limit
+#                   ($0.92) and clear of the $8.00 equity floor
+# A $6.00 position needs about a +34% move to net the $2.00 target.
+#   run.py   the startup log prints the gainer settings in force
+gainer:
+  enabled: true
+  dry_run: false
+  poll_seconds: 30
+  top_n: 10
+  min_quote_volume: 10000000
+  confirm_polls: 2          # polls a new #1 must hold before it counts
+  # true: trade the #1 found at first boot. The last leader is saved in
+  # data/gainer.json, so a restart does not re-buy a leader already traded.
+  trade_on_start: true
+  notional_usdt: 6.0
+  target_usd: 2.0
+  stop_pct: 5.0
+  max_positions: 2
+  fee_pct: 0.15
+  milestones_usd: [1.0, 1.5, 2.0]
+  status_minutes: 60
+  slope_minutes: 10
+  predict_minutes: 15
+
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.
