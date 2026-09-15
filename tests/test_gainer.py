@@ -24,9 +24,10 @@ from bot.notify import Event                               # noqa: E402
 from test_r2_regressions import StubAPI, engine            # noqa: E402
 
 
-def tick(sym, pct, price=1.0, qv=50e6):
+def tick(sym, pct, price=1.0, qv=50e6, high=None):
     return {"symbol": sym, "priceChangePercent": str(pct),
-            "lastPrice": str(price), "quoteVolume": str(qv)}
+            "lastPrice": str(price), "quoteVolume": str(qv),
+            "highPrice": str(price if high is None else high)}
 
 
 class Rules:
@@ -279,6 +280,65 @@ class LiveOrders(unittest.TestCase):
         m2.restore()
         self.assertEqual(e.book["AAAUSDT"].strategy, "gainer")
         self.assertIn("AAAUSDT", m2.tracks)
+
+
+class Reentry(unittest.TestCase):
+    def stopped_out(self, **kw):
+        """Live AAAUSDT, still the leader, closed by its stop at 0.95; 24h high 1.3."""
+        m, e = miner(dry=False, **kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.book.pop("AAAUSDT")
+        e.api.filled_amt = 0.0
+        e.api.board = [tick("AAAUSDT", 40, 0.95, high=1.3)]
+        m.tick(now=1000)
+        return m, e
+
+    def test_stop_out_on_the_leader_arms_at_the_24h_high(self):
+        m, e = self.stopped_out()
+        self.assertEqual(m.tracks, {})
+        self.assertEqual(m.rearm, {"AAAUSDT": 1.3})
+        self.assertEqual(len(e.api.orders), 1, "no re-entry below the high")
+
+    def test_buys_again_above_the_high_once(self):
+        m, e = self.stopped_out()
+        e.api.board = [tick("AAAUSDT", 45, 1.25, high=1.3)]
+        m.tick(now=1030)
+        self.assertEqual(len(e.api.orders), 1)
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1060)
+        self.assertIn("AAAUSDT", m.tracks)
+        self.assertEqual(len(e.api.orders), 2)
+        self.assertEqual(m.rearm, {})
+        self.assertTrue(any("RE-ENTRY: AAAUSDT" in b for b in bodies(e)))
+
+    def test_refused_reentry_is_not_retried_every_poll(self):
+        m, e = self.stopped_out()
+        e.state.halted = True
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1030)
+        e.api.board = [tick("AAAUSDT", 55, 1.40, high=1.40)]
+        m.tick(now=1060)
+        self.assertEqual(sum("NOT opened" in b for b in bodies(e)), 1)
+        self.assertEqual(len(e.api.orders), 1)
+
+    def test_new_leader_clears_the_rearm(self):
+        m, e = self.stopped_out()
+        e.api.board = [tick("BBBUSDT", 60, 1.0), tick("AAAUSDT", 40, 1.4, high=1.4)]
+        m._tradable = set()         # the cached symbol list predates BBBUSDT
+        m.tick(now=1030)
+        self.assertNotIn("AAAUSDT", m.rearm)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertNotIn("AAAUSDT", m.tracks)
+
+    def test_disabled_does_not_arm(self):
+        m, e = self.stopped_out(reentry_on_new_high=False)
+        self.assertEqual(m.rearm, {})
+
+    def test_rearm_survives_a_restart(self):
+        m, e = self.stopped_out()
+        m2 = GainerMiner(e, m.cfg, path=m.path)
+        self.assertEqual(m2.rearm, {"AAAUSDT": 1.3})
 
 
 class Config(unittest.TestCase):

@@ -73,6 +73,10 @@ class GainerConfig:
     confirm_polls: int = 2
     #: False: the leader found at boot is a baseline, not a new leader.
     trade_on_start: bool = False
+    #: When a position on the current leader closes (stop or take-profit) and
+    #: the symbol is still first, buy it again once its price trades above the
+    #: 24h high recorded at the close. One attempt per new high.
+    reentry_on_new_high: bool = True
 
     # -- sizing
     notional_usdt: float = 5.5
@@ -276,6 +280,9 @@ class GainerMiner:
         self._candidate_polls = 0
         self._baselined = False
         self.tracks: dict[str, Track] = {}
+        #: symbol -> price it must trade above to be bought again. 0.0 means
+        #: "not known yet": the 24h high on the next poll is taken.
+        self.rearm: dict[str, float] = {}
         self._last_poll = 0.0
         self._last_status = time.time()
         self._tradable: set = set()
@@ -293,6 +300,7 @@ class GainerMiner:
         except (OSError, ValueError):
             return
         self.leader = raw.get("leader", "")
+        self.rearm = {s: float(h) for s, h in (raw.get("rearm") or {}).items()}
         for sym, t in (raw.get("tracks") or {}).items():
             try:
                 self.tracks[sym] = Track(**t)
@@ -305,6 +313,7 @@ class GainerMiner:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(
                 {"leader": self.leader,
+                 "rearm": self.rearm,
                  "tracks": {s: asdict(t) for s, t in self.tracks.items()}},
                 indent=2))
             tmp.replace(self.path)
@@ -326,6 +335,7 @@ class GainerMiner:
             if pos is None:
                 log.info("gainer: %s closed while the bot was down", sym)
                 del self.tracks[sym]
+                self._arm(sym, {})
                 continue
             pos.strategy = STRATEGY
         self.save()
@@ -346,16 +356,20 @@ class GainerMiner:
             return
         self.board.update(rows, now)
         prices = {r.symbol: r.price for r in rows}
-        # Held symbols can fall under the volume floor; price them anyway.
+        highs = {}
         for t in tickers or []:
-            if t.get("symbol") in self.tracks and t.get("symbol") not in prices:
-                try:
-                    prices[t["symbol"]] = float(t.get("lastPrice") or 0)
-                except (TypeError, ValueError):
-                    pass
+            sym = t.get("symbol")
+            try:
+                if sym in self.tracks or sym in self.rearm:
+                    highs[sym] = float(t.get("highPrice") or 0)
+                # Held symbols can fall under the volume floor; price them anyway.
+                if sym in self.tracks and sym not in prices:
+                    prices[sym] = float(t.get("lastPrice") or 0)
+            except (TypeError, ValueError):
+                pass
 
-        self.sync_tracks(prices)
-        self.check_leader(now, prices)
+        self.sync_tracks(prices, highs)
+        self.check_leader(now, prices, highs)
         self.check_milestones(prices)
         if self.cfg.status_minutes and now - self._last_status >= self.cfg.status_minutes * 60:
             self._last_status = now
@@ -376,7 +390,7 @@ class GainerMiner:
         self._tradable_at = now
         return self._tradable
 
-    def check_leader(self, now: float, prices: dict) -> None:
+    def check_leader(self, now: float, prices: dict, highs: dict | None = None) -> None:
         lead = self.board.leader
         if lead is None:
             return
@@ -391,6 +405,7 @@ class GainerMiner:
                 return
         if lead.symbol == self.leader:
             self._candidate, self._candidate_polls = lead.symbol, 0
+            self.check_reentry(lead, highs or {})
             return
         if lead.symbol != self._candidate:
             self._candidate, self._candidate_polls = lead.symbol, 0
@@ -398,8 +413,38 @@ class GainerMiner:
         if self._candidate_polls < self.cfg.confirm_polls:
             return
         previous, self.leader = self.leader, lead.symbol
+        self.rearm.clear()          # a new leader is traded by on_new_leader
         self.save()
         self.on_new_leader(lead, previous, now, prices)
+
+    def _arm(self, symbol: str, highs: dict) -> None:
+        """A position on the leader closed: allow one buy above its 24h high."""
+        if not self.cfg.reentry_on_new_high or symbol != self.leader:
+            return
+        self.rearm[symbol] = highs.get(symbol, 0.0)
+        self.save()
+        if self.rearm[symbol] > 0:
+            self.notify(f"{symbol} still leads; will buy again above its 24h high "
+                        f"{self.rearm[symbol]:,.6g}", symbol=symbol)
+
+    def check_reentry(self, lead: Row, highs: dict) -> None:
+        sym = lead.symbol
+        if not self.cfg.reentry_on_new_high or sym not in self.rearm or sym in self.tracks:
+            return
+        high = self.rearm[sym]
+        if high <= 0:
+            if highs.get(sym, 0.0) > 0:
+                self.rearm[sym] = highs[sym]
+                self.save()
+            return
+        if lead.price <= high:
+            return
+        del self.rearm[sym]         # one attempt; a refusal must not retry every poll
+        self.save()
+        self.notify(f"RE-ENTRY: {sym} made a new high {lead.price:,.6g} "
+                    f"(above {high:,.6g}) and still leads at {lead.change_pct:+.2f}%",
+                    symbol=sym)
+        self.open(sym, lead.price, lead.change_pct)
 
     def on_new_leader(self, lead: Row, previous: str, now: float, prices: dict) -> None:
         fc = self.board.forecast(now)
@@ -594,8 +639,9 @@ class GainerMiner:
             self.notify(f"{symbol}: close FAILED; its stop and take-profit are still "
                         f"on the exchange\n{why}", symbol=symbol, event=Event.ERROR)
 
-    def sync_tracks(self, prices: dict) -> None:
+    def sync_tracks(self, prices: dict, highs: dict | None = None) -> None:
         """Resolve paper exits, and forget live ones the exchange already closed."""
+        highs = highs or {}
         for sym, t in list(self.tracks.items()):
             if not t.paper:
                 if sym not in self.engine.book:
@@ -603,6 +649,7 @@ class GainerMiner:
                     log.info("gainer: %s closed exchange-side", sym)
                     del self.tracks[sym]
                     self.save()
+                    self._arm(sym, highs)
                 continue
             px = prices.get(sym, 0.0)
             if px <= 0:
@@ -611,6 +658,10 @@ class GainerMiner:
                 self.close(sym, t.take_profit, f"take-profit hit (target ${self.cfg.target_usd:.2f})")
             elif px <= t.stop:
                 self.close(sym, t.stop, f"stop-loss hit (-{self.cfg.stop_pct:g}%)")
+            else:
+                continue
+            if sym not in self.tracks:
+                self._arm(sym, highs)
 
     def check_milestones(self, prices: dict) -> None:
         for sym, t in self.tracks.items():

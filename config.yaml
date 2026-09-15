@@ -247,6 +247,9 @@ gainer:
   # true: trade the #1 found at first boot. The last leader is saved in
   # data/gainer.json, so a restart does not re-buy a leader already traded.
   trade_on_start: true
+  # After a stop or take-profit on the coin that is still #1, buy it again
+  # once it trades above the 24h high recorded at that close (one attempt).
+  reentry_on_new_high: true
   notional_usdt: 6.0
   target_usd: 2.0
   stop_pct: 5.0
