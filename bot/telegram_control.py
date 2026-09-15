@@ -74,6 +74,11 @@ SETTINGS  (written to config.yaml, applied on restart)
 /aggressive           aggressive mode and profile
 /aggressive on|off    turn it on or off
 /aggressive <profile> moderate | high | maximum
+/supervisor           position supervisor state
+/supervisor on|off    turn the position supervisor on or off
+/gainer               gainer mining settings and their values
+/gainer <name> <value> change one: size, confirm, rising, minrise,
+                      cooldown, target, onleader, hold
 
 PROCESS
 /restart              restart the bot, applying config.yaml
@@ -237,6 +242,8 @@ class TelegramControl:
             "/resume": lambda: self._ask("resume", "Clear the halt and resume trading?"),
             "/set": lambda: self._set(arg, rest),
             "/aggressive": lambda: self._aggressive(arg),
+            "/supervisor": lambda: self._supervisor(arg),
+            "/gainer": lambda: self._gainer(arg, rest),
             "/restart": lambda: self._ask(
                 "restart", "Restart the bot?"),
             "/stop": lambda: self._ask(
@@ -374,6 +381,57 @@ class TelegramControl:
             self.send(f"Refused: {e}")
             return
         self._ask("set", f"Change {key}?", value=f"{key}={value}")
+
+    def _supervisor(self, arg: str) -> None:
+        """A shorthand over /set for supervise.enabled."""
+        from .settings import EDITABLE, parse_value
+
+        key = "supervise.enabled"
+        if not arg:
+            self.send(f"{self.read().get('mode_line', '')}\n\n"
+                      f"{key}   {self._fmt_current(key)}\n\n"
+                      f"/supervisor on | off\n\n"
+                      f"Written to config.yaml; /restart applies it.")
+            return
+        try:
+            value = parse_value(EDITABLE[key], arg)
+        except ValueError as e:
+            self.send(f"Refused: {e}")
+            return
+        self._ask("set", f"Change {key}?", value=f"{key}={value}")
+
+    #: /gainer's short names, grouped as config.yaml groups them.
+    GAINER_KEYS = {
+        "size": "gainer.entry.notional_usdt",
+        "confirm": "gainer.entry.confirm_minutes",
+        "rising": "gainer.entry.buy_only_if_rising",
+        "minrise": "gainer.entry.min_rise_pct_per_min",
+        "cooldown": "gainer.entry.rebuy_cooldown_minutes",
+        "target": "gainer.exit.target_usd",
+        "onleader": "gainer.exit.on_new_leader",
+        "hold": "gainer.exit.min_hold_minutes",
+    }
+
+    def _gainer(self, arg: str, rest: list[str]) -> None:
+        """A shorthand over /set for the gainer mining settings."""
+        if not arg:
+            lines = [self.read().get("mode_line", ""), ""]
+            for group in ("entry", "exit"):
+                lines.append(f"{group.upper()}")
+                for name, key in self.GAINER_KEYS.items():
+                    if key.split(".")[1] == group:
+                        lines.append(f"  {name:<9}{key}  {self._fmt_current(key)}")
+            lines += ["", "/gainer <name> <value>",
+                      "/gainer <name>  explains one", "",
+                      "Written to config.yaml; /restart applies it."]
+            self.send("\n".join(lines))
+            return
+        key = self.GAINER_KEYS.get(arg)
+        if key is None:
+            self.send(f"{arg!r} is not a gainer setting. Use one of: "
+                      f"{', '.join(self.GAINER_KEYS)}.")
+            return
+        self._set(key, rest)
 
     def _scan(self, arg: str) -> None:
         """`/scan` reports the last result; `/scan now` asks for a fresh one."""

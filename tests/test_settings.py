@@ -79,6 +79,32 @@ class TestWritesTheRightLine(ConfigFileTest):
         self.assertFalse(raw["aggressive"]["enabled"])
         self.assertTrue(raw["portfolio"]["enabled"], "wrote the wrong section")
 
+    def test_a_three_level_key_resolves_by_its_group(self):
+        """min_hold_minutes under gainer.entry must not catch gainer.exit's."""
+        self.path.write_text(
+            "gainer:\n"
+            "  enabled: true\n"
+            "  entry:\n"
+            "    min_hold_minutes: 1   # decoy\n"
+            "  exit:\n"
+            "    # comment\n"
+            "    min_hold_minutes: 15\n"
+            "    target_usd: 0.25\n"
+            "supervise:\n"
+            "  enabled: true\n")
+        write_setting("gainer.exit.min_hold_minutes", 30.0, self.path)
+        raw = self.reload()
+        self.assertEqual(raw["gainer"]["exit"]["min_hold_minutes"], 30)
+        self.assertEqual(raw["gainer"]["entry"]["min_hold_minutes"], 1)
+        self.assertIn("# decoy", self.path.read_text())
+
+    def test_current_value_reads_nested_groups(self):
+        from bot.gainer import GainerConfig
+
+        class Cfg:
+            gainer = GainerConfig(exit={"target_usd": 0.25})
+        self.assertEqual(current_value(Cfg, "gainer.exit.target_usd"), 0.25)
+
     def test_top_level_key(self):
         write_setting("strategy", "trend_atr", self.path)
         self.assertEqual(self.reload()["strategy"], "trend_atr")
@@ -421,3 +447,15 @@ class TestTheUnitFileAgrees(unittest.TestCase):
         m = re.search(r"^ReadWritePaths=(.*)$", self.unit, re.M)
         self.assertIsNotNone(m)
         self.assertIn("config.yaml", m.group(1))
+
+
+class TestTheRealConfigDeclaresEveryKey(unittest.TestCase):
+    """write_setting refuses a key the file does not declare, so an EDITABLE
+    entry missing from config.yaml is a Telegram command that always fails."""
+
+    def test_every_editable_key_is_in_config_yaml(self):
+        from bot.settings import _find_line
+        lines = (ROOT / "config.yaml").read_text().splitlines(keepends=True)
+        for key in EDITABLE:
+            with self.subTest(key=key):
+                self.assertGreaterEqual(_find_line(lines, key), 0)

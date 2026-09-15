@@ -386,6 +386,58 @@ class TestSettingsCommands(Base):
         self.assertIn("neither on/off nor a profile", self.last())
         self.assertEqual(self.tc.pop_commands(), [])
 
+    def test_supervisor_alone_reports_the_current_state(self):
+        self.tc._handle(message("/supervisor"))
+        self.assertIn("supervise.enabled", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_supervisor_off_targets_the_supervise_flag(self):
+        self.tc._handle(message("/supervisor off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "supervise.enabled=False")
+
+    def test_an_unknown_supervisor_argument_is_refused(self):
+        self.tc._handle(message("/supervisor maybe"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_size_targets_the_notional(self):
+        self.tc._handle(message("/gainer size 7.5"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "gainer.entry.notional_usdt=7.5")
+
+    def test_gainer_target_targets_the_target(self):
+        self.tc._handle(message("/gainer target 0.25"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "gainer.exit.target_usd=0.25")
+
+    def test_gainer_cooldown_targets_the_entry_group(self):
+        self.tc._handle(message("/gainer cooldown 90"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "gainer.entry.rebuy_cooldown_minutes=90.0")
+
+    def test_gainer_onleader_is_a_choice(self):
+        self.tc._handle(message("/gainer onleader sometimes"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_alone_lists_the_groups(self):
+        self.tc._handle(message("/gainer"))
+        self.assertIn("ENTRY", self.last())
+        self.assertIn("gainer.exit.min_hold_minutes", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_an_unknown_gainer_name_is_refused(self):
+        self.tc._handle(message("/gainer speed 3"))
+        self.assertIn("not a gainer setting", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_size_under_the_exchange_minimum_is_refused(self):
+        self.tc._handle(message("/gainer size 2"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
 
 class TestProcessCommands(Base):
     def test_restart_asks_first(self):

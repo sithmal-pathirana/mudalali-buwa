@@ -118,6 +118,41 @@ EDITABLE: dict[str, Setting] = {
         Setting("universe.min_quote_volume", "float",
                 "minimum 24h quote volume for a symbol to be considered",
                 lo=0.0, hi=1e12),
+
+        Setting("supervise.enabled", "bool",
+                "position supervisor on or off: break-even, runner, horizon "
+                "and failed-breakout exits. Off leaves each trade to its "
+                "original stop and take-profit"),
+
+        # gainer mining -- entry: when a new top gainer is bought, and how much
+        Setting("gainer.entry.notional_usdt", "float",
+                "size of each gainer mining trade in USDT. Binance refuses "
+                "orders under $5 after lot rounding", lo=5.0, hi=1000.0),
+        Setting("gainer.entry.confirm_minutes", "float",
+                "how long a new #1 must hold first place before it counts as "
+                "the leader", lo=0.0, hi=120.0),
+        Setting("gainer.entry.buy_only_if_rising", "bool",
+                "buy a leader only while its 24h % is still climbing; a fading "
+                "one is watched instead"),
+        Setting("gainer.entry.min_rise_pct_per_min", "float",
+                "the climb that counts as rising, in 24h % points per minute",
+                lo=-10.0, hi=10.0),
+        Setting("gainer.entry.rebuy_cooldown_minutes", "float",
+                "a coin sold within this many minutes is not bought again as "
+                "a new leader; 0 turns it off", lo=0.0, hi=1440.0),
+
+        # gainer mining -- exit: when a position is sold
+        Setting("gainer.exit.target_usd", "float",
+                "net profit each gainer mining trade takes, in USDT; sets the "
+                "take-profit distance", lo=0.05, hi=100.0),
+        Setting("gainer.exit.on_new_leader", "choice",
+                "what happens to held positions when another coin takes #1: "
+                "close_if_losing sells the ones not in profit, keep leaves them "
+                "to their stop and take-profit",
+                choices=("close_if_losing", "keep")),
+        Setting("gainer.exit.min_hold_minutes", "float",
+                "a position younger than this is never sold because of a new "
+                "leader", lo=0.0, hi=1440.0),
     )
 }
 
@@ -177,13 +212,12 @@ def format_value(value) -> str:
 
 def current_value(cfg, key: str):
     """Read what a loaded Config currently holds for a dotted key."""
-    if "." not in key:
-        return getattr(cfg, key, None)
-    section, leaf = key.split(".", 1)
-    block = getattr(cfg, section, None)
-    if isinstance(block, dict):
-        return block.get(leaf)
-    return getattr(block, leaf, None)
+    node = cfg
+    for part in key.split("."):
+        node = node.get(part) if isinstance(node, dict) else getattr(node, part, None)
+        if node is None:
+            return None
+    return node
 
 
 #: `key:` at some indent, its value, and any trailing comment, kept apart so a
@@ -199,30 +233,28 @@ def _find_line(lines: list[str], key: str) -> int:
     """
     Index of the line declaring `key`, or -1.
 
-    Dotted keys are resolved against the section actually open at that point in
-    the file, so `portfolio.enabled` cannot match the `enabled:` belonging to
-    `aggressive:` a few lines earlier -- which is the entire hazard of editing
-    YAML by line.
+    Dotted keys are resolved against the blocks actually open at that point in
+    the file, by indentation and at any depth, so `portfolio.enabled` cannot
+    match the `enabled:` belonging to `aggressive:` a few lines earlier, nor
+    `gainer.exit.min_hold_minutes` one under `gainer.entry:` -- which is the
+    entire hazard of editing YAML by line.
     """
-    top_re = re.compile(r"^(?P<key>[A-Za-z_][\w-]*):")
-    if "." in key:
-        section, leaf = key.split(".", 1)
-    else:
-        section, leaf = None, key
-    pattern = _line_re(leaf)
-    open_section: str | None = None
+    path = key.split(".")
+    key_re = re.compile(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z_][\w-]*):(?:[ \t]|\r?\n?$)")
+    open_keys: list[tuple[int, str]] = []       # (indent, key) of each open block
 
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith("#") or stripped.startswith("-"):
             continue
-        top = top_re.match(line)
-        if top:                                  # indent 0: a new section starts
-            open_section = top.group("key")
-            if section is None and open_section == leaf:
-                return i
+        m = key_re.match(line)
+        if not m:
             continue
-        if section is not None and open_section == section and pattern.match(line):
+        indent = len(m.group("indent"))
+        while open_keys and open_keys[-1][0] >= indent:
+            open_keys.pop()
+        open_keys.append((indent, m.group("key")))
+        if [k for _, k in open_keys] == path:
             return i
     return -1
 

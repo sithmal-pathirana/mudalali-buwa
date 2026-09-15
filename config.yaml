@@ -220,45 +220,103 @@ supervise:
   failed_breakout_exit: true
 
 # GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
-# buy it with a take-profit that nets target_usd and a stop stop_pct below.
-# When another coin takes #1, open that too; every other gainer position is
-# kept if still profitable (net of fee_pct) and closed if not. Alerts: new
-# leader, open, keep/close, each milestone, and an hourly board + positions.
-# The "likely next gainer" is an extrapolation of the last slope_minutes, not
-# a prediction. Not backtested.
+# buy it with a take-profit that nets exit.target_usd and a stop exit.stop_pct
+# below. When another coin takes #1, open that too, and judge every other
+# gainer position by exit.on_new_leader. Alerts: new leader, open, keep/close,
+# each milestone, and an hourly board + positions. The "likely next gainer" is
+# an extrapolation of forecast.slope_minutes, not a prediction. Not backtested.
 #
-# dry_run: true is PAPER: nothing is sent, fills and exits are simulated.
+# Settings are grouped by what they act on:
+#   board     what is watched
+#   entry     when a leader is bought, and how much
+#   exit      when a position is sold
+#   alerts    what is announced beyond each trade
+#   forecast  how the board's recent motion is measured
 #
-# LIVE since 2026-09-15 by request ("set those parameters as your wish and
-# deploy and go live"), sized for $9.23 of equity:
-#   $6.00 notional  clears the $5 minimum after per-lot rounding
-#   5% stop         ~$0.31 with fees per stop-out, ~3.4% of equity
-#   2 positions     two stop-outs ~$0.62, inside the 10% daily loss limit
-#                   ($0.92) and clear of the $8.00 equity floor
-# A $6.00 position needs about a +34% move to net the $2.00 target.
-#   run.py   the startup log prints the gainer settings in force
+# From Telegram: /gainer lists them, /gainer <name> <value> changes one
+# (size, confirm, rising, minrise, cooldown, target, onleader, hold).
+# The startup log prints the settings in force.
 gainer:
   enabled: true
+  # true is PAPER: nothing is sent, fills and exits are simulated.
   dry_run: false
-  poll_seconds: 30
-  top_n: 10
-  min_quote_volume: 10000000
-  confirm_polls: 2          # polls a new #1 must hold before it counts
-  # true: trade the #1 found at first boot. The last leader is saved in
-  # data/gainer.json, so a restart does not re-buy a leader already traded.
-  trade_on_start: true
-  # After a stop or take-profit on the coin that is still #1, buy it again
-  # once it trades above the 24h high recorded at that close (one attempt).
-  reentry_on_new_high: true
-  notional_usdt: 6.0
-  target_usd: 2.0
-  stop_pct: 5.0
-  max_positions: 2
-  fee_pct: 0.15
-  milestones_usd: [1.0, 1.5, 2.0]
-  status_minutes: 60
-  slope_minutes: 10
-  predict_minutes: 15
+
+  board:
+    poll_seconds: 30
+    top_n: 10
+    # 24h quote volume floor. A $300k coin can top the board on one order.
+    min_quote_volume: 10000000
+
+  entry:
+    # true: trade the #1 found at first boot. The last leader is saved in
+    # data/gainer.json, so a restart does not re-buy a leader already traded.
+    trade_on_start: true
+
+    # THE SWAP GUARDS. On 2026-09-15 AINUSDT and POWERUSDT, both fading after a
+    # 50-95% day, swapped first place 7 times in 77 minutes. Every swap sold one
+    # at a small loss and bought the other: -$0.03, -$0.12, -$0.19, -$0.07 in a
+    # row, with no stop or target ever reached. These four settings (with
+    # exit.min_hold_minutes) stop that.
+    #
+    # A new #1 must hold first place this long before it counts. It was 2 polls
+    # (1 minute), and those swaps were 2-5 minutes apart.
+    confirm_minutes: 5.0
+    # Buy a leader only while its 24h % is still climbing. Every swap above
+    # bought a leader reported as fading (-0.7 to -1.1 %/min): it reached #1
+    # because the other coin fell faster. A fading leader is watched while it
+    # stays #1 and bought if it starts rising again.
+    buy_only_if_rising: true
+    # The climb that counts as rising, in 24h % points per minute over
+    # forecast.slope_minutes. 0.05 matches the board's "holding" band, so a
+    # flat leader is not bought either.
+    min_rise_pct_per_min: 0.05
+    # A coin sold for any reason is not bought again as a new leader for this
+    # long; 0 turns it off. This is what breaks an A-B-A-B loop. Re-entry on a
+    # new high below is exempt: it has its own trigger.
+    rebuy_cooldown_minutes: 60
+
+    # After a stop or take-profit on the coin that is still #1, buy it again
+    # once it trades above the 24h high recorded at that close (one attempt).
+    reentry_on_new_high: true
+
+    # LIVE since 2026-09-15 by request ("set those parameters as your wish and
+    # deploy and go live"), sized for $9.23 of equity:
+    #   $6.00 notional  clears the $5 minimum after per-lot rounding
+    #   2 positions     two stop-outs ~$0.62, inside the 10% daily loss limit
+    #                   ($0.92) and clear of the $8.00 equity floor
+    notional_usdt: 6.0
+    max_positions: 2
+
+  exit:
+    # 2026-09-15, by request ("2$ is bit large. what about .25$"): $0.25 is
+    # about +4.3% on $6.00, reachable inside a leader's run; $2.00 needed +34%
+    # and never filled. Against the 5% stop that is a payoff under 1:1, so it
+    # needs a win rate above ~55%.
+    target_usd: 0.25
+    # ~$0.31 with fees per stop-out on $6.00, ~3.4% of equity.
+    stop_pct: 5.0
+    # Round-trip cost estimate, % of notional. Added to the take-profit so the
+    # target is net, and subtracted before calling a position profitable.
+    fee_pct: 0.15
+    # When another coin takes #1, what happens to the positions already held:
+    #   close_if_losing  sell the ones not in profit (net of fee_pct)
+    #   keep             leave every one to its own stop and take-profit
+    on_new_leader: close_if_losing
+    # A position younger than this is never sold because of a new leader; its
+    # stop still protects it. The swaps above sold positions 2-5 minutes old,
+    # before the trade had any chance to reach its target.
+    min_hold_minutes: 15
+
+  alerts:
+    milestones_usd: [1.0, 1.5, 2.0]
+    status_minutes: 60
+
+  forecast:
+    history_minutes: 60
+    slope_minutes: 10
+    predict_minutes: 15
+    # |slope| below this (24h % points per minute) reads as "holding".
+    trend_eps: 0.05
 
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,

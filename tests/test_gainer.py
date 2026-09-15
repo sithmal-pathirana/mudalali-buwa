@@ -107,9 +107,19 @@ def miner(dry=True, api=None, **kw):
         return True
     e.close_position = close_position
     e.closed = closed
-    base = dict(enabled=True, dry_run=dry, poll_seconds=0, confirm_polls=1,
-                milestones_usd=[1.0, 2.0], status_minutes=0)
-    base.update(kw)
+    # The swap guards are off here so each older test isolates its own rule;
+    # class SwapGuards turns them on one at a time.
+    base = dict(enabled=True, dry_run=dry,
+                board=dict(poll_seconds=0),
+                entry=dict(confirm_minutes=0, buy_only_if_rising=False,
+                           rebuy_cooldown_minutes=0),
+                exit=dict(min_hold_minutes=0),
+                alerts=dict(milestones_usd=[1.0, 2.0], status_minutes=0))
+    for k, v in kw.items():
+        if isinstance(v, dict):
+            base.setdefault(k, {}).update(v)
+        else:
+            base[k] = v
     path = Path(tempfile.mkdtemp()) / "gainer.json"
     m = GainerMiner(e, GainerConfig(**base), path=path)
     e.gainer = m
@@ -137,7 +147,7 @@ class Arithmetic(unittest.TestCase):
 
 class Board(unittest.TestCase):
     def test_forecast_names_the_closing_challenger(self):
-        b = GainerBoard(GainerConfig(slope_minutes=10, predict_minutes=15))
+        b = GainerBoard(GainerConfig(forecast=dict(slope_minutes=10, predict_minutes=15)))
         b.update(rank_board([tick("AAAUSDT", 40), tick("BBBUSDT", 20)], set(), 0), 0)
         b.update(rank_board([tick("AAAUSDT", 39), tick("BBBUSDT", 35)], set(), 0), 600)
         fc = b.forecast(600)
@@ -174,7 +184,7 @@ class LeaderChange(unittest.TestCase):
         self.assertEqual(e.api.orders, [], "paper mode must send nothing")
 
     def test_confirmation_ignores_a_one_poll_flicker(self):
-        m, e = miner(confirm_polls=2)
+        m, e = miner(entry=dict(confirm_minutes=0.5))
         e.api.board = [tick("AAAUSDT", 40), tick("BBBUSDT", 20)]
         m.tick(now=1000)
         e.api.board = [tick("BBBUSDT", 41), tick("AAAUSDT", 40)]
@@ -190,8 +200,7 @@ class LeaderChange(unittest.TestCase):
         m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
         e.api.board = [tick("BBBUSDT", 50, 1.0), tick("AAAUSDT", 40, 1.05),
                        tick("CCCUSDT", 30, 0.99)]
-        m.max_positions = 3
-        m.cfg.max_positions = 3
+        m.cfg.entry.max_positions = 3
         m.tick(now=1000)
         self.assertIn("AAAUSDT", m.tracks)
         self.assertNotIn("CCCUSDT", m.tracks)
@@ -249,14 +258,14 @@ class LiveOrders(unittest.TestCase):
         self.assertEqual(e.api.orders, [])
 
     def test_leverage_ceiling_counts_the_whole_book(self):
-        m, e = miner(dry=False, notional_usdt=100.0)
+        m, e = miner(dry=False, entry=dict(notional_usdt=100.0))
         e.equity = e.state.day_start_equity = 10.0
         self.assertFalse(m.open("AAAUSDT", 1.0, 40))
         self.assertTrue(any("leverage ceiling" in b for b in bodies(e)))
         self.assertEqual(e.api.orders, [])
 
     def test_unprofitable_live_gainer_is_closed_through_the_engine(self):
-        m, e = miner(dry=False, max_positions=3)
+        m, e = miner(dry=False, entry=dict(max_positions=3))
         m._baselined, m.leader = True, "AAAUSDT"
         m.open("AAAUSDT", 1.0, 40)
         e.api.board = [tick("BBBUSDT", 50, 1.0), tick("AAAUSDT", 40, 0.98)]
@@ -332,7 +341,7 @@ class Reentry(unittest.TestCase):
         self.assertNotIn("AAAUSDT", m.tracks)
 
     def test_disabled_does_not_arm(self):
-        m, e = self.stopped_out(reentry_on_new_high=False)
+        m, e = self.stopped_out(entry=dict(reentry_on_new_high=False))
         self.assertEqual(m.rearm, {})
 
     def test_rearm_survives_a_restart(self):
@@ -341,13 +350,130 @@ class Reentry(unittest.TestCase):
         self.assertEqual(m2.rearm, {"AAAUSDT": 1.3})
 
 
+class SwapGuards(unittest.TestCase):
+    """Two fading coins trading first place must not be bought and sold in turn."""
+
+    def led_by_aaa(self, **kw):
+        m, e = miner(**kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    def test_a_new_leader_must_hold_first_place_for_confirm_minutes(self):
+        m, e = self.led_by_aaa(entry=dict(confirm_minutes=5))
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1000)
+        m.tick(now=1240)
+        self.assertEqual(m.leader, "AAAUSDT", "confirmed after 4 minutes")
+        m.tick(now=1300)
+        self.assertEqual(m.leader, "BBBUSDT")
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_a_fading_leader_is_watched_then_bought_when_it_rises(self):
+        m, e = self.led_by_aaa(entry=dict(buy_only_if_rising=True))
+        e.api.board = [tick("AAAUSDT", 60), tick("BBBUSDT", 50)]
+        m.tick(now=1000)
+        e.api.board = [tick("BBBUSDT", 45), tick("AAAUSDT", 40)]
+        m.tick(now=1100)
+        self.assertNotIn("BBBUSDT", m.tracks)
+        self.assertEqual(m.waiting, "BBBUSDT")
+        e.api.board = [tick("BBBUSDT", 49), tick("AAAUSDT", 38)]
+        m.tick(now=1200)
+        self.assertNotIn("BBBUSDT", m.tracks, "bought while still under its start")
+        e.api.board = [tick("BBBUSDT", 60), tick("AAAUSDT", 37)]
+        m.tick(now=1300)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertEqual(sum("not bought yet" in b for b in bodies(e)), 1,
+                         "the wait should be announced once, not every poll")
+
+    def test_unknown_trend_is_not_read_as_rising(self):
+        m, e = self.led_by_aaa(entry=dict(buy_only_if_rising=True))
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1000)
+        self.assertEqual(m.tracks, {})
+
+    def test_a_coin_sold_recently_is_not_bought_back(self):
+        m, e = self.led_by_aaa(entry=dict(rebuy_cooldown_minutes=60))
+        m.closed_at["BBBUSDT"] = 1000
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1100)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("rebuy_cooldown_minutes" in b for b in bodies(e)))
+        m.tick(now=1000 + 3600 + 1)
+        self.assertIn("BBBUSDT", m.tracks, "not bought once the cooldown ran out")
+
+    def test_reentry_on_a_new_high_ignores_the_cooldown(self):
+        m, e = miner(dry=False, entry=dict(rebuy_cooldown_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.book.pop("AAAUSDT")
+        e.api.filled_amt = 0.0
+        e.api.board = [tick("AAAUSDT", 40, 0.95, high=1.3)]
+        m.tick(now=1000)
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1030)
+        self.assertIn("AAAUSDT", m.tracks)
+
+    def test_a_young_position_is_not_swapped_out(self):
+        m, e = self.led_by_aaa(exit=dict(min_hold_minutes=15))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 900, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.99)]
+        m.tick(now=1000)
+        self.assertIn("CCCUSDT", m.tracks)
+        self.assertTrue(any("CCCUSDT HELD" in b for b in bodies(e)))
+
+    def test_an_old_losing_position_is_still_swapped_out(self):
+        m, e = self.led_by_aaa(exit=dict(min_hold_minutes=15))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.99)]
+        m.tick(now=1000)
+        self.assertNotIn("CCCUSDT", m.tracks)
+        self.assertEqual(m.closed_at["CCCUSDT"], 1000)
+
+    def test_keep_never_sells_on_a_new_leader(self):
+        m, e = self.led_by_aaa(exit=dict(on_new_leader="keep"))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.97)]
+        m.tick(now=1000)
+        self.assertIn("CCCUSDT", m.tracks)
+
+    def test_an_unknown_on_new_leader_is_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(on_new_leader="sometimes"))
+
+    def test_an_unknown_key_in_a_group_names_the_group(self):
+        with self.assertRaises(TypeError) as ctx:
+            GainerConfig(entry=dict(confirm_polls=2))
+        self.assertIn("gainer.entry", str(ctx.exception))
+
+    def test_closes_survive_a_restart(self):
+        m, e = self.led_by_aaa()
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        m.close("CCCUSDT", 0.99, "test", now=1000)
+        m2 = GainerMiner(e, m.cfg, path=m.path)
+        self.assertEqual(m2.closed_at, {"CCCUSDT": 1000})
+
+    def test_the_2026_09_15_swap_loop_trades_each_coin_once(self):
+        """AAA and BBB swap #1 every 30s for 5 minutes, prices flat."""
+        m, e = miner(entry=dict(rebuy_cooldown_minutes=60))
+        e.api.board = [tick("AAAUSDT", 60), tick("BBBUSDT", 59)]
+        m.tick(now=0)                                   # baseline AAA
+        for i in range(1, 11):
+            first, second = ("BBBUSDT", "AAAUSDT") if i % 2 else ("AAAUSDT", "BBBUSDT")
+            e.api.board = [tick(first, 60 + i), tick(second, 59 + i)]
+            m.tick(now=30 * i)
+        opened = sum("OPENED" in b for b in bodies(e))
+        self.assertEqual(opened, 2, "without the cooldown this opened 10 times")
+
+
 class Config(unittest.TestCase):
     def test_config_yaml_loads_the_gainer_section(self):
         from bot.config import Config as C
         cfg = C.load(ROOT / "config.yaml")
         self.assertIsInstance(cfg.gainer, GainerConfig)
-        self.assertEqual(cfg.gainer.target_usd, 2.0)
-        self.assertGreater(cfg.gainer.notional_usdt, 5.0, "must clear the $5 minimum")
+        self.assertGreater(cfg.gainer.exit.target_usd, 0.0)
+        self.assertGreater(cfg.gainer.entry.notional_usdt, 5.0,
+                           "must clear the $5 minimum")
+        self.assertIn(cfg.gainer.exit.on_new_leader, ("close_if_losing", "keep"))
 
     def test_event_exists(self):
         self.assertEqual(Event.GAINER.value, "gainer mining")

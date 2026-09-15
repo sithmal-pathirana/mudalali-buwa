@@ -1292,8 +1292,14 @@ class Engine:
             log.info("gainer mining ON%s: top %d every %ds, $%.2f notional, "
                      "target $%.2f, stop %.1f%%, up to %d positions",
                      " (PAPER)" if self.gainer.paper else " (LIVE ORDERS)",
-                     g.top_n, g.poll_seconds, g.notional_usdt, g.target_usd,
-                     g.stop_pct, g.max_positions)
+                     g.board.top_n, g.board.poll_seconds, g.entry.notional_usdt,
+                     g.exit.target_usd, g.exit.stop_pct, g.entry.max_positions)
+            log.info("gainer swap guards: confirm %gmin, buy only if rising %s "
+                     "(>= %g %%/min), rebuy cooldown %gmin, on new leader %s, "
+                     "min hold %gmin",
+                     g.entry.confirm_minutes, g.entry.buy_only_if_rising,
+                     g.entry.min_rise_pct_per_min, g.entry.rebuy_cooldown_minutes,
+                     g.exit.on_new_leader, g.exit.min_hold_minutes)
 
         if not self.cfg.dry_run and self.cfg.symbol not in self.book:
             # Skipped when the configured symbol is itself an adopted position:

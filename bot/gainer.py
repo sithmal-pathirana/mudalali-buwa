@@ -4,17 +4,30 @@ Gainer mining: trade whichever USDT perpetual has just become the top gainer.
 The rules, as asked for:
 
   * When a symbol takes FIRST place on the 24h gainer board, open a long on it
-    with a take-profit sized to bank `target_usd` (default $2) and a
-    protective stop. The exchange closes it when either triggers.
+    with a take-profit sized to bank `exit.target_usd` and a protective stop.
+    The exchange closes it when either triggers.
   * When a different symbol takes first place, open that one too. Every other
-    gainer position is re-judged at that moment: still in profit (net of the
-    estimated round-trip cost) -> keep it; not in profit -> close it.
+    gainer position is re-judged at that moment (`exit.on_new_leader`): still
+    in profit (net of the estimated round-trip cost) -> keep it; not in profit
+    -> close it.
   * Notify every step: new leader, position opened, kept or closed, each
-    profit milestone ($1, $1.5, $2 by default), and an hourly status of the
-    open positions and the top of the board.
+    profit milestone, and an hourly status of the open positions and the top
+    of the board.
 
-A monitor runs inside the engine loop every `poll_seconds`. It keeps a short
-history of the top of the board and reports how the leader is behaving
+The swap guards. On 2026-09-15 AINUSDT and POWERUSDT, both fading after a
+50-95% day, traded first place seven times in 77 minutes. Each swap sold one
+at a small loss and bought the other, and the account bled about $0.50 with
+neither stop nor target ever reached. Four settings stop that:
+
+  * entry.confirm_minutes          a new #1 must hold first place this long
+  * entry.buy_only_if_rising       a leader whose 24h % is falling is watched,
+                                   not bought, until it rises again
+  * entry.rebuy_cooldown_minutes   a coin sold recently is not bought back
+  * exit.min_hold_minutes          a young position is not swapped out; its
+                                   stop still protects it
+
+A monitor runs inside the engine loop every `board.poll_seconds`. It keeps a
+short history of the top of the board and reports how the leader is behaving
 (accelerating, holding, fading) and which challenger is closing on it.
 
 Honest label, same as every other strategy in this repo: the "prediction" is an
@@ -56,6 +69,95 @@ STRATEGY = "gainer"
 
 EXCLUDE_BASES = {"USDC", "BUSD", "TUSD", "FDUSD", "DAI", "EUR", "USDP", "AEUR"}
 
+#: What happens to the positions already held when a new coin takes first place.
+ON_NEW_LEADER = ("close_if_losing", "keep")
+
+#: Closes older than this are forgotten; no cooldown is meant to be longer.
+CLOSED_AT_MAX_AGE = 24 * 3600
+
+
+# ------------------------------------------------------------------- config
+@dataclass
+class GainerBoardConfig:
+    """What is watched: the 24h gainer board."""
+    poll_seconds: int = 30
+    top_n: int = 10
+    #: 24h quote volume floor. A $300k coin can top the board on one order.
+    min_quote_volume: float = 10_000_000
+
+
+@dataclass
+class GainerEntryConfig:
+    """When a leader is bought, and how much."""
+    #: False: the leader found at boot is a baseline, not a new leader.
+    trade_on_start: bool = False
+    #: A new symbol must hold first place this long before it counts as the
+    #: leader, so two coins trading places minute by minute are not traded.
+    confirm_minutes: float = 5.0
+    #: Buy a leader only while its 24h % is still climbing. A fading leader is
+    #: watched while it stays first, and bought if it starts rising again.
+    buy_only_if_rising: bool = True
+    #: The climb that counts as rising, in 24h % points per minute, measured
+    #: over forecast.slope_minutes.
+    min_rise_pct_per_min: float = 0.05
+    #: A coin sold (for any reason) is not bought again as a new leader for
+    #: this long. 0 turns it off. Re-entry on a new high is exempt: it has its
+    #: own trigger.
+    rebuy_cooldown_minutes: float = 60.0
+    #: When a position on the leader closes (stop or take-profit) and the
+    #: symbol is still first, buy it again once its price trades above the
+    #: 24h high recorded at the close. One attempt per new high.
+    reentry_on_new_high: bool = True
+    #: USDT per trade. Must clear Binance's $5 minimum after lot rounding.
+    notional_usdt: float = 5.5
+    max_positions: int = 2
+
+
+@dataclass
+class GainerExitConfig:
+    """When a position is sold."""
+    #: Net profit the take-profit is placed to bank, in USDT.
+    target_usd: float = 2.0
+    stop_pct: float = 5.0
+    #: Round-trip cost estimate as % of notional. Added to the take-profit
+    #: distance so the target is NET, and subtracted before calling a position
+    #: "still profitable" when a new leader arrives.
+    fee_pct: float = 0.15
+    #: close_if_losing: a held position that is not in profit is sold when
+    #: another coin takes first place. keep: only its stop and take-profit
+    #: ever close it.
+    on_new_leader: str = "close_if_losing"
+    #: A position younger than this is never sold because of a new leader.
+    min_hold_minutes: float = 15.0
+
+    def __post_init__(self):
+        if self.on_new_leader not in ON_NEW_LEADER:
+            raise ValueError(f"gainer.exit.on_new_leader must be one of "
+                             f"{' | '.join(ON_NEW_LEADER)}, not {self.on_new_leader!r}")
+
+
+@dataclass
+class GainerAlertsConfig:
+    """What is announced beyond each trade."""
+    milestones_usd: list = field(default_factory=lambda: [1.0, 1.5, 2.0])
+    status_minutes: int = 60
+
+
+@dataclass
+class GainerForecastConfig:
+    """How the board's recent motion is measured."""
+    history_minutes: int = 60
+    #: Window the rate of change is measured over, and how far it is projected.
+    slope_minutes: float = 10.0
+    predict_minutes: float = 15.0
+    #: |slope| below this (24h % points per minute) reads as "holding".
+    trend_eps: float = 0.05
+
+
+GROUPS = {"board": GainerBoardConfig, "entry": GainerEntryConfig,
+          "exit": GainerExitConfig, "alerts": GainerAlertsConfig,
+          "forecast": GainerForecastConfig}
+
 
 @dataclass
 class GainerConfig:
@@ -64,39 +166,27 @@ class GainerConfig:
     #: alert, and send NOTHING to the exchange. Independent of the top-level
     #: dry_run, which forces this on when it is true.
     dry_run: bool = True
-    poll_seconds: int = 30
-    top_n: int = 10
-    #: 24h quote volume floor. A $300k coin can top the board on one order.
-    min_quote_volume: float = 10_000_000
-    #: Consecutive polls a new symbol must hold first place before it counts,
-    #: so two coins trading places tick by tick do not open two positions.
-    confirm_polls: int = 2
-    #: False: the leader found at boot is a baseline, not a new leader.
-    trade_on_start: bool = False
-    #: When a position on the current leader closes (stop or take-profit) and
-    #: the symbol is still first, buy it again once its price trades above the
-    #: 24h high recorded at the close. One attempt per new high.
-    reentry_on_new_high: bool = True
+    board: GainerBoardConfig = field(default_factory=GainerBoardConfig)
+    entry: GainerEntryConfig = field(default_factory=GainerEntryConfig)
+    exit: GainerExitConfig = field(default_factory=GainerExitConfig)
+    alerts: GainerAlertsConfig = field(default_factory=GainerAlertsConfig)
+    forecast: GainerForecastConfig = field(default_factory=GainerForecastConfig)
 
-    # -- sizing
-    notional_usdt: float = 5.5
-    target_usd: float = 2.0
-    stop_pct: float = 5.0
-    max_positions: int = 2
-    #: Round-trip cost estimate as % of notional. Added to the take-profit
-    #: distance so the target is NET, and subtracted before calling a position
-    #: "still profitable" when a new leader arrives.
-    fee_pct: float = 0.15
-
-    # -- alerts and monitor
-    milestones_usd: list = field(default_factory=lambda: [1.0, 1.5, 2.0])
-    status_minutes: int = 60
-    history_minutes: int = 60
-    #: Window the rate of change is measured over, and how far it is projected.
-    slope_minutes: float = 10.0
-    predict_minutes: float = 15.0
-    #: |slope| below this (24h % points per minute) reads as "holding".
-    trend_eps: float = 0.05
+    def __post_init__(self):
+        # config.yaml hands each group over as a dict.
+        for name, cls in GROUPS.items():
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, cls())
+            elif isinstance(value, dict):
+                try:
+                    setattr(self, name, cls(**value))
+                except TypeError as e:
+                    valid = ", ".join(sorted(cls.__dataclass_fields__))
+                    raise TypeError(f"bad key under gainer.{name} ({e}). "
+                                    f"Valid keys: {valid}") from None
+            elif not isinstance(value, cls):
+                raise TypeError(f"gainer.{name} must be a block of settings")
 
 
 # ------------------------------------------------------------------ the board
@@ -163,15 +253,15 @@ class GainerBoard:
 
     def update(self, rows: list[Row], now: float) -> None:
         self.rows = rows
-        keep = rows[: self.cfg.top_n * 3]
+        keep = rows[: self.cfg.board.top_n * 3]
         self.history.append((now, {r.symbol: r.change_pct for r in keep}))
-        horizon = now - self.cfg.history_minutes * 60
+        horizon = now - self.cfg.forecast.history_minutes * 60
         while self.history and self.history[0][0] < horizon:
             self.history.popleft()
 
     @property
     def top(self) -> list[Row]:
-        return self.rows[: self.cfg.top_n]
+        return self.rows[: self.cfg.board.top_n]
 
     @property
     def leader(self) -> Row | None:
@@ -182,7 +272,7 @@ class GainerBoard:
         if not self.history or symbol not in self.history[-1][1]:
             return None
         t_now, latest = self.history[-1]
-        target = t_now - self.cfg.slope_minutes * 60
+        target = t_now - self.cfg.forecast.slope_minutes * 60
         base = None
         for t, snap in self.history:
             if symbol in snap:
@@ -196,9 +286,9 @@ class GainerBoard:
     def trend_word(self, slope: float | None) -> str:
         if slope is None:
             return "unknown"
-        if slope > self.cfg.trend_eps:
+        if slope > self.cfg.forecast.trend_eps:
             return "accelerating"
-        if slope < -self.cfg.trend_eps:
+        if slope < -self.cfg.forecast.trend_eps:
             return "fading"
         return "holding"
 
@@ -208,7 +298,7 @@ class GainerBoard:
             return None
         ls = self.slope(lead.symbol, now)
         fc = Forecast(lead.symbol, self.trend_word(ls), ls or 0.0)
-        horizon = self.cfg.predict_minutes
+        horizon = self.cfg.forecast.predict_minutes
         lead_proj = lead.change_pct + (ls or 0.0) * horizon
         best, best_proj = None, lead_proj
         for r in self.top[1:]:
@@ -277,12 +367,17 @@ class GainerMiner:
         self.board = GainerBoard(cfg)
         self.leader = ""                # confirmed leader
         self._candidate = ""
-        self._candidate_polls = 0
+        self._candidate_since = 0.0
         self._baselined = False
         self.tracks: dict[str, Track] = {}
         #: symbol -> price it must trade above to be bought again. 0.0 means
         #: "not known yet": the 24h high on the next poll is taken.
         self.rearm: dict[str, float] = {}
+        #: symbol -> when a gainer position on it last closed, for the cooldown.
+        self.closed_at: dict[str, float] = {}
+        #: The confirmed leader an entry guard held back; re-checked each poll
+        #: while it stays first.
+        self.waiting = ""
         self._last_poll = 0.0
         self._last_status = time.time()
         self._tradable: set = set()
@@ -301,6 +396,7 @@ class GainerMiner:
             return
         self.leader = raw.get("leader", "")
         self.rearm = {s: float(h) for s, h in (raw.get("rearm") or {}).items()}
+        self.closed_at = {s: float(t) for s, t in (raw.get("closed_at") or {}).items()}
         for sym, t in (raw.get("tracks") or {}).items():
             try:
                 self.tracks[sym] = Track(**t)
@@ -314,6 +410,7 @@ class GainerMiner:
             tmp.write_text(json.dumps(
                 {"leader": self.leader,
                  "rearm": self.rearm,
+                 "closed_at": self.closed_at,
                  "tracks": {s: asdict(t) for s, t in self.tracks.items()}},
                 indent=2))
             tmp.replace(self.path)
@@ -335,6 +432,7 @@ class GainerMiner:
             if pos is None:
                 log.info("gainer: %s closed while the bot was down", sym)
                 del self.tracks[sym]
+                self.closed_at[sym] = time.time()
                 self._arm(sym, {})
                 continue
             pos.strategy = STRATEGY
@@ -343,7 +441,7 @@ class GainerMiner:
     # -------------------------------------------------------------------- loop
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        if now - self._last_poll < self.cfg.poll_seconds:
+        if now - self._last_poll < self.cfg.board.poll_seconds:
             return
         self._last_poll = now
         try:
@@ -351,10 +449,12 @@ class GainerMiner:
         except BinanceError as e:
             log.warning("gainer board unavailable: %s", e)
             return
-        rows = rank_board(tickers, self.tradable(now), self.cfg.min_quote_volume)
+        rows = rank_board(tickers, self.tradable(now), self.cfg.board.min_quote_volume)
         if not rows:
             return
         self.board.update(rows, now)
+        self.closed_at = {s: t for s, t in self.closed_at.items()
+                          if now - t < CLOSED_AT_MAX_AGE}
         prices = {r.symbol: r.price for r in rows}
         highs = {}
         for t in tickers or []:
@@ -368,10 +468,11 @@ class GainerMiner:
             except (TypeError, ValueError):
                 pass
 
-        self.sync_tracks(prices, highs)
+        self.sync_tracks(prices, highs, now)
         self.check_leader(now, prices, highs)
         self.check_milestones(prices)
-        if self.cfg.status_minutes and now - self._last_status >= self.cfg.status_minutes * 60:
+        status = self.cfg.alerts.status_minutes
+        if status and now - self._last_status >= status * 60:
             self._last_status = now
             self.send_status(now, prices)
 
@@ -396,30 +497,32 @@ class GainerMiner:
             return
         if not self._baselined:
             self._baselined = True
-            if not self.cfg.trade_on_start:
+            if not self.cfg.entry.trade_on_start:
                 self.leader = lead.symbol
-                self._candidate, self._candidate_polls = lead.symbol, self.cfg.confirm_polls
                 log.info("gainer: baseline leader %s (%+.2f%%); waiting for a new one",
                          lead.symbol, lead.change_pct)
                 self.save()
                 return
         if lead.symbol == self.leader:
-            self._candidate, self._candidate_polls = lead.symbol, 0
+            self._candidate = ""
             self.check_reentry(lead, highs or {})
+            if self.waiting == lead.symbol and lead.symbol not in self.tracks:
+                self.try_enter(lead, now)
             return
         if lead.symbol != self._candidate:
-            self._candidate, self._candidate_polls = lead.symbol, 0
-        self._candidate_polls += 1
-        if self._candidate_polls < self.cfg.confirm_polls:
+            self._candidate, self._candidate_since = lead.symbol, now
+        if now - self._candidate_since < self.cfg.entry.confirm_minutes * 60:
             return
         previous, self.leader = self.leader, lead.symbol
+        self._candidate = ""
+        self.waiting = ""
         self.rearm.clear()          # a new leader is traded by on_new_leader
         self.save()
         self.on_new_leader(lead, previous, now, prices)
 
     def _arm(self, symbol: str, highs: dict) -> None:
         """A position on the leader closed: allow one buy above its 24h high."""
-        if not self.cfg.reentry_on_new_high or symbol != self.leader:
+        if not self.cfg.entry.reentry_on_new_high or symbol != self.leader:
             return
         self.rearm[symbol] = highs.get(symbol, 0.0)
         self.save()
@@ -429,7 +532,7 @@ class GainerMiner:
 
     def check_reentry(self, lead: Row, highs: dict) -> None:
         sym = lead.symbol
-        if not self.cfg.reentry_on_new_high or sym not in self.rearm or sym in self.tracks:
+        if not self.cfg.entry.reentry_on_new_high or sym not in self.rearm or sym in self.tracks:
             return
         high = self.rearm[sym]
         if high <= 0:
@@ -452,41 +555,90 @@ class GainerMiner:
                     f"(was {previous or 'none'})"
                     + (f"\n{fc.text()}" if fc else ""), symbol=lead.symbol)
 
+        self.judge_held(lead.symbol, now, prices)
+
+        if lead.symbol in self.tracks:
+            self.notify(f"{lead.symbol} is back on top; already holding it", symbol=lead.symbol)
+            return
+        self.try_enter(lead, now)
+
+    def judge_held(self, new_leader: str, now: float, prices: dict) -> None:
+        """exit.on_new_leader and exit.min_hold_minutes, for every other position."""
+        ex = self.cfg.exit
         for sym, t in list(self.tracks.items()):
-            if sym == lead.symbol:
+            if sym == new_leader:
                 continue
             px = prices.get(sym, 0.0)
             if px <= 0:
                 self.notify(f"{sym}: no price to judge it by; left open", symbol=sym)
                 continue
-            pnl = net_pnl(t.entry, t.qty, px, self.cfg.fee_pct)
+            pnl = net_pnl(t.entry, t.qty, px, ex.fee_pct)
+            if ex.on_new_leader == "keep":
+                self.notify(f"{sym} KEPT: exit.on_new_leader is keep, so only its stop "
+                            f"and take-profit close it ({pnl:+.2f} USDT)", symbol=sym)
+                continue
+            age_min = (now - t.opened_at) / 60.0
+            if ex.min_hold_minutes > 0 and age_min < ex.min_hold_minutes:
+                self.notify(f"{sym} HELD: opened {age_min:.0f} min ago, under "
+                            f"exit.min_hold_minutes ({ex.min_hold_minutes:g}); its stop "
+                            f"still protects it ({pnl:+.2f} USDT)", symbol=sym)
+                continue
             if pnl > 0:
                 self.notify(f"{sym} KEPT: still profitable {pnl:+.2f} USDT "
                             f"(now {px:,.6g}, entry {t.entry:,.6g})", symbol=sym)
             else:
-                self.close(sym, px, f"no longer leader and not profitable ({pnl:+.2f} USDT)")
-
-        if lead.symbol in self.tracks:
-            self.notify(f"{lead.symbol} is back on top; already holding it", symbol=lead.symbol)
-            return
-        self.open(lead.symbol, lead.price, lead.change_pct)
+                self.close(sym, px, f"no longer leader and not profitable ({pnl:+.2f} USDT)",
+                           now=now)
 
     # ------------------------------------------------------------------- open
+    def entry_blocker(self, lead: Row, now: float) -> str:
+        """Why the confirmed leader should not be bought yet, or '' to buy it."""
+        en = self.cfg.entry
+        closed = self.closed_at.get(lead.symbol)
+        if en.rebuy_cooldown_minutes > 0 and closed is not None:
+            left = en.rebuy_cooldown_minutes * 60 - (now - closed)
+            if left > 0:
+                return (f"sold {(now - closed) / 60:.0f} min ago, inside "
+                        f"entry.rebuy_cooldown_minutes ({en.rebuy_cooldown_minutes:g}; "
+                        f"{left / 60:.0f} min left)")
+        if en.buy_only_if_rising:
+            s = self.board.slope(lead.symbol, now)
+            if s is None:
+                return "not enough board history yet to tell whether it is rising"
+            if s < en.min_rise_pct_per_min:
+                return (f"it is not rising ({s:+.2f} %/min, entry.min_rise_pct_per_min "
+                        f"is {en.min_rise_pct_per_min:g})")
+        return ""
+
+    def try_enter(self, lead: Row, now: float) -> bool:
+        """Buy the leader, or watch it while an entry guard holds it back."""
+        why = self.entry_blocker(lead, now)
+        if why:
+            if self.waiting != lead.symbol:
+                self.waiting = lead.symbol
+                log.info("gainer: waiting on %s -- %s", lead.symbol, why)
+                self.notify(f"{lead.symbol} not bought yet: {why}.\n"
+                            f"Watching it while it stays #1.", symbol=lead.symbol)
+            return False
+        self.waiting = ""
+        return self.open(lead.symbol, lead.price, lead.change_pct)
+
     def refuse(self, symbol: str, why: str) -> None:
         log.info("gainer: not opening %s -- %s", symbol, why)
         self.notify(f"{symbol} NOT opened: {why}", symbol=symbol)
 
     def open(self, symbol: str, price: float, change_pct: float = 0.0) -> bool:
-        cfg, eng = self.cfg, self.engine
-        if len(self.tracks) >= cfg.max_positions:
-            self.refuse(symbol, f"already holding {len(self.tracks)}/{cfg.max_positions} "
+        en, ex, eng = self.cfg.entry, self.cfg.exit, self.engine
+        if len(self.tracks) >= en.max_positions:
+            self.refuse(symbol, f"already holding {len(self.tracks)}/{en.max_positions} "
                                 f"gainer positions")
             return False
         if symbol in eng.book:
             self.refuse(symbol, "another strategy already holds it")
             return False
-        if cfg.target_usd <= 0 or cfg.stop_pct <= 0 or cfg.notional_usdt <= 0:
-            self.refuse(symbol, "gainer target_usd, stop_pct and notional_usdt must all be > 0")
+        if ex.target_usd <= 0 or ex.stop_pct <= 0 or en.notional_usdt <= 0:
+            self.refuse(symbol, "gainer exit.target_usd, exit.stop_pct and "
+                                "entry.notional_usdt must all be > 0")
             return False
 
         try:
@@ -494,9 +646,9 @@ class GainerMiner:
         except (KeyError, BinanceError) as e:
             self.refuse(symbol, f"no symbol filters ({e})")
             return False
-        sized = rules.size_for_notional(cfg.notional_usdt, price)
+        sized = rules.size_for_notional(en.notional_usdt, price)
         if sized is None:
-            self.refuse(symbol, f"${cfg.notional_usdt:.2f} is under the cheapest legal "
+            self.refuse(symbol, f"${en.notional_usdt:.2f} is under the cheapest legal "
                                 f"order (${rules.min_affordable_notional(price):.2f})")
             return False
         qty = float(sized[0])
@@ -554,9 +706,9 @@ class GainerMiner:
 
     def _protect(self, symbol, entry, qty, entry_id, rules, change_pct) -> bool:
         """Stop and take-profit for a filled market entry, or flatten it."""
-        eng, cfg = self.engine, self.cfg
-        sl = float(rules.round_price(stop_price(entry, cfg.stop_pct)))
-        tp = float(rules.round_price(target_price(entry, qty, cfg.target_usd, cfg.fee_pct)))
+        eng, ex = self.engine, self.cfg.exit
+        sl = float(rules.round_price(stop_price(entry, ex.stop_pct)))
+        tp = float(rules.round_price(target_price(entry, qty, ex.target_usd, ex.fee_pct)))
         qty_s = rules.round_qty(qty)
         eng._seq += 1
         stop_id = client_order_id("s", eng._seq)
@@ -603,35 +755,37 @@ class GainerMiner:
                             stop=sl, tp=tp)
 
     def _opened(self, symbol, entry, qty, paper, change_pct, stop=0.0, tp=0.0) -> bool:
-        cfg = self.cfg
-        stop = stop or stop_price(entry, cfg.stop_pct)
-        tp = tp or target_price(entry, qty, cfg.target_usd, cfg.fee_pct)
+        ex = self.cfg.exit
+        stop = stop or stop_price(entry, ex.stop_pct)
+        tp = tp or target_price(entry, qty, ex.target_usd, ex.fee_pct)
         self.tracks[symbol] = Track(symbol, entry, qty, stop, tp, time.time(), paper=paper)
         self.save()
-        loss = net_pnl(entry, qty, stop, cfg.fee_pct)
+        loss = net_pnl(entry, qty, stop, ex.fee_pct)
         self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} (top gainer "
                     f"{change_pct:+.2f}%)\nBUY {qty:g} @ {entry:,.6g}  "
                     f"(${entry * qty:,.2f})\n"
                     f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets "
-                    f"${cfg.target_usd:.2f})\n"
-                    f"SL {stop:,.6g} (-{cfg.stop_pct:g}%, about {loss:+.2f} USDT)",
+                    f"${ex.target_usd:.2f})\n"
+                    f"SL {stop:,.6g} (-{ex.stop_pct:g}%, about {loss:+.2f} USDT)",
                     symbol=symbol, event=Event.TRADE_OPEN)
         return True
 
     # ------------------------------------------------------------------ close
-    def close(self, symbol: str, price: float, why: str) -> None:
+    def close(self, symbol: str, price: float, why: str, now: float | None = None) -> None:
         t = self.tracks.get(symbol)
         if t is None:
             return
-        pnl = net_pnl(t.entry, t.qty, price, self.cfg.fee_pct)
+        pnl = net_pnl(t.entry, t.qty, price, self.cfg.exit.fee_pct)
         if t.paper:
             del self.tracks[symbol]
+            self.closed_at[symbol] = time.time() if now is None else now
             self.save()
             self.notify(f"PAPER CLOSED {symbol} at {price:,.6g} for {pnl:+.2f} USDT\n{why}",
                         symbol=symbol)
             return
         if self.engine.close_position(f"gainer mining -- {why}", symbol=symbol):
             del self.tracks[symbol]
+            self.closed_at[symbol] = time.time() if now is None else now
             self.save()
             self.notify(f"CLOSED {symbol} near {price:,.6g} (about {pnl:+.2f} USDT)\n{why}",
                         symbol=symbol)
@@ -639,15 +793,19 @@ class GainerMiner:
             self.notify(f"{symbol}: close FAILED; its stop and take-profit are still "
                         f"on the exchange\n{why}", symbol=symbol, event=Event.ERROR)
 
-    def sync_tracks(self, prices: dict, highs: dict | None = None) -> None:
+    def sync_tracks(self, prices: dict, highs: dict | None = None,
+                    now: float | None = None) -> None:
         """Resolve paper exits, and forget live ones the exchange already closed."""
         highs = highs or {}
+        now = time.time() if now is None else now
+        ex = self.cfg.exit
         for sym, t in list(self.tracks.items()):
             if not t.paper:
                 if sym not in self.engine.book:
                     # The engine's reconcile has booked it and sent the TP/SL alert.
                     log.info("gainer: %s closed exchange-side", sym)
                     del self.tracks[sym]
+                    self.closed_at[sym] = now
                     self.save()
                     self._arm(sym, highs)
                 continue
@@ -655,9 +813,10 @@ class GainerMiner:
             if px <= 0:
                 continue
             if px >= t.take_profit:
-                self.close(sym, t.take_profit, f"take-profit hit (target ${self.cfg.target_usd:.2f})")
+                self.close(sym, t.take_profit, f"take-profit hit (target ${ex.target_usd:.2f})",
+                           now=now)
             elif px <= t.stop:
-                self.close(sym, t.stop, f"stop-loss hit (-{self.cfg.stop_pct:g}%)")
+                self.close(sym, t.stop, f"stop-loss hit (-{ex.stop_pct:g}%)", now=now)
             else:
                 continue
             if sym not in self.tracks:
@@ -668,8 +827,8 @@ class GainerMiner:
             px = prices.get(sym, 0.0)
             if px <= 0:
                 continue
-            pnl = net_pnl(t.entry, t.qty, px, self.cfg.fee_pct)
-            for m in sorted(float(x) for x in self.cfg.milestones_usd):
+            pnl = net_pnl(t.entry, t.qty, px, self.cfg.exit.fee_pct)
+            for m in sorted(float(x) for x in self.cfg.alerts.milestones_usd):
                 if pnl >= m and m not in t.milestones_hit:
                     t.milestones_hit.append(m)
                     self.save()
@@ -684,7 +843,7 @@ class GainerMiner:
                 px = prices.get(sym, 0.0)
                 rank = next((r.rank for r in self.board.rows if r.symbol == sym), 0)
                 if px > 0:
-                    pnl = net_pnl(t.entry, t.qty, px, self.cfg.fee_pct)
+                    pnl = net_pnl(t.entry, t.qty, px, self.cfg.exit.fee_pct)
                     span = t.take_profit - t.entry
                     prog = (px - t.entry) / span * 100 if span > 0 else 0.0
                     lines.append(f"{sym}: {pnl:+.2f} USDT, {prog:.0f}% to TP, "
@@ -694,6 +853,8 @@ class GainerMiner:
                     lines.append(f"{sym}: no price")
         else:
             lines.append("no open gainer positions")
+        if self.waiting:
+            lines.append(f"watching {self.waiting} (#1, held back by an entry guard)")
         lines.append("")
         lines += self.board.board_lines(now, set(self.tracks))
         fc = self.board.forecast(now)
