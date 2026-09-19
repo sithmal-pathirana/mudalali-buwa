@@ -63,7 +63,9 @@ class RiskManager:
                     f"Restart by hand after reviewing why.")
                 return Decision(False, "daily loss limit")
 
-        if self.state.trades_today >= self.cfg.max_trades_per_day:
+        # 0 = no cap. The daily loss limit above still binds either way.
+        cap = self.cfg.max_trades_per_day
+        if cap > 0 and self.state.trades_today >= cap:
             return Decision(False, f"trade cap reached ({self.cfg.max_trades_per_day}/day)")
 
         return Decision(True)

@@ -101,6 +101,13 @@ class TestGates(unittest.TestCase):
         self.assertFalse(rm.preflight(100.0))
         self.assertFalse(state.halted)                 # a cap pauses; it does not halt
 
+    def test_a_zero_trade_cap_means_no_cap(self):
+        rm, state = fresh(self.tmp, max_trades_per_day=0)
+        state.day_start_equity = 100.0
+        for _ in range(50):
+            rm.record_attempt()
+        self.assertTrue(rm.preflight(100.0))
+
     def test_fills_are_counted_separately_from_attempts(self):
         rm, state = fresh(self.tmp, max_trades_per_day=10)
         rm.record_attempt()

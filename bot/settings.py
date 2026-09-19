@@ -82,7 +82,7 @@ EDITABLE: dict[str, Setting] = {
         Setting("risk.daily_loss_limit_pct", "float",
                 "drawdown that halts the day", lo=1.0, hi=100.0),
         Setting("risk.max_trades_per_day", "int",
-                "hard cap on entries per day", lo=1, hi=200),
+                "hard cap on entries per day; 0 = no cap", lo=0, hi=200),
         Setting("risk.min_equity_usdt", "float",
                 "permanent floor; below this the bot stops for good",
                 lo=0.0, hi=100000.0),

@@ -73,10 +73,11 @@ risk:
   # average 2026-09-18 loss to ~0.4R, so about fourteen ordinary losers. 10%
   # would have let one bad day take $10.
   daily_loss_limit_pct: 3.0
-  # Back to a conservative 6 (was 20, which matched the aggressive maximum
-  # profile). Six attempts a day at 3.5% each cannot outrun the 10% daily loss
-  # limit above, so that limit stays the thing that actually binds.
-  max_trades_per_day: 12
+  # Entries sent per day, filled or not; 0 = no cap. OFF (0) for the demo from
+  # 2026-09-19 at the user's request, to gather more trades on the new
+  # settings. What still limits activity: the daily loss limit above, the
+  # portfolio's 2% total risk (4 slots), and the 2h coin cooldown. Was 12.
+  max_trades_per_day: 0
   # Raised from 1.70 to match this risk profile rather than the exchange's
   # hard limit. At 3.5% over a 7% stop the order size is equity x 0.5, so
   # below $10.00 it no longer reaches the $5 exchange minimum and every signal

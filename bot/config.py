@@ -21,7 +21,7 @@ class RiskConfig:
     risk_per_trade_pct: float = 2.0        # % of equity risked between entry and stop
     max_position_pct: float = 100.0        # cap on notional as % of equity * leverage
     daily_loss_limit_pct: float = 5.0      # halt for the day past this drawdown
-    max_trades_per_day: int = 10
+    max_trades_per_day: int = 10            # 0 = no cap
     min_equity_usdt: float = 10.0          # below this the bot stops permanently
     allow_averaging_down: bool = False     # keep False; see README
     entry_expiry_minutes: int = 60         # cancel a limit entry that never fills
