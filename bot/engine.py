@@ -37,6 +37,7 @@ from .stream import BarClosed, Disconnected, MarketStream, OrderUpdate, StreamSt
 from .strategies import build
 from .strategies.base import Bar
 from .strategies.trend_atr import atr as true_range
+from .context import closed_closes, trend_direction
 from .journal import SupervisorReview, TradeJournal, describe as describe_review, position_report
 from .protect import plan_protection, stop_room
 from .supervise import Reading, supervise
@@ -1814,6 +1815,36 @@ class Engine:
         cache[symbol] = (time.time(), bars)
         return bars
 
+    #: How long a slower-chart trend reading is reused. A 4h bar closes six
+    #: times a day; re-reading it every 20-second tick would be ~700 requests
+    #: to learn the same number.
+    HIGHER_TREND_MAX_AGE = 300.0
+
+    def higher_trend(self, symbol: str) -> int:
+        """
+        The slower chart's trend for `symbol` (bot/context.py): +1 up, -1
+        down, 0 flat -- and 0 when it cannot be read, so a failed request
+        never blocks a trade or changes how one is supervised.
+        """
+        cache = getattr(self, "_higher_trend", None)
+        if cache is None:
+            cache = self._higher_trend = {}
+        hit = cache.get(symbol)
+        if hit and time.time() - hit[0] < self.HIGHER_TREND_MAX_AGE:
+            return hit[1]
+        tc = self.cfg.context.trend
+        try:
+            raw = self.api.klines(symbol, tc.interval,
+                                  limit=tc.sma_bars + tc.slope_bars + 2)
+            closes = closed_closes(raw, int(time.time() * 1000))
+            trend = trend_direction(closes, tc.sma_bars, tc.slope_bars)
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError,
+                IndexError) as e:
+            log.debug("%s %s trend unavailable: %s", symbol, tc.interval, e)
+            return hit[1] if hit else 0
+        cache[symbol] = (time.time(), trend)
+        return trend
+
     def scale_out_qty(self, pos) -> float:
         """
         The quantity to leave on the take-profit when splitting the position,
@@ -1868,9 +1899,12 @@ class Engine:
         w = int(cfg.horizon.drift_window_bars)
         drift = ((price - bars[-w].close) / w) if len(bars) >= w and w > 0 else 0.0
         age = (time.time() * 1000 - pos.opened_ms) / 1000.0 if pos.opened_ms else 0.0
+        # Read only when patience can use it: one cached request per symbol.
+        higher = self.higher_trend(pos.symbol) if cfg.patience.enabled else 0
         reading = Reading(price=price, atr=a, efficiency=er, age_seconds=age,
                           net_move_per_bar=drift,
-                          bar_seconds=self.interval_seconds())
+                          bar_seconds=self.interval_seconds(),
+                          higher_trend=higher)
         plan = supervise(pos, reading, cfg, scale_out_qty=self.scale_out_qty(pos))
         if plan:
             self.apply_plan(pos, plan, price)
@@ -3062,6 +3096,15 @@ class Engine:
     def place(self, signal, notional: float, risk_note: str,
               symbol: str | None = None, atr_pct: float = 0.0) -> None:
         symbol = symbol or self.cfg.symbol
+        if self.cfg.context.entry.block_against_trend:
+            trend = self.higher_trend(symbol)
+            side = 1 if signal.side == "BUY" else -1
+            if trend == -side:
+                log.info("%s %s skipped: the %s trend is %s (context.entry."
+                         "block_against_trend)", symbol, signal.side,
+                         self.cfg.context.trend.interval,
+                         "down" if trend < 0 else "up")
+                return
         rules = self.rules if symbol == self.cfg.symbol else self.rules_for(symbol)
         sized = rules.size_for_notional(notional, signal.entry)
         if sized is None:

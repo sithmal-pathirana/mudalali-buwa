@@ -63,6 +63,9 @@ class Reading:
     age_seconds: float = 0.0
     #: Length of one bar, for converting the horizon into a bar count.
     bar_seconds: float = 900.0
+    #: The slower chart's trend (bot/context.py), in MARKET terms: +1 up,
+    #: -1 down, 0 flat or not read. Only supervise.patience uses it.
+    higher_trend: int = 0
 
 
 @dataclass
@@ -153,8 +156,23 @@ class FailedBreakoutConfig:
     enabled: bool = True
 
 
+@dataclass
+class PatienceConfig:
+    #: While the slower chart's trend (context.trend) is behind the trade, the
+    #: early exits below are skipped and the trade is left to its stop, its
+    #: take-profit, break-even and the runner. With no clear trend, or one
+    #: against the trade, every rule runs as usual. OFF by default: measured
+    #: only by replay so far.
+    enabled: bool = False
+    skip_cut_losers: bool = True
+    skip_harvest: bool = True
+    skip_failed_breakout: bool = True
+    skip_bank_turning_profit: bool = False
+
+
 GROUPS = {"breakeven": BreakevenConfig, "runner": RunnerConfig,
           "horizon": HorizonConfig, "failed_breakout": FailedBreakoutConfig,
+          "patience": PatienceConfig,
           "protect": ProtectConfig, "monitor": MonitorConfig}
 
 
@@ -177,6 +195,7 @@ class SuperviseConfig:
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     horizon: HorizonConfig = field(default_factory=HorizonConfig)
     failed_breakout: FailedBreakoutConfig = field(default_factory=FailedBreakoutConfig)
+    patience: PatienceConfig = field(default_factory=PatienceConfig)
     #: The protection watchdog (bot/protect.py): puts back a missing stop or
     #: take-profit on any open position, adopting untracked ones.
     protect: ProtectConfig = field(default_factory=ProtectConfig)
@@ -296,6 +315,16 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
     r_now = favour(pos, price) / r_unit
     r_peak = favour(pos, peak) / r_unit
     in_profit = favour(pos, price) > cost
+    # Patience: the slower chart is trending the trade's way, so the early
+    # exits that are switched to skip stand aside for this tick.
+    pat = cfg.patience
+    patient = pat.enabled and reading.higher_trend == sign
+    cut_losers = cfg.horizon.cut_losers and not (patient and pat.skip_cut_losers)
+    harvest = cfg.horizon.harvest and not (patient and pat.skip_harvest)
+    bank_turning = (cfg.horizon.bank_turning_profit
+                    and not (patient and pat.skip_bank_turning_profit))
+    failed_breakout = (cfg.failed_breakout.enabled
+                       and not (patient and pat.skip_failed_breakout))
 
     # ---------------------------------------------------------------- rule 1
     if cfg.breakeven.enabled and r_peak >= cfg.breakeven.at_r:
@@ -357,7 +386,7 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
 
         if bars_needed > horizon_bars:
             if not in_profit:
-                if hz.cut_losers:
+                if cut_losers:
                     plan.exit_now = True
                     plan.note(f"target needs {bars_needed:.0f} bars against a "
                               f"{horizon_bars:.0f}-bar horizon and the trade is "
@@ -366,11 +395,11 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
                 # In profit and the market has turned. This is the case worth
                 # the most: take what the trade can actually give rather than
                 # holding out for a number it is now walking away from.
-                if hz.bank_turning_profit:
+                if bank_turning:
                     plan.exit_now = True
                     plan.note(f"in profit at {r_now:.2f}R and drifting away "
                               f"from the target; banking it")
-            elif hz.harvest:
+            elif harvest:
                 reachable = price + sign * horizon_bars * drift
                 pull = _pull_in(pos, pos.take_profit, reachable)
                 if pull is not None and favour(pos, pull) > cost:
@@ -396,7 +425,7 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
     # Only ever banks a profit. A breakout that has failed AND is underwater is
     # left to the stop: exiting at market there converts a maybe into a certain
     # loss at a worse price than the stop that is already resting.
-    if (cfg.failed_breakout.enabled and pos.ref_level and in_profit
+    if (failed_breakout and pos.ref_level and in_profit
             and not plan.exit_now):
         given_back = (price - pos.ref_level) * sign <= 0
         if given_back:

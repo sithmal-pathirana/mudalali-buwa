@@ -148,6 +148,11 @@ EDITABLE: dict[str, Setting] = {
         Setting("supervise.failed_breakout.enabled", "bool",
                 "rule 4: take the profit when price falls back through the "
                 "level the breakout broke"),
+        Setting("supervise.patience.enabled", "bool",
+                "while the 4h trend is behind a trade, skip the supervisor's "
+                "early exits and leave it to its stop and take-profit"),
+        Setting("context.entry.block_against_trend", "bool",
+                "refuse a new trade against the 4h trend"),
         Setting("supervise.monitor.review_exits", "bool",
                 "score every supervisor exit against what holding would have "
                 "done (data/supervisor_review.csv)"),

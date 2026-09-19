@@ -263,6 +263,23 @@ supervise:
   failed_breakout:
     enabled: true
 
+  # PATIENCE -- while the 4h trend (context.trend below) is behind the trade,
+  # skip the early exits named here and leave the trade to its stop, its
+  # take-profit, break-even and the runner. No clear 4h trend, or one against
+  # the trade: every rule runs as usual. Why: replayed on the 53 past trades,
+  # the supervisor cut good trades early when the 4h trend was behind them
+  # (+0.6R supervised vs +9.7R held) but protected well without one (+4.1R
+  # vs +0.2R). With context.entry.block_against_trend, the replay goes from
+  # +4.5R to +9.3R; 9 other 4h trend definitions all land between +6.9R and
+  # +11.2R. The cost: losers it would have cut are held to their stop, so the
+  # average loss rises from -0.47R to -0.74R. OFF until tested on the demo.
+  patience:
+    enabled: false
+    skip_cut_losers: true
+    skip_harvest: true
+    skip_failed_breakout: true
+    skip_bank_turning_profit: false
+
   # THE PROTECTION WATCHDOG (bot/protect.py). About once a minute, halted or
   # not, every open position is checked for a stop-loss AND a take-profit on
   # the exchange, and whatever is missing is put back. Added after 2026-09-19:
@@ -319,6 +336,22 @@ supervise:
     report_minutes: 60       # open-positions report while anything is open; 0 = off
     review_exits: true
     review_hours: 24         # score at the last price if neither level is reached
+
+# THE BIGGER PICTURE (bot/context.py). The strategy and the supervisor read
+# 15m bars; this reads a slower chart's trend: up when the last close is above
+# its sma_bars average and that average is rising over slope_bars, down the
+# other way, flat otherwise. Read from closed bars only, cached 5 minutes.
+# Used by supervise.patience above and by the entry filter here.
+context:
+  trend:
+    interval: 4h             # 1h replayed as almost useless: 49 of 53 breakouts already agree with it
+    sma_bars: 20
+    slope_bars: 5
+  entry:
+    # Refuse a trade against the 4h trend; a flat or unreadable trend never
+    # blocks. Replay: 4 of 53 past trades were against it (-4.0R held to
+    # stop/target). OFF until tested on the demo.
+    block_against_trend: false
 
 # GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
 # buy it with a take-profit that nets exit.target_usd and a stop exit.stop_pct

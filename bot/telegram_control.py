@@ -77,7 +77,8 @@ SETTINGS  (written to config.yaml, applied on restart)
 /supervisor           every supervisor ability and whether it is on
 /supervisor on|off    turn the whole supervisor on or off
 /supervisor <name> on|off  one ability: breakeven, runner, horizon,
-                      cutlosers, bankturn, harvest, breakout, review
+                      cutlosers, bankturn, harvest, breakout, patience,
+                      trendfilter, review
 /supervisor report <minutes>  position report interval (0 = off)
 /gainer               gainer mining settings and their values
 /gainer <name> <value> change one: size, confirm, rising, minrise,
@@ -394,6 +395,8 @@ class TelegramControl:
         "bankturn": "supervise.horizon.bank_turning_profit",
         "harvest": "supervise.horizon.harvest",
         "breakout": "supervise.failed_breakout.enabled",
+        "patience": "supervise.patience.enabled",
+        "trendfilter": "context.entry.block_against_trend",
         "review": "supervise.monitor.review_exits",
         "report": "supervise.monitor.report_minutes",
     }
