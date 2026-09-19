@@ -554,7 +554,10 @@ class TelegramControl:
             "",
             f"equity      ${s.get('equity', 0):,.2f}",
             f"price       {s.get('price', 0):,.4f}",
-            f"today       {s.get('realized_today', 0):+.2f} USDT",
+            f"today       {s.get('realized_today', 0):+.2f} USDT"
+            + (f" ({s['realized_pct_of_equity']:+.2f}%)"
+               if s.get("day_start_equity") else ""),
+            f"since start {s.get('since_restart', 0.0):+.2f} USDT",
             f"trades      {s.get('trades_today', 0)} today",
             f"day ends in {s.get('day_ends_in', '?')}",
             f"feed        {s.get('feed') or ('live' if s.get('stream_ok') else 'DOWN')}",
@@ -590,6 +593,21 @@ class TelegramControl:
     def _send_pnl(self) -> None:
         s = self.read()
         realized = s.get("realized_today", 0.0)
+        since = s.get("since_restart")
+        since_line = ("" if since is None else
+                      f"\nsince restart {since:+.2f} USDT"
+                      + (f" ({s['session_started']})" if s.get("session_started") else ""))
+        if not s.get("stop_when_reached", True):
+            # The daily target is off: a "$x of $2.00" bar reads as a rule the
+            # bot is following. Report against the equity actually at stake.
+            eq = s.get("day_start_equity") or s.get("equity") or 0.0
+            pct = s.get("realized_pct_of_equity", 0.0)
+            self.send(f"day {s.get('day', '?')}\n"
+                      f"today {realized:+.2f} USDT"
+                      + (f" ({pct:+.2f}% of ${eq:,.2f} equity)" if eq else "")
+                      + since_line
+                      + "\n\ndaily target off (targets.stop_when_reached false)")
+            return
         target = s.get("target", 0.0)
         pct = s.get("target_pct", 0.0)
         filled = max(0, min(20, int(pct / 100 * 20)))
@@ -601,7 +619,7 @@ class TelegramControl:
             msg += ("\n\nTarget banked. "
                     + ("No further trades today." if s.get("stop_when_reached")
                        else "Still trading."))
-        self.send(msg)
+        self.send(msg + since_line)
 
     def _strategy(self, arg: str) -> None:
         s = self.read()

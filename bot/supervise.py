@@ -32,6 +32,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .journal import MonitorConfig
+from .protect import ProtectConfig
+
 
 @dataclass
 class Reading:
@@ -125,6 +128,36 @@ class SuperviseConfig:
 
     # -- rule 4
     failed_breakout_exit: bool = True
+
+    #: The protection watchdog (bot/protect.py): puts back a missing stop or
+    #: take-profit on any open position, adopting untracked ones.
+    protect: ProtectConfig = field(default_factory=ProtectConfig)
+    #: Hourly position report, trade journal and supervisor-exit review
+    #: (bot/journal.py).
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
+
+    def __post_init__(self):
+        if self.monitor is None:
+            self.monitor = MonitorConfig()
+        elif isinstance(self.monitor, dict):
+            try:
+                self.monitor = MonitorConfig(**self.monitor)
+            except TypeError as e:
+                valid = ", ".join(sorted(MonitorConfig.__dataclass_fields__))
+                raise TypeError(f"bad key under supervise.monitor ({e}). "
+                                f"Valid keys: {valid}") from None
+        # config.yaml hands the group over as a dict.
+        if self.protect is None:
+            self.protect = ProtectConfig()
+        elif isinstance(self.protect, dict):
+            try:
+                self.protect = ProtectConfig(**self.protect)
+            except TypeError as e:
+                if "supervise.protect" in str(e):
+                    raise
+                valid = ", ".join(sorted(ProtectConfig.__dataclass_fields__))
+                raise TypeError(f"bad key under supervise.protect ({e}). "
+                                f"Valid keys: {valid}") from None
 
 
 def _sign(pos) -> int:

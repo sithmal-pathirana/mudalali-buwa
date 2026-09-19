@@ -20,7 +20,7 @@
 # halted on risk.min_equity_usdt until the account is actually funded to $12.
 # ############################################################################
 
-mode: live              # testnet | live   (testnet uses fake money on real markets)
+mode: testnet           # testnet | live   (testnet uses fake money on real markets)
 dry_run: false         # true = log intended orders, send nothing. Your first run.
 
 # Live futures WEBSOCKETS ARE SILENT FROM THIS HOST -- `run.py netcheck` reports
@@ -92,7 +92,13 @@ risk:
   # Trade as if the account held this much, whatever the real balance is.
   # 0 = use the real balance. MUST NOT be left at a testnet rehearsal value:
   # at 100.0 the bot sizes for $100 it does not have.
-  equity_cap_usdt: 0.0
+  equity_cap_usdt: 100.0
+  # true: the capped equity starts at the cap and then moves with every real
+  # gain and loss, like a funded account. false: it reads exactly the cap
+  # forever, so on the 5,000 USDT testnet the equity floor and the daily loss
+  # limit could never trigger. Rehearsing the 2026-09-25 $100 go-live needs
+  # true. Has no effect when equity_cap_usdt is 0 (live).
+  equity_cap_tracks_pnl: true
 
 # Daily profit targets. stop_when_reached is the real mechanism behind
 # "guarantee the profit": once the day's target is banked the bot stops
@@ -219,6 +225,62 @@ supervise:
   # positions have no recorded level, so it is off for them.
   failed_breakout_exit: true
 
+  # THE PROTECTION WATCHDOG (bot/protect.py). About once a minute, halted or
+  # not, every open position is checked for a stop-loss AND a take-profit on
+  # the exchange, and whatever is missing is put back. Added after 2026-09-19:
+  # an STGUSDT stop was refused (-2021) after its entry had already filled,
+  # the halt path reported "Nothing is open", and 71 STG sat with no stop for
+  # four hours while the bot only logged "NOT tracking".
+  #
+  # Which levels it places, in order:
+  #   1. the ones the trade was opened with, if the market still allows them
+  #   2. none -- CLOSE at market -- if price is already past the planned stop:
+  #      the trade is over by its own rule, and a wider stop would be a risk
+  #      it was never sized for
+  #   3. otherwise, rebuilt from the symbol's current behaviour: stop.atr_mult
+  #      ATRs from the mark, take-profit target.atr_mult ATRs away (pulled in
+  #      to target.choppy_atr_mult when the market is choppy)
+  protect:
+    watch:
+      enabled: true
+      # Take over a position the bot is not tracking (a lost fill, a manual
+      # trade): track it, protect it and let the supervisor manage it,
+      # instead of only warning every minute.
+      adopt_untracked: true
+    stop:
+      atr_mult: 2.0          # = params.trend.atr_stop_mult, the strategy's own distance
+      fallback_pct: 3.0      # used when the symbol's bars cannot be read
+      min_gap_pct: 0.5       # never nearer the mark than this; nearer is the STG -2021
+    target:
+      atr_mult: 3.0          # = params.trend.atr_target_mult
+      # Below this efficiency ratio (= params.regime.range_below) the market
+      # is ranging and a trend-sized target will not arrive; aim nearer.
+      choppy_below_efficiency: 0.20
+      choppy_atr_mult: 1.5
+      min_gap_pct: 0.3
+    failure:
+      # A stop still refused after this many attempts (one a minute): close
+      # at market. A position that cannot be protected is not held. 0 = only
+      # alert, never close.
+      close_after_attempts: 3
+    entry:
+      # Skip an entry when the price has moved since the signal so that less
+      # than this fraction of the planned entry-to-stop distance is left. STG
+      # had 0.19 left (fill 0.1523, stop 0.1513, planned from 0.1566).
+      min_stop_room_frac: 0.5
+
+  # THE SUPERVISOR'S REPORT CARD (bot/journal.py). Every closed trade is
+  # written to data/trades.csv. After every supervisor exit the bot keeps
+  # watching that coin and records whether holding would have hit the
+  # ORIGINAL stop or target first (data/supervisor_review.csv), with a
+  # running "exits vs holding" total in Telegram. On 2026-09-18 that was
+  # roughly even: +$1.02 saved on losers, -$1.15 given up on winners -- one
+  # day is not enough to tune on; a week of this is.
+  monitor:
+    report_minutes: 60       # open-positions report while anything is open; 0 = off
+    review_exits: true
+    review_hours: 24         # score at the last price if neither level is reached
+
 # GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
 # buy it with a take-profit that nets exit.target_usd and a stop exit.stop_pct
 # below. When another coin takes #1, open that too, and judge every other
@@ -237,7 +299,7 @@ supervise:
 # (size, confirm, rising, minrise, cooldown, target, onleader, hold).
 # The startup log prints the settings in force.
 gainer:
-  enabled: true
+  enabled: false
   # true is PAPER: nothing is sent, fills and exits are simulated.
   dry_run: false
 

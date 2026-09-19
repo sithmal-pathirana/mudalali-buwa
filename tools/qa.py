@@ -357,15 +357,23 @@ class _StubAPI:
     def positions(self, s=None):
         if self._amt == 0.0:
             return []
-        return [{"positionAmt": str(self._amt), "entryPrice": "0.09",
+        # The real client names the symbol on every row; reconcile_book keys
+        # on it. This stub only ever holds DOGEUSDT.
+        return [{"symbol": s or "DOGEUSDT",
+                 "positionAmt": str(self._amt), "entryPrice": "0.09",
                  "unRealizedProfit": "-1.0", "liquidationPrice": "0.05"}]
 
     # Conditional orders live on the algo endpoint since the Binance migration,
     # so the stub splits them out the way the exchange now does: "s"/"t" ids are
     # algo, "e" (entry) stays a plain limit order.
     def _rows(self, ids):
-        return [{"clientOrderId": i, "side": "SELL", "type": "STOP_MARKET",
+        return [{"symbol": "DOGEUSDT", "clientOrderId": i, "side": "SELL",
+                 "type": "STOP_MARKET" if not str(i).startswith("t-")
+                 else "TAKE_PROFIT_MARKET",
                  "origQty": "100", "price": "0"} for i in ids]
+
+    def user_trades(self, symbol, start_ms=None, limit=1000):
+        return []
 
     def open_orders(self, s=None):
         return self._rows([i for i in self._open
@@ -754,8 +762,12 @@ def layer_audit(report, args):
             e.place(Signal("BUY", entry=0.0900, stop=0.0882, take_profit=0.0954), 20.0, "n")
         except KeyboardInterrupt:
             pass
+        # A -2021 with the entry cancelled before it filled is a trade that no
+        # longer exists: skipped, not halted (since the STGUSDT fix of
+        # 2026-09-19). The property this probes is unchanged -- nothing is
+        # left open without a stop. Other refusals still halt; tests cover it.
         cancelled = any(c[0] == "cancel_all" for c in api.calls)
-        return (cancelled and e.state.halted and e.active is None), (
+        return (cancelled and e.active is None and not e.book), (
             f"cancelled={cancelled} halted={e.state.halted} active={e.active is not None}")
 
     # -- A13 --------------------------------------------------------------

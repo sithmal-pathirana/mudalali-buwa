@@ -131,9 +131,28 @@ class TestCrossedLevelsAreSkippedNotHalted(unittest.TestCase):
         e.place(AKE_SHORT, 8.54, "n")
         self.assertIn(e.cfg.symbol, e.book)
 
-    def test_the_halt_still_backs_it_up_and_names_the_leg(self):
-        """No mark price: the check steps aside and the halt still fires."""
+    def test_a_refused_leg_with_nothing_filled_is_a_skipped_trade(self):
+        """No mark price: the check steps aside, Binance refuses the leg with
+        -2021, and the entry is cancelled before it fills. The trade no longer
+        exists -- that is a skip, not a halt (changed after STGUSDT,
+        2026-09-19, when this halt blocked the bot for a day)."""
         api = _PlaceAPI(mark=None, fail_type="TAKE_PROFIT_MARKET")
+        e = _placing(api)
+        e.place(AKE_SHORT, 8.54, "n")
+        self.assertFalse(e.state.halted)
+        self.assertTrue(api.cancelled_everything)
+        self.assertNotIn(e.cfg.symbol, e.book)
+        self.assertTrue([b for _, b in e.sent if "take-profit" in b
+                         and "nothing is open" in b])
+
+    def test_any_other_refusal_still_halts_and_names_the_leg(self):
+        api = _PlaceAPI(mark=None)
+
+        def refuse(**kw):
+            if kw.get("type") == "TAKE_PROFIT_MARKET":
+                raise BinanceError(-2019, "Margin is insufficient.", "/algoOrder")
+            return {"algoStatus": "NEW"}
+        api.algo_order = refuse
         e = _placing(api)
         e.place(AKE_SHORT, 8.54, "n")
         self.assertTrue(e.state.halted)

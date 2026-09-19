@@ -40,6 +40,11 @@ class State:
     schedule_start_date: str = ""      # ISO date of day 1, for the target schedule
     target_reached_today: bool = False
     strategy_override: str = ""        # "" = automatic regime routing
+    # risk.equity_cap_tracks_pnl: the REAL equity when the rehearsal began,
+    # and the cap it began under. Effective equity is cap + (actual - anchor),
+    # so a testnet rehearsal gains and loses like the account it rehearses.
+    cap_anchor_equity: float = 0.0
+    cap_anchor_cap: float = 0.0
 
     path: Path = field(default=STATE_PATH, repr=False)
 

@@ -62,6 +62,10 @@ class ActivePosition:
     #: Set once the position has been split: part banked at the original
     #: target, the remainder left to run on a trail with no ceiling.
     runner: bool = False
+    #: Why the bot closed it, when the bot did ("supervisor -- ...",
+    #: "protection watchdog -- ..."). Empty for a stop or take-profit that
+    #: filled on the exchange. Recorded in data/trades.csv.
+    exit_reason: str = ""
     #: Whether the entry order is known to have FILLED. Entries rest as GTC
     #: limits, so a position exists in this book from the moment the order is
     #: placed -- which is not the moment there is anything to manage. Until

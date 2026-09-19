@@ -34,6 +34,12 @@ class RiskConfig:
     #: sizing decision unrepresentative of the account you actually intend to
     #: fund -- and hides the minimum-order constraint entirely.
     equity_cap_usdt: float = 0.0
+    #: With a cap set: start at the cap and then follow the account's real
+    #: gains and losses (cap + actual - actual-when-started), instead of
+    #: reading exactly the cap forever. A fixed cap on a 5,000 USDT testnet
+    #: can never fall, so the equity floor and the equity side of the daily
+    #: loss limit could never fire -- the rehearsal did not rehearse them.
+    equity_cap_tracks_pnl: bool = False
     #: Round a too-small position UP to the exchange minimum instead of skipping
     #: it. Off in the safe profile, where refusing is right: the account cannot
     #: afford the trade at the stated risk, so it should not take it. Aggressive

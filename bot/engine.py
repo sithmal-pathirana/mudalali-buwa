@@ -37,6 +37,8 @@ from .stream import BarClosed, Disconnected, MarketStream, OrderUpdate, StreamSt
 from .strategies import build
 from .strategies.base import Bar
 from .strategies.trend_atr import atr as true_range
+from .journal import SupervisorReview, TradeJournal, describe as describe_review, position_report
+from .protect import plan_protection, stop_room
 from .supervise import Reading, supervise
 from .targets import TargetSchedule, format_duration, seconds_to_day_end
 
@@ -153,12 +155,26 @@ class Engine:
     _prepared: set = None
     #: bot/gainer.py's GainerMiner when gainer.enabled, else None
     gainer = None
+    #: Net realised P&L booked since this process started, and when it did.
+    #: In memory on purpose: "since the last restart" resets with the process.
+    session_realized = 0.0
+    session_started = 0.0
+    #: bot/journal.py, created in __init__ (None in tests built without it)
+    journal = None
+    review = None
+    _last_review_check = 0.0
+    _last_position_report = 0.0
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.api = Binance(cfg.api_key, cfg.api_secret, testnet=cfg.testnet)
         self.state = State.load()
         self.risk = RiskManager(cfg, self.state)
+        self.session_realized = 0.0
+        self.session_started = time.time()
+        self.journal = TradeJournal()
+        self.review = SupervisorReview()
+        self._last_position_report = time.time()
         self.strategy = build(cfg.strategy, cfg.params)
         self.notify = Notifier.from_config(cfg)
         self.schedule = TargetSchedule.from_config(cfg.targets)
@@ -308,6 +324,75 @@ class Engine:
             return RISK_UNKNOWN
         return gap
 
+    @staticmethod
+    def protective_legs(orders: list) -> tuple[dict | None, dict | None]:
+        """(stop, take-profit) among one symbol's open orders, None if absent.
+
+        A TRAILING_STOP_MARKET counts as the stop. The entry is a plain LIMIT,
+        so it is never mistaken for either.
+        """
+        stop_o = tp_o = None
+        for o in orders:
+            kind = (o.get("type") or "").upper()
+            if "TAKE_PROFIT" in kind:
+                tp_o = tp_o or o
+            elif "STOP" in kind:
+                stop_o = stop_o or o
+        return stop_o, tp_o
+
+    def adopt_row(self, row: dict, orders: list) -> ActivePosition:
+        """Track one position the exchange holds, from its row in positions()
+        and that symbol's open orders. See adopt_open_positions."""
+        symbol = row["symbol"]
+        amt = float(row["positionAmt"])
+        stop_o, tp_o = self.protective_legs(orders)
+
+        def price_of(o):
+            try:
+                return float(o.get("stopPrice") or 0.0) if o else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        pos = ActivePosition(
+            symbol=symbol,
+            side="BUY" if amt > 0 else "SELL",
+            entry=float(row.get("entryPrice") or 0.0),
+            stop=price_of(stop_o),
+            take_profit=price_of(tp_o),
+            qty=abs(amt),
+            # Synthetic, and deliberately not empty: reconcile_position
+            # intersects these ids with the open-order list, and a blank
+            # would collide with any order whose id failed to normalise.
+            entry_order_id=f"adopted-{symbol}",
+            stop_order_id=(stop_o or {}).get("clientOrderId", ""),
+            tp_order_id=(tp_o or {}).get("clientOrderId", ""),
+            tag=f"adopted-{symbol}",
+            opened_ms=(self.opened_ms_for(symbol)
+                       or int(row.get("updateTime") or 0)),
+            # 1R, or RISK_UNKNOWN -- see adopted_risk above. The stop as
+            # adopted is pinned too, but it is consulted only when the gap
+            # is still a plausible original.
+            # ref_level stays 0: the strategy that opened this position is
+            # not around to say what it broke, so the failed-breakout rule
+            # stays off for adopted trades.
+            initial_stop=price_of(stop_o),
+            initial_target=price_of(tp_o),
+            initial_risk=self.adopted_risk(
+                float(row.get("entryPrice") or 0.0), price_of(stop_o),
+                symbol),
+            # The exchange says this position is open, so it is.
+            filled=True)
+        self.book[symbol] = pos
+        # Margin type and leverage are already whatever this position was
+        # opened with, and Binance rejects changing either while it is
+        # open. Marking it prepared skips a call that can only fail.
+        if getattr(self, "_prepared", None) is not None:
+            self._prepared.add(symbol)
+        log.warning("adopted %s %s %g @ %.6f (stop %.6f, tp %.6f)",
+                    symbol, pos.side, pos.qty, pos.entry, pos.stop,
+                    pos.take_profit)
+        return pos
+
     def adopt_open_positions(self) -> int:
         """
         Rebuild the book from what the exchange says is actually open.
@@ -343,61 +428,9 @@ class Engine:
 
         unprotected = []
         for row in live:
-            symbol = row["symbol"]
-            amt = float(row["positionAmt"])
-            stop_o = tp_o = None
-            for o in by_symbol.get(symbol, []):
-                kind = (o.get("type") or "").upper()
-                if "TAKE_PROFIT" in kind:
-                    tp_o = tp_o or o
-                elif "STOP" in kind:
-                    stop_o = stop_o or o
-
-            def price_of(o):
-                try:
-                    return float(o.get("stopPrice") or 0.0) if o else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
-
-            pos = ActivePosition(
-                symbol=symbol,
-                side="BUY" if amt > 0 else "SELL",
-                entry=float(row.get("entryPrice") or 0.0),
-                stop=price_of(stop_o),
-                take_profit=price_of(tp_o),
-                qty=abs(amt),
-                # Synthetic, and deliberately not empty: reconcile_position
-                # intersects these ids with the open-order list, and a blank
-                # would collide with any order whose id failed to normalise.
-                entry_order_id=f"adopted-{symbol}",
-                stop_order_id=(stop_o or {}).get("clientOrderId", ""),
-                tp_order_id=(tp_o or {}).get("clientOrderId", ""),
-                tag=f"adopted-{symbol}",
-                opened_ms=(self.opened_ms_for(symbol)
-                           or int(row.get("updateTime") or 0)),
-                # 1R, or RISK_UNKNOWN -- see adopted_risk above. The stop as
-                # adopted is pinned too, but it is consulted only when the gap
-                # is still a plausible original.
-                # ref_level stays 0: the strategy that opened this position is
-                # not around to say what it broke, so the failed-breakout rule
-                # stays off for adopted trades.
-                initial_stop=price_of(stop_o),
-                initial_target=price_of(tp_o),
-                initial_risk=self.adopted_risk(
-                    float(row.get("entryPrice") or 0.0), price_of(stop_o),
-                    symbol),
-                # The exchange says this position is open, so it is.
-                filled=True)
-            self.book[symbol] = pos
-            # Margin type and leverage are already whatever this position was
-            # opened with, and Binance rejects changing either while it is
-            # open. Marking it prepared skips a call that can only fail.
-            self._prepared.add(symbol)
+            pos = self.adopt_row(row, by_symbol.get(row["symbol"], []))
             if not pos.stop:
-                unprotected.append(symbol)
-            log.warning("adopted %s %s %g @ %.6f (stop %.6f, tp %.6f)",
-                        symbol, pos.side, pos.qty, pos.entry, pos.stop,
-                        pos.take_profit)
+                unprotected.append(pos.symbol)
 
         lines = "\n".join(
             f"  {p.symbol} {p.side} {p.qty:g} @ {p.entry:,.6f}"
@@ -410,11 +443,14 @@ class Engine:
         if unprotected:
             log.critical("adopted position(s) with NO protective stop: %s",
                          ", ".join(unprotected))
+            fix = ("The protection watchdog will place a stop and take-profit "
+                   "within a minute." if self.cfg.supervise.protect.watch.enabled
+                   else "Close it or set a stop by hand.")
             self.notify.send(
                 Event.ERROR,
                 f"{', '.join(unprotected)} is open with NO stop on the "
                 f"exchange. It is tracked, so nothing new will be stacked on "
-                f"it, but it is not protected. Close it or set a stop by hand.")
+                f"it, but it is not protected. {fix}")
         return len(live)
 
     def realized_from_exchange(self, pos: ActivePosition,
@@ -491,6 +527,8 @@ class Engine:
             if pnl is None:
                 return None
             self.state.realized_today += pnl
+            self.note_realized(pnl)
+            self.after_close(pos, how, pnl)
             if not self.cfg.realtime:
                 self.state.total_trades += 1
             self.state.save()
@@ -515,7 +553,7 @@ class Engine:
             pnl = self.book_close(pos, "exchange-side")
             if pnl is None:
                 return
-            prog = self.schedule.progress(self.state.realized_today)
+            prog = self.progress()
             self.notify.send(
                 Event.TP_HIT if pnl >= 0 else Event.SL_HIT,
                 f"{pos.symbol} closed for {pnl:+.2f} USDT\n{prog}\n"
@@ -578,7 +616,19 @@ class Engine:
         cap = getattr(self.cfg.risk, "equity_cap_usdt", 0.0) or 0.0
         if cap <= 0:
             return actual
-        return min(actual, cap)
+        if not getattr(self.cfg.risk, "equity_cap_tracks_pnl", False):
+            return min(actual, cap)
+        # Tracking: behave like an account funded with `cap` when this began.
+        # The anchor is re-taken whenever the cap itself changes, so moving the
+        # cap starts a fresh rehearsal rather than inheriting the old drift.
+        st = self.state
+        if st.cap_anchor_equity <= 0 or st.cap_anchor_cap != cap:
+            st.cap_anchor_equity = actual
+            st.cap_anchor_cap = cap
+            st.save()
+            log.info("equity cap: rehearsing a $%.2f account from real equity "
+                     "%.2f; gains and losses from here move it", cap, actual)
+        return max(0.0, min(actual, cap + (actual - st.cap_anchor_equity)))
 
     def rebase_day_start_equity(self) -> None:
         """
@@ -593,6 +643,18 @@ class Engine:
         """
         anchor = self.state.day_start_equity
         if anchor <= 0:
+            return
+        cap = getattr(self.cfg.risk, "equity_cap_usdt", 0.0) or 0.0
+        if cap > 0 and getattr(self.cfg.risk, "equity_cap_tracks_pnl", False):
+            # effective_equity() takes a REAL balance, not a day-start figure,
+            # so it cannot be applied to the anchor here. A day anchored on the
+            # real balance shows up as a gap larger than the whole rehearsed
+            # account, which no day's trading on it could produce.
+            if anchor > self.equity + cap:
+                log.warning("day start equity re-based %.2f -> %.2f to match the "
+                            "tracking equity cap", anchor, self.equity)
+                self.state.day_start_equity = self.equity
+                self.state.save()
             return
         capped = self.effective_equity(anchor)
         if capped < anchor:
@@ -638,7 +700,7 @@ class Engine:
         })
 
     def snapshot(self) -> dict:
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         # One source of truth. The old duplicate here referenced `sym` and `px`
         # from _position_book's loop, so snapshot() raised NameError the moment
         # any position opened -- freezing the dashboard and /status on the
@@ -658,6 +720,12 @@ class Engine:
             "day_ends_in": format_duration(seconds_to_day_end()),
             "target_reached": prog.reached,
             "stop_when_reached": self.schedule.stop_when_reached,
+            "day_start_equity": prog.equity,
+            "realized_pct_of_equity": prog.equity_pct,
+            "since_restart": self.session_realized,
+            "session_started": (datetime.fromtimestamp(self.session_started, timezone.utc)
+                                .strftime("%Y-%m-%d %H:%M UTC")
+                                if self.session_started else ""),
             "target_note": self.schedule.describe(self.equity),
             "halted": self.state.halted, "halt_reason": self.state.halt_reason,
             "trades_today": self.state.trades_today,
@@ -1050,7 +1118,7 @@ class Engine:
         if pnl is None:
             return "\nP&L could not be read from the exchange; not booked."
         return (f"\nresult {pnl:+.2f} USDT\n"
-                f"{self.schedule.progress(self.state.realized_today)}")
+                f"{self.progress()}")
 
     def close_all(self, reason: str) -> int:
         """
@@ -1107,6 +1175,8 @@ class Engine:
             return False
 
         pos = self.book.get(symbol)
+        if pos is not None:
+            pos.exit_reason = reason
         if not live:
             log.info("close requested but %s is already flat", symbol)
             # Flat does not mean nothing is resting. On 2026-09-13 a /close
@@ -1960,10 +2030,11 @@ class Engine:
         pnl = gross - fees
 
         self.state.realized_today += pnl
+        self.note_realized(pnl)
         self.risk.record_fill()
         self.equity += pnl
         event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         self.notify.send(event,
                          f"DRY RUN -- simulated close at {exit_px:,.4f} "
                          f"for {pnl:+.2f} USDT\n{prog}", symbol=pos.symbol)
@@ -2023,6 +2094,7 @@ class Engine:
         if closing:
             pnl = upd.realized_pnl
             self.state.realized_today += pnl
+            self.note_realized(pnl)
             self.state.save()
             event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
             if self.signals is not None and pos.entry:
@@ -2032,7 +2104,7 @@ class Engine:
                     move if pos.is_long else -move,
                     "take-profit" if pnl >= 0 else "stop-loss",
                     mode=self.cfg.mode, dry_run=self.cfg.dry_run)
-            prog = self.schedule.progress(self.state.realized_today)
+            prog = self.progress()
             self.notify.send(
                 event,
                 f"{upd.symbol} closed at {upd.avg_price:,.4f} for "
@@ -2073,7 +2145,7 @@ class Engine:
         if self.state.roll_day_if_needed(self.equity):
             self.schedule.start_date = self.state.schedule_start_date
             step = self.schedule.escalates_today()
-            if step:
+            if step and self.schedule.stop_when_reached:
                 self.notify.send(Event.TARGET_RAISED,
                                  f"Day {self.schedule.day_number()}: target raised to "
                                  f"${step.usd_per_day:.2f}/day.\n"
@@ -2086,13 +2158,18 @@ class Engine:
         self.reconcile_position(snap)
         # Even with an empty book: an empty book is exactly when a position the
         # bot lost track of goes unnoticed (see reconcile_book).
-        if self.cfg.portfolio.enabled or self.gainer is not None:
+        if (self.cfg.portfolio.enabled or self.gainer is not None
+                or self.cfg.supervise.protect.watch.enabled):
             self.reconcile_book()
+        try:
+            self.monitor_positions(now)
+        except Exception:
+            log.exception("position monitor failed -- continuing")
 
         hb =self.cfg.alerts.heartbeat_minutes
         if hb and now - self._last_heartbeat > hb * 60:
             self._last_heartbeat = now
-            prog = self.schedule.progress(self.state.realized_today)
+            prog = self.progress()
             self.notify.send(Event.DAILY_SUMMARY,
                              f"{prog}\nequity ${self.equity:,.2f}  "
                              f"price {self.last_price:,.4f}\n"
@@ -2276,8 +2353,195 @@ class Engine:
                  "entry_price": float(row.get("entryPrice") or 0.0) if row else 0.0,
                  "open_order_ids": by_symbol.get(symbol, set())},
                 symbol=symbol)
+        self.protect_positions(live, orders)
         self.warn_untracked(live)
         return live
+
+    def protect_positions(self, live: dict, orders: list) -> None:
+        """
+        The protection watchdog. Every open position gets a stop-loss and a
+        take-profit on the exchange; any that is missing one is repaired here,
+        and one the bot is not tracking at all is adopted first.
+
+        Runs on every reconcile, halted or not: a halt stops NEW trades, and
+        the STGUSDT long of 2026-09-19 sat naked for four hours precisely
+        because the halt was the only thing that happened. See bot/protect.py
+        for how the levels are chosen.
+        """
+        pcfg = self.cfg.supervise.protect
+        if not pcfg.watch.enabled or self.cfg.dry_run:
+            return
+        by_symbol: dict[str, list] = {}
+        for o in orders:
+            by_symbol.setdefault(o.get("symbol", ""), []).append(o)
+        for symbol, row in live.items():
+            try:
+                amt = float(row.get("positionAmt") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amt == 0.0:
+                continue
+            if symbol not in self.book:
+                if not pcfg.watch.adopt_untracked:
+                    continue            # warn_untracked reports it
+                pos = self.adopt_row({**row, "symbol": symbol},
+                                     by_symbol.get(symbol, []))
+                self.notify.send(
+                    Event.ERROR,
+                    f"{symbol}: found {amt:g} open (entry {pos.entry:,.6g}) "
+                    f"that the bot was not tracking. It is tracked now and "
+                    f"will be protected and supervised.", symbol=symbol)
+            try:
+                self.ensure_protected(symbol, by_symbol.get(symbol, []))
+            except Exception:
+                # One symbol's surprise must not stop the others being checked.
+                log.exception("%s: protection check failed", symbol)
+
+    def ensure_protected(self, symbol: str, orders: list) -> str:
+        """
+        Put back whatever protection one tracked position is missing.
+
+        Returns "ok" (both orders were there), "protected" (repaired),
+        "closed" (closed at market instead), "failed" (still unprotected) or
+        "skipped" (not a filled position, or nothing could be read).
+        """
+        pos = self.book.get(symbol)
+        if pos is None or not pos.filled:
+            return "skipped"
+        failures = getattr(self, "_protect_failures", None)
+        if failures is None:
+            failures = self._protect_failures = {}
+        stop_o, tp_o = self.protective_legs(orders)
+        if stop_o and tp_o:
+            failures.pop(symbol, None)
+            return "ok"
+
+        # Something looks missing. Read again, for this symbol alone, before
+        # acting: reconcile reads positions BEFORE orders, so a stop that
+        # triggered in between reads as "open with no stop", and a new stop on
+        # a position that no longer exists is the last thing wanted.
+        try:
+            rows = self.api.positions(symbol)
+            fresh = (list(self.api.open_orders(symbol))
+                     + list(self.api.open_algo_orders(symbol)))
+            mark = float(self.api.mark_price(symbol)["markPrice"])
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError) as e:
+            log.error("%s looks unprotected but could not be re-read (%s); "
+                      "retrying next reconcile", symbol, e)
+            return "skipped"
+        row = next((r for r in rows or []
+                    if float(r.get("positionAmt") or 0.0) != 0.0), None)
+        if row is None:
+            return "skipped"            # closed meanwhile; reconcile books it
+        stop_o, tp_o = self.protective_legs(fresh)
+        if stop_o and tp_o:
+            failures.pop(symbol, None)
+            return "ok"
+        pos.qty = abs(float(row["positionAmt"]))
+
+        a, er = self.market_reading(symbol)
+        plan = plan_protection(
+            long=pos.is_long, mark=mark, atr=a, efficiency=er,
+            has_stop=stop_o is not None, has_target=tp_o is not None,
+            planned_stop=pos.stop, planned_target=pos.take_profit,
+            cfg=self.cfg.supervise.protect)
+        missing = " and ".join(n for n, o in (("stop-loss", stop_o),
+                                               ("take-profit", tp_o)) if o is None)
+        log.critical("%s is open with no %s: %s", symbol, missing, plan.why)
+
+        if plan.close_now:
+            closed = self.close_position(f"protection watchdog -- {plan.why}",
+                                         symbol=symbol)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} had no {missing}, and the market is already past "
+                f"its planned stop. " + ("Closed at market." if closed else
+                "Closing it FAILED -- close it on Binance."), symbol=symbol)
+            failures.pop(symbol, None)
+            return "closed" if closed else "failed"
+
+        placed = []
+        stop_ok = True
+        if plan.stop is not None:
+            # The recorded id names an order that is gone; cancelling it after
+            # the replacement lands would only log a spurious failure.
+            pos.stop_order_id = ""
+            stop_ok = self.replace_protective(pos, "stop", plan.stop)
+            if stop_ok:
+                pos.stop = plan.stop
+                if pos.initial_risk <= 0:
+                    # An adopted position whose 1R was unknown: the stop just
+                    # placed IS the risk being carried now, so the supervisor
+                    # measures from it rather than standing down.
+                    pos.initial_stop = plan.stop
+                    pos.initial_risk = abs(mark - plan.stop)
+                placed.append(f"SL {plan.stop:,.6g}")
+        if plan.target is not None:
+            pos.tp_order_id = ""
+            if self.replace_protective(pos, "tp", plan.target):
+                pos.take_profit = plan.target
+                if not pos.initial_target:
+                    pos.initial_target = plan.target
+                placed.append(f"TP {plan.target:,.6g}")
+
+        if stop_ok and not placed:
+            # Only a take-profit was missing and it was refused. The stop is
+            # on the book, so the position is protected; say so once, retry.
+            failures.pop(symbol, None)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} has no take-profit and placing one failed. Its "
+                f"stop-loss is in place. Retrying every minute.",
+                dedupe_key=f"protect-tp:{symbol}", symbol=symbol)
+            return "failed"
+        if stop_ok:
+            failures.pop(symbol, None)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} was open with no {missing}. The watchdog placed "
+                f"{', '.join(placed) or 'nothing'} (mark {mark:,.6g}).\n"
+                f"{plan.why}", symbol=symbol)
+            return "protected"
+
+        n = failures[symbol] = failures.get(symbol, 0) + 1
+        limit = int(self.cfg.supervise.protect.failure.close_after_attempts)
+        if limit and n >= limit:
+            closed = self.close_position(
+                f"protection watchdog -- no stop could be placed after {n} "
+                f"attempts", symbol=symbol)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol}: no stop could be placed after {n} attempts. "
+                + ("Closed at market." if closed else
+                   "Closing it FAILED too -- close it on Binance."),
+                symbol=symbol)
+            if closed:
+                failures.pop(symbol, None)
+            return "closed" if closed else "failed"
+        self.notify.send(
+            Event.ERROR,
+            f"{symbol} has no stop-loss and placing one failed "
+            f"(attempt {n}" + (f" of {limit}" if limit else "") + "). "
+            "Retrying next minute" + ("; it is closed at market if that "
+            "keeps failing." if limit else "."),
+            dedupe_key=f"protect:{symbol}:{n}", symbol=symbol)
+        return "failed"
+
+    def market_reading(self, symbol: str) -> tuple[float, float]:
+        """(ATR in price units, efficiency ratio) of a symbol's recent bars,
+        with 0.0 / -1.0 standing for unknown -- the same reading the
+        supervisor takes."""
+        try:
+            bars = self.held_bars(symbol)
+        except Exception as e:          # no strategy warmup, no bars: unknown
+            log.debug("%s: no bars for a market reading (%s)", symbol, e)
+            bars = []
+        params = self.cfg.params or {}
+        atr_period = int((params.get("trend") or {}).get("atr_period", 14))
+        er_window = int((params.get("regime") or {}).get("window", 30))
+        a = true_range(bars, atr_period) if len(bars) > atr_period else 0.0
+        er = efficiency_ratio(bars, er_window) if len(bars) > er_window else -1.0
+        return a, er
 
     def warn_untracked(self, live: dict) -> None:
         """
@@ -2305,8 +2569,9 @@ class Engine:
                 f"{symbol}: the exchange holds {amt:g} (entry "
                 f"{row.get('entryPrice')}) that the bot is NOT tracking. It has "
                 f"no managed stop and is using margin. Set a stop-loss on "
-                f"Binance or close it there. A restart makes the bot track it "
-                f"again but does NOT place a stop.",
+                f"Binance or close it there, or turn on "
+                f"supervise.protect.watch.adopt_untracked to have the bot take "
+                f"it over and protect it.",
                 dedupe_key=f"untracked:{symbol}:{amt}", symbol=symbol)
 
     def expire_stale_entry(self, snap: dict, symbol: str | None = None) -> None:
@@ -2445,11 +2710,67 @@ class Engine:
             self.decide()
 
     # -------------------------------------------------------------- decision
+    def progress(self):
+        """Today's progress as every alert prints it: against the dollar
+        target when targets.stop_when_reached is on, against the day's
+        opening equity when it is off, plus the net since the last restart."""
+        equity = self.state.day_start_equity or self.equity
+        return self.schedule.progress(self.state.realized_today, equity=equity,
+                                      since_restart=self.session_realized)
+
+    def note_realized(self, pnl: float) -> None:
+        """Every booked close passes through here, on every path."""
+        self.session_realized += pnl
+
+    def after_close(self, pos: ActivePosition, how: str, pnl: float) -> None:
+        """Journal a booked close, and queue a supervisor exit for review."""
+        if self.journal is not None:
+            self.journal.record(pos, pnl, closed_by=how, mode=self.cfg.mode)
+        reason = pos.exit_reason or ""
+        if (self.review is not None and reason.startswith("supervisor")
+                and self.cfg.supervise.monitor.review_exits):
+            self.review.add(pos, pnl, reason)
+
+    def monitor_positions(self, now: float | None = None) -> None:
+        """
+        The supervisor's report card, run from periodic():
+          - resolve supervisor-exit reviews (every 15 minutes)
+          - the open-positions report (every monitor.report_minutes)
+        """
+        now = time.time() if now is None else now
+        mcfg = self.cfg.supervise.monitor
+        if self.review is not None and self.review.pending \
+                and now - self._last_review_check >= 900:
+            self._last_review_check = now
+
+            def bars(symbol):
+                return [Bar.from_kline(k)
+                        for k in self.api.klines(symbol, "15m", limit=120)]
+            for r in self.review.resolve(bars, expire_hours=mcfg.review_hours):
+                text = describe_review(r, self.review.totals)
+                log.info("%s", text.replace("\n", " "))
+                self.notify.send(Event.DAILY_SUMMARY, text, symbol=r.symbol)
+
+        if (mcfg.report_minutes > 0 and self.book
+                and now - self._last_position_report >= mcfg.report_minutes * 60):
+            self._last_position_report = now
+            rows = [(p, (self.last_prices or {}).get(sym, 0.0),
+                     bool(p.stop_order_id) and bool(p.tp_order_id or not p.take_profit))
+                    for sym, p in self.book.items() if p.filled]
+            text = position_report(rows)
+            if text:
+                self.notify.send(Event.DAILY_SUMMARY,
+                                 f"{text}\n{self.progress()}")
+
     def check_target_reached(self) -> bool:
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         if prog.reached and not self.state.target_reached_today:
             self.state.target_reached_today = True
             self.state.save()
+            if not prog.enforced:
+                # The target decides nothing when it is off; announcing it
+                # "banked" made a $2 figure look like a rule being followed.
+                return False
             self.notify.send(
                 Event.TARGET_REACHED,
                 f"Day {prog.day} target of ${prog.target:.2f} banked "
@@ -2600,7 +2921,8 @@ class Engine:
 
     # ---------------------------------------------------------------- orders
     def protective_levels_crossed(self, symbol: str, side: str,
-                                  stop: float, tp: float) -> str:
+                                  stop: float, tp: float,
+                                  entry: float = 0.0) -> str:
         """
         Why this trade's stop or take-profit is already on the wrong side of
         the market, or "" when both are placeable.
@@ -2613,6 +2935,12 @@ class Engine:
 
         An unreadable mark price returns "" and leaves the halt as the
         backstop, rather than skipping a trade on a guess.
+
+        With `entry`, it also refuses a stop that is merely TOO CLOSE. A long
+        limit priced above the market fills at the market, so the stop ends up
+        nearer than planned: STGUSDT's 0.1566 buy filled at 0.1523 on
+        2026-09-19 with its stop at 0.1513, 0.66% away, and the mark was
+        through it a second later. See protect.stop_room.
         """
         try:
             mark = float(self.api.mark_price(symbol)["markPrice"])
@@ -2626,7 +2954,109 @@ class Engine:
             return f"mark {mark} is already through the stop {stop}"
         if tp and (mark >= tp if long else mark <= tp):
             return f"mark {mark} is already through the take-profit {tp}"
+        need = self.cfg.supervise.protect.entry.min_stop_room_frac
+        if entry > 0 and stop and need > 0:
+            room = stop_room(long=long, entry=entry, stop=stop, mark=mark)
+            if room < need:
+                return (f"price moved from {entry} to mark {mark} since the "
+                        f"signal: only {room:.0%} of the planned distance to "
+                        f"the stop {stop} is left (need {need:.0%})")
         return ""
+
+    def recover_failed_protection(self, signal, symbol: str, leg: str,
+                                  err: BinanceError, entry_id: str,
+                                  stop: float, tp: float) -> None:
+        """
+        A stop or take-profit was refused right after the entry was sent.
+
+        This used to cancel everything, halt, and announce "Nothing is open"
+        without looking. cancel_all() cancels ORDERS: an entry that had already
+        filled -- a limit priced above the market fills at once -- stays open,
+        and on 2026-09-19 that left 71 STGUSDT long with no stop for hours
+        while the halt blocked everything else.
+
+        Now the position is read back after the cancel:
+
+          flat, refusal was -2021   the market simply moved; the trade no
+                                    longer exists. Skip it; no halt.
+          flat, any other refusal   halt, as before -- it may not be
+                                    transient. "Nothing is open" is now true.
+          filled                    track it and hand it to the protection
+                                    watchdog at once. If it cannot be
+                                    protected, close it; halt only if even
+                                    that fails.
+          unreadable                halt, and say it is unknown.
+        """
+        try:
+            self.api.cancel_all(symbol)
+        except BinanceError as ce:
+            log.error("%s: cancelling after the failed %s also failed: %s",
+                      symbol, leg, ce)
+        try:
+            rows = self.api.positions(symbol)
+            row = next((r for r in rows or []
+                        if float(r.get("positionAmt") or 0.0) != 0.0), None)
+        except (BinanceError, TypeError, ValueError) as re:
+            self.state.halt(f"could not place protective {leg} on {symbol}: "
+                            f"{err}; and whether the entry filled is unknown ({re})")
+            self.notify.send(Event.HALT,
+                             f"Could not place the {leg} on {symbol}: {err}\n"
+                             f"Entry cancelled, but the position could not be "
+                             f"read back. Check Binance for an open {symbol} "
+                             f"position.", symbol=symbol)
+            return
+
+        if row is None:
+            if err.code == -2021:
+                log.warning("%s: the %s would have triggered at once; the entry "
+                            "was cancelled before it filled. Trade skipped.",
+                            symbol, leg)
+                self.notify.send(
+                    Event.DAILY_SUMMARY,
+                    f"{symbol}: trade skipped. The market moved past the {leg} "
+                    f"({err}) before it could be placed. The entry was "
+                    f"cancelled before filling; nothing is open.", symbol=symbol)
+                return
+            self.state.halt(f"could not place protective {leg} on {symbol}: {err}")
+            self.notify.send(Event.HALT, f"Could not place the {leg}: {err}\n"
+                                         "Entry cancelled, bot halted. Nothing is open.")
+            return
+
+        # The entry filled. Track it with the levels it was planned with; the
+        # watchdog restores those if the market still allows, rebuilds them
+        # from the market if not, and closes it if the planned stop is gone.
+        amt = float(row["positionAmt"])
+        fill = float(row.get("entryPrice") or 0.0) or float(signal.entry)
+        pos = ActivePosition(
+            symbol=symbol, side=signal.side, entry=fill, stop=stop,
+            take_profit=tp, qty=abs(amt), entry_order_id=entry_id, tag=entry_id,
+            opened_ms=int(time.time() * 1000),
+            initial_stop=stop, initial_target=tp,
+            initial_risk=abs(fill - stop),
+            ref_level=float(getattr(signal, "ref_level", 0.0) or 0.0),
+            filled=True)
+        self.book[symbol] = pos
+        self.risk.record_attempt()
+        self.risk.record_fill()
+        log.critical("%s: the entry had already FILLED (%g @ %.8g); handing it "
+                     "to the protection watchdog", symbol, abs(amt), fill)
+        outcome = self.ensure_protected(symbol, [])
+        if outcome in ("protected", "ok", "closed"):
+            if outcome != "closed":
+                self._entry_placed_at = time.time()
+            return
+        if symbol in self.book and self.close_position(
+                f"entry filled but no stop could be placed ({err})", symbol=symbol):
+            self.notify.send(Event.ERROR,
+                             f"{symbol}: the entry filled but no stop could be "
+                             f"placed, so it was closed at market.", symbol=symbol)
+            return
+        self.state.halt(f"{symbol} filled with no stop, and closing it failed "
+                        f"({err})")
+        self.notify.send(Event.HALT,
+                         f"{symbol} is OPEN WITH NO STOP: the {leg} was refused "
+                         f"({err}) and closing it failed. Close it on Binance.",
+                         symbol=symbol)
 
     def place(self, signal, notional: float, risk_note: str,
               symbol: str | None = None, atr_pct: float = 0.0) -> None:
@@ -2706,7 +3136,8 @@ class Engine:
             return
 
         crossed = self.protective_levels_crossed(symbol, signal.side,
-                                                 float(stop_price), float(tp_price))
+                                                 float(stop_price), float(tp_price),
+                                                 entry=float(price))
         if crossed:
             log.warning("%s signal skipped: %s", symbol, crossed)
             return
@@ -2765,10 +3196,8 @@ class Engine:
             # -- read as a stop failure and sent the diagnosis the wrong way.
             log.critical("PROTECTIVE ORDER FAILED on the %s (%s) -- cancelling entry",
                          leg, e)
-            self.api.cancel_all(symbol)
-            self.state.halt(f"could not place protective {leg} on {symbol}: {e}")
-            self.notify.send(Event.HALT, f"Could not place the {leg}: {e}\n"
-                                         "Entry cancelled, bot halted. Nothing is open.")
+            self.recover_failed_protection(signal, symbol, leg, e, entry_id,
+                                           float(stop_price), float(tp_price))
             return
 
         self.book[symbol] = ActivePosition(
@@ -2797,7 +3226,7 @@ class Engine:
                                mode=self.cfg.mode, dry_run=self.cfg.dry_run,
                                reason=signal.reason)
 
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         # "resting", not "opened". The entry is a GTC limit and may never fill
         # -- saying it had opened was how a phantom KAVAUSDT position came to
         # be reported, supervised and alerted on for 34 minutes on 2026-09-13.

@@ -38,11 +38,14 @@ class StubAPI:
         self.calls.append(("sync_clock", None))
         return 0
 
-    def positions(self, symbol):
+    def positions(self, symbol=None):
+        # symbol=None is the real client's "every position" form, which
+        # reconcile_book uses; this stub only ever holds DOGEUSDT.
         self.calls.append(("positions", symbol))
         if self.position_amt == 0.0:
             return []
-        return [{"positionAmt": str(self.position_amt), "entryPrice": "0.09",
+        return [{"symbol": symbol or "DOGEUSDT",
+                 "positionAmt": str(self.position_amt), "entryPrice": "0.09",
                  "unRealizedProfit": "0", "liquidationPrice": "0"}]
 
     # Since the Binance algo migration a conditional order is NOT returned by
