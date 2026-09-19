@@ -153,6 +153,9 @@ EDITABLE: dict[str, Setting] = {
                 "early exits and leave it to its stop and take-profit"),
         Setting("context.entry.block_against_trend", "bool",
                 "refuse a new trade against the 4h trend"),
+        Setting("context.entry.coin_cooldown_minutes", "int",
+                "minutes to stay off a coin after its last trade closed; "
+                "0 turns it off", lo=0, hi=1440),
         Setting("supervise.monitor.review_exits", "bool",
                 "score every supervisor exit against what holding would have "
                 "done (data/supervisor_review.csv)"),

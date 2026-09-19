@@ -45,6 +45,10 @@ class State:
     # so a testnet rehearsal gains and loses like the account it rehearses.
     cap_anchor_equity: float = 0.0
     cap_anchor_cap: float = 0.0
+    # context.entry.coin_cooldown_minutes: when each coin's last FILLED
+    # position left the book (epoch ms). Here rather than in memory so a
+    # restart does not reopen the door the cooldown is holding shut.
+    last_exit_ms: dict = field(default_factory=dict)
 
     path: Path = field(default=STATE_PATH, repr=False)
 

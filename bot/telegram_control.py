@@ -80,6 +80,7 @@ SETTINGS  (written to config.yaml, applied on restart)
                       cutlosers, bankturn, harvest, breakout, patience,
                       trendfilter, review
 /supervisor report <minutes>  position report interval (0 = off)
+/supervisor cooldown <minutes>  stay off a coin after it closes (0 = off)
 /gainer               gainer mining settings and their values
 /gainer <name> <value> change one: size, confirm, rising, minrise,
                       cooldown, target, onleader, hold
@@ -397,6 +398,7 @@ class TelegramControl:
         "breakout": "supervise.failed_breakout.enabled",
         "patience": "supervise.patience.enabled",
         "trendfilter": "context.entry.block_against_trend",
+        "cooldown": "context.entry.coin_cooldown_minutes",
         "review": "supervise.monitor.review_exits",
         "report": "supervise.monitor.report_minutes",
     }

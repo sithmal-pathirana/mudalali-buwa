@@ -5,6 +5,7 @@ The slower-chart context: bot/context.py, the entry filter
 """
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -177,6 +178,76 @@ class TestEntryFilter(unittest.TestCase):
         e.higher_trend("STGUSDT")
         e.higher_trend("STGUSDT")
         self.assertEqual(api.kline_calls, 1)
+
+
+class TestCoinCooldown(unittest.TestCase):
+    def tearDown(self):
+        _cleanup()
+
+    def _engine(self, minutes=120):
+        api = _TrendAPI(trend=1, marks={"STGUSDT": 0.1566})
+        e = _engine(api)
+        e.cfg.context.entry.coin_cooldown_minutes = minutes
+        return api, e
+
+    def test_off_by_default(self):
+        self.assertEqual(ContextConfig().entry.coin_cooldown_minutes, 0.0)
+
+    def test_the_shipped_config_turns_it_on(self):
+        from bot.config import Config
+        self.assertEqual(Config.load(ROOT / "config.yaml")
+                         .context.entry.coin_cooldown_minutes, 120)
+
+    def test_a_coin_closed_an_hour_ago_is_skipped(self):
+        api, e = self._engine()
+        e.note_exit("STGUSDT", now_ms=int(time.time() * 1000) - 3_600_000)
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        self.assertNotIn("STGUSDT", e.book)
+        self.assertFalse([c for c in api.calls if c[0] == "order"])
+
+    def test_a_coin_closed_three_hours_ago_trades(self):
+        api, e = self._engine()
+        e.note_exit("STGUSDT", now_ms=int(time.time() * 1000) - 3 * 3_600_000)
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        self.assertIn("STGUSDT", e.book)
+
+    def test_another_coin_is_not_held_back(self):
+        api, e = self._engine()
+        e.note_exit("HEIUSDT")
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        self.assertIn("STGUSDT", e.book)
+
+    def test_zero_means_off(self):
+        api, e = self._engine(minutes=0)
+        e.note_exit("STGUSDT")
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        self.assertIn("STGUSDT", e.book)
+
+    def test_a_filled_position_starts_the_cooldown_on_release(self):
+        api, e = self._engine()
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        e.book["STGUSDT"].filled = True
+        e.release("STGUSDT")
+        self.assertGreater(e.cooling_down("STGUSDT"), 119)
+
+    def test_a_cancelled_entry_that_never_filled_does_not(self):
+        api, e = self._engine()
+        e.place(SIG, 5.36, "n", symbol="STGUSDT")
+        e.release("STGUSDT")
+        self.assertEqual(e.cooling_down("STGUSDT"), 0.0)
+
+    def test_it_survives_a_restart(self):
+        api, e = self._engine()
+        e.note_exit("STGUSDT")
+        from bot.state import State
+        self.assertIn("STGUSDT", State.load(e.state.path).last_exit_ms)
+
+    def test_day_old_exits_are_pruned(self):
+        api, e = self._engine()
+        now = int(time.time() * 1000)
+        e.note_exit("OLDUSDT", now_ms=now - 2 * 86_400_000)
+        e.note_exit("STGUSDT", now_ms=now)
+        self.assertNotIn("OLDUSDT", e.state.last_exit_ms)
 
 
 if __name__ == "__main__":

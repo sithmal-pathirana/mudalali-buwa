@@ -570,8 +570,31 @@ class Engine:
         p = self.book.pop(symbol, None)
         if p is not None:
             self.notify.clear_position_alerts(p.tag)
+            # Only a trade that happened starts a cooldown: an entry that
+            # rested and was cancelled never took the move being chased.
+            if p.filled and getattr(p, "strategy", "") != "gainer":
+                self.note_exit(symbol)
         if self.stream is not None and symbol != self.cfg.symbol:
             self.stream.remove_symbol(symbol)
+
+    def note_exit(self, symbol: str, now_ms: int | None = None) -> None:
+        """Remember when `symbol` last closed, for the coin cooldown."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        exits = self.state.last_exit_ms
+        # A day covers any sensible cooldown; older entries only grow the file.
+        for s in [s for s, t in exits.items() if now_ms - t > 86_400_000]:
+            del exits[s]
+        exits[symbol] = now_ms
+        self.state.save()
+
+    def cooling_down(self, symbol: str, now_ms: int | None = None) -> float:
+        """Minutes left before `symbol` may be opened again; 0 = free."""
+        minutes = self.cfg.context.entry.coin_cooldown_minutes
+        last = self.state.last_exit_ms.get(symbol)
+        if minutes <= 0 or not last:
+            return 0.0
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        return max(0.0, minutes - (now_ms - last) / 60_000)
 
     def prepare_symbol(self, symbol: str) -> bool:
         """
@@ -3096,6 +3119,13 @@ class Engine:
     def place(self, signal, notional: float, risk_note: str,
               symbol: str | None = None, atr_pct: float = 0.0) -> None:
         symbol = symbol or self.cfg.symbol
+        left = self.cooling_down(symbol)
+        if left > 0:
+            log.info("%s %s skipped: closed %.0f min ago, cooldown has %.0f "
+                     "min left (context.entry.coin_cooldown_minutes)", symbol,
+                     signal.side, self.cfg.context.entry.coin_cooldown_minutes - left,
+                     left)
+            return
         if self.cfg.context.entry.block_against_trend:
             trend = self.higher_trend(symbol)
             side = 1 if signal.side == "BUY" else -1

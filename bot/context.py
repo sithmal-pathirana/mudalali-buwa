@@ -14,6 +14,9 @@ Two uses follow, each behind its own switch and OFF by default:
   supervise.patience                  relax the supervisor's early exits
                                       while the trend is behind the trade
 
+Also here, because it is the other entry filter: context.entry.
+coin_cooldown_minutes, which keeps the bot off a coin it has just closed.
+
 The trend is read from CLOSED bars only. A slow bar lasts longer than most
 trades (median 48 minutes), so this is context fixed at entry, not a signal
 that changes during the trade.
@@ -40,6 +43,12 @@ class ContextEntryConfig:
     #: Refuse a new trade whose side is against the slower chart's trend. A
     #: flat or unreadable trend never blocks anything.
     block_against_trend: bool = False
+    #: Do not open a coin again until this many minutes after its last
+    #: position closed; 0 = off. Replayed over 85 signals of 2026-09-05 to
+    #: 09-19, re-buying a coin within 2h of closing it won 2 of 10 trades
+    #: for -6.8R, mostly straight after a win: chasing a move already taken. 2h after any exit took the replay from +10.8R to
+    #: +17.7R (held to stop/target: +6.6R to +11.6R); 1h to 8h all helped.
+    coin_cooldown_minutes: float = 0.0
 
 
 GROUPS = {"trend": ContextTrendConfig, "entry": ContextEntryConfig}
