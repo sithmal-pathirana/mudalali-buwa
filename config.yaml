@@ -272,9 +272,10 @@ supervise:
   # vs +0.2R). With context.entry.block_against_trend, the replay goes from
   # +4.5R to +9.3R; 9 other 4h trend definitions all land between +6.9R and
   # +11.2R. The cost: losers it would have cut are held to their stop, so the
-  # average loss rises from -0.47R to -0.74R. OFF until tested on the demo.
+  # average loss rises from -0.47R to -0.74R. ON for the demo from 2026-09-19
+  # to test it on fresh trades before the 2026-09-25 go-live.
   patience:
-    enabled: false
+    enabled: true
     skip_cut_losers: true
     skip_harvest: true
     skip_failed_breakout: true
@@ -350,8 +351,8 @@ context:
   entry:
     # Refuse a trade against the 4h trend; a flat or unreadable trend never
     # blocks. Replay: 4 of 53 past trades were against it (-4.0R held to
-    # stop/target). OFF until tested on the demo.
-    block_against_trend: false
+    # stop/target). ON for the demo from 2026-09-19, with patience above.
+    block_against_trend: true
 
 # GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
 # buy it with a take-profit that nets exit.target_usd and a stop exit.stop_pct

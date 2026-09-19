@@ -52,11 +52,12 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(ContextConfig().entry.block_against_trend)
         self.assertFalse(SuperviseConfig().patience.enabled)
 
-    def test_the_shipped_config_leaves_both_off(self):
+    def test_the_shipped_config_turns_both_on(self):
+        # On for the demo from 2026-09-19 by request; the code defaults stay off.
         from bot.config import Config
         cfg = Config.load(overlay=False)
-        self.assertFalse(cfg.context.entry.block_against_trend)
-        self.assertFalse(cfg.supervise.patience.enabled)
+        self.assertTrue(cfg.context.entry.block_against_trend)
+        self.assertTrue(cfg.supervise.patience.enabled)
         self.assertEqual(cfg.context.trend.interval, "4h")
 
     def test_a_bad_key_names_its_group(self):
