@@ -401,6 +401,27 @@ class TestSettingsCommands(Base):
         self.assertIn("Refused", self.last())
         self.assertEqual(self.tc.pop_commands(), [])
 
+    def test_supervisor_lists_every_ability(self):
+        self.tc._handle(message("/supervisor"))
+        for name in ("breakeven", "runner", "cutlosers", "harvest", "breakout"):
+            self.assertIn(name, self.last())
+
+    def test_supervisor_ability_off_targets_its_own_switch(self):
+        self.tc._handle(message("/supervisor breakout off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "supervise.failed_breakout.enabled=False")
+
+    def test_supervisor_cut_losers_targets_the_horizon_group(self):
+        self.tc._handle(message("/supervisor cutlosers off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "supervise.horizon.cut_losers=False")
+
+    def test_the_watchdog_cannot_be_switched_from_chat(self):
+        self.tc._handle(message("/set supervise.protect.watch.enabled false"))
+        self.assertEqual(self.tc.pop_commands(), [])
+
     def test_gainer_size_targets_the_notional(self):
         self.tc._handle(message("/gainer size 7.5"))
         self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))

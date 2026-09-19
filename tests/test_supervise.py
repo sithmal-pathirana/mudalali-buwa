@@ -103,7 +103,7 @@ class TestBreakEven(unittest.TestCase):
     def test_never_moves_a_stop_backwards(self):
         p = long_pos(peak=110.0)
         p.stop = 105.0                    # already trailed well past break even
-        plan = supervise(p, ok(108.0), cfg(trail_atr_mult=99.0))
+        plan = supervise(p, ok(108.0), cfg(runner={"trail_atr_mult": 99.0}))
         self.assertIsNone(plan.stop)
 
     def test_r_is_measured_against_the_original_stop(self):
@@ -148,13 +148,13 @@ class TestRunner(unittest.TestCase):
     def test_runner_trails_from_the_peak(self):
         p = long_pos(peak=106.0, runner=True)
         p.stop = 100.15
-        plan = supervise(p, ok(105.0), cfg(trail_atr_mult=1.5))
+        plan = supervise(p, ok(105.0), cfg(runner={"trail_atr_mult": 1.5}))
         self.assertAlmostEqual(plan.stop, 106.0 - 1.5 * 1.0)
 
     def test_runner_trail_never_drops_below_break_even(self):
         p = long_pos(peak=102.2, runner=True)      # trail would land at 100.7
         p.stop = 98.0
-        plan = supervise(p, ok(102.0), cfg(trail_atr_mult=4.0))
+        plan = supervise(p, ok(102.0), cfg(runner={"trail_atr_mult": 4.0}))
         self.assertGreaterEqual(plan.stop, 100.0)
 
 
@@ -262,12 +262,83 @@ class TestFailedBreakout(unittest.TestCase):
         self.assertTrue(supervise(p, ok_short(99.6), cfg()).exit_now)
 
 
+class TestAbilitySwitches(unittest.TestCase):
+    """Each ability off does nothing; the others carry on unaffected."""
+
+    far = TestHorizon.far
+
+    def test_breakeven_off_leaves_the_stop(self):
+        p = long_pos(peak=102.1)
+        plan = supervise(p, ok(102.0), cfg(breakeven={"enabled": False}))
+        self.assertIsNone(plan.stop)
+
+    def test_runner_off_never_splits(self):
+        p = long_pos(peak=102.6)
+        plan = supervise(p, ok(102.6), cfg(runner={"enabled": False}),
+                         scale_out_qty=5.0)
+        self.assertIsNone(plan.target_qty)
+
+    def test_a_runner_already_split_keeps_its_trail_when_switched_off(self):
+        p = long_pos(peak=106.0, runner=True)
+        plan = supervise(p, ok(105.0), cfg(runner={"enabled": False}))
+        self.assertIsNotNone(plan.stop)
+
+    def test_cut_losers_off_keeps_a_losing_trade(self):
+        p = long_pos()
+        plan = supervise(p, self.far(age_seconds=7200.0),
+                         cfg(horizon={"cut_losers": False}))
+        self.assertFalse(plan.exit_now)
+
+    def test_bank_turning_profit_off_keeps_a_turning_winner(self):
+        p = long_pos(peak=101.5)
+        turning = ok(101.2, atr=0.5, efficiency=0.7, net_move_per_bar=-0.2,
+                     age_seconds=7200.0)
+        plan = supervise(p, turning, cfg(horizon={"bank_turning_profit": False}))
+        self.assertFalse(plan.exit_now)
+
+    def test_harvest_off_leaves_target_and_stop(self):
+        p = long_pos(peak=101.0)
+        r = ok(101.0, atr=0.5, efficiency=0.05, net_move_per_bar=0.005,
+               age_seconds=7200.0)
+        plan = supervise(p, r, cfg(horizon={"harvest": False}))
+        self.assertIsNone(plan.target)
+        self.assertFalse(plan.exit_now)
+
+    def test_horizon_off_switches_off_all_three(self):
+        p = long_pos()
+        plan = supervise(p, self.far(age_seconds=7200.0),
+                         cfg(horizon={"enabled": False}))
+        self.assertFalse(plan)
+
+    def test_failed_breakout_off_holds(self):
+        p = long_pos(peak=102.0, ref_level=100.5)
+        plan = supervise(p, ok(100.4), cfg(failed_breakout={"enabled": False}))
+        self.assertFalse(plan.exit_now)
+
+    def test_every_switch_defaults_on(self):
+        c = SuperviseConfig(enabled=True)
+        self.assertTrue(all([c.breakeven.enabled, c.runner.enabled,
+                             c.horizon.enabled, c.horizon.cut_losers,
+                             c.horizon.bank_turning_profit, c.horizon.harvest,
+                             c.failed_breakout.enabled]))
+
+    def test_an_old_flat_key_is_refused_by_name(self):
+        """config.yaml predating the regroup must fail loudly, not be ignored."""
+        with self.assertRaises(TypeError):
+            SuperviseConfig(enabled=True, failed_breakout_exit=False)
+
+    def test_a_bad_key_inside_a_group_names_the_group(self):
+        with self.assertRaises(TypeError) as ctx:
+            SuperviseConfig(horizon={"cut_loser": False})
+        self.assertIn("supervise.horizon", str(ctx.exception))
+
+
 class TestSafety(unittest.TestCase):
     def test_a_stop_through_the_market_is_never_sent(self):
         """Binance rejects a trigger price has already passed (-2021)."""
         p = long_pos(peak=110.0, runner=True)
         p.stop = 100.15
-        plan = supervise(p, ok(104.0, atr=0.1), cfg(trail_atr_mult=0.1))
+        plan = supervise(p, ok(104.0, atr=0.1), cfg(runner={"trail_atr_mult": 0.1}))
         if plan.stop is not None:
             self.assertLess(plan.stop, 104.0)
 

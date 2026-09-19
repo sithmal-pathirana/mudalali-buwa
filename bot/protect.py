@@ -82,6 +82,8 @@ class ProtectFailureConfig:
 
 @dataclass
 class ProtectEntryConfig:
+    #: The stop-room check below, on or off.
+    enabled: bool = True
     #: Before an entry is sent, the price may have moved since the signal's
     #: bar closed. Skip the trade when less than this fraction of the planned
     #: entry-to-stop distance is left between the price it will fill at and

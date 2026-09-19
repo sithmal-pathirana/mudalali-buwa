@@ -1865,7 +1865,7 @@ class Engine:
         # Signed, in market terms: the supervisor applies the position's own
         # direction. Measured to the LIVE price rather than the last closed
         # bar, so a turn inside the forming bar is not invisible for 15 minutes.
-        w = int(cfg.drift_window_bars)
+        w = int(cfg.horizon.drift_window_bars)
         drift = ((price - bars[-w].close) / w) if len(bars) >= w and w > 0 else 0.0
         age = (time.time() * 1000 - pos.opened_ms) / 1000.0 if pos.opened_ms else 0.0
         reading = Reading(price=price, atr=a, efficiency=er, age_seconds=age,
@@ -2954,8 +2954,9 @@ class Engine:
             return f"mark {mark} is already through the stop {stop}"
         if tp and (mark >= tp if long else mark <= tp):
             return f"mark {mark} is already through the take-profit {tp}"
-        need = self.cfg.supervise.protect.entry.min_stop_room_frac
-        if entry > 0 and stop and need > 0:
+        ecfg = self.cfg.supervise.protect.entry
+        need = ecfg.min_stop_room_frac
+        if ecfg.enabled and entry > 0 and stop and need > 0:
             room = stop_room(long=long, entry=entry, stop=stop, mark=mark)
             if room < need:
                 return (f"price moved from {entry} to mark {mark} since the "

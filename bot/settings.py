@@ -124,6 +124,37 @@ EDITABLE: dict[str, Setting] = {
                 "and failed-breakout exits. Off leaves each trade to its "
                 "original stop and take-profit"),
 
+        # supervisor -- one switch per ability. The protection watchdog and the
+        # entry check are deliberately NOT here: they are what keeps a
+        # position from sitting without a stop, and no chat message should be
+        # able to take that away. Change them in config.yaml if you must.
+        Setting("supervise.breakeven.enabled", "bool",
+                "rule 1: once a trade has been +1R ahead, move its stop to "
+                "break even so it can no longer lose"),
+        Setting("supervise.runner.enabled", "bool",
+                "rule 2: near the target with the trend intact, bank half and "
+                "trail the rest (needs a position worth $10 or more)"),
+        Setting("supervise.horizon.enabled", "bool",
+                "rule 3: when the target cannot arrive within the horizon, stop "
+                "reaching for it. Master switch for the three below"),
+        Setting("supervise.horizon.cut_losers", "bool",
+                "rule 3, losing trade: close it at market instead of waiting "
+                "for its stop"),
+        Setting("supervise.horizon.bank_turning_profit", "bool",
+                "rule 3, profitable trade turning away from the target: bank it"),
+        Setting("supervise.horizon.harvest", "bool",
+                "rule 3, profitable but slow trade: pull the target in and "
+                "trail a tight stop behind the peak"),
+        Setting("supervise.failed_breakout.enabled", "bool",
+                "rule 4: take the profit when price falls back through the "
+                "level the breakout broke"),
+        Setting("supervise.monitor.review_exits", "bool",
+                "score every supervisor exit against what holding would have "
+                "done (data/supervisor_review.csv)"),
+        Setting("supervise.monitor.report_minutes", "int",
+                "how often the open-positions report is sent; 0 turns it off",
+                lo=0, hi=1440),
+
         # gainer mining -- entry: when a new top gainer is bought, and how much
         Setting("gainer.entry.notional_usdt", "float",
                 "size of each gainer mining trade in USDT. Binance refuses "

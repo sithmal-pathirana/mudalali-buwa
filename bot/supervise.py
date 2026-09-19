@@ -18,6 +18,10 @@ Four rules, each gated on the one before it where that matters:
                      reaching for it: harvest a profit, or leave.
   4. FAILED BREAKOUT a breakout that gives back its own trigger level is over.
 
+Each rule has its own switch (supervise.<rule>.enabled), and the horizon
+rule has one per outcome (cut_losers, bank_turning_profit, harvest), so any
+of them can be measured on its own. supervise.enabled is the master switch.
+
 Everything is measured in R -- the money between entry and the ORIGINAL stop --
 never in percent. Stop distances on this account have ranged from 1.0% to 12.1%
 across symbols, so a rule written in percent is hair-trigger on one symbol and
@@ -85,9 +89,82 @@ class Plan:
 
 
 @dataclass
+class BreakevenConfig:
+    #: Rule 1. Once the trade has been at_r ahead at any point, move the stop
+    #: to entry + cost_buffer_pct so the trade can no longer lose.
+    enabled: bool = True
+    at_r: float = 1.0
+
+
+@dataclass
+class RunnerConfig:
+    #: Rule 2. Approaching the target with the trend intact, bank part at the
+    #: target and trail the rest with no ceiling. Dormant on its own until
+    #: a position is worth twice the exchange minimum. A position already
+    #: split keeps its trail even if this is turned off later: its take-profit
+    #: has been cut to the banked part, and the trail is the remainder's exit.
+    enabled: bool = True
+    #: Fraction of the way to the ORIGINAL target at which the runner arms.
+    #: Must be < 1.0: at 1.0 the take-profit has already filled and there is
+    #: nothing left to decide.
+    at_target_frac: float = 0.8
+    #: Trail distance for the runner, in ATR.
+    trail_atr_mult: float = 1.5
+    #: Efficiency ratio below which the trend is no longer considered intact,
+    #: so the runner does not arm. Keep at or above params.regime.trend_above,
+    #: or the supervisor will call a trend healthy that the router would not
+    #: have entered on.
+    min_trend_efficiency: float = 0.25
+
+
+@dataclass
+class HorizonConfig:
+    #: Rule 3. When the target cannot arrive within `hours` at the recent
+    #: pace, stop reaching for it. What happens then depends on the trade,
+    #: and each of the three outcomes has its own switch below.
+    enabled: bool = True
+    hours: float = 5.0
+    #: A trade is left alone for this long before the rule may fire. Without
+    #: it a position that ticks adverse in its first seconds is killed before
+    #: the setup has had a single bar to work.
+    grace_minutes: float = 20.0
+    #: Bars the pace is measured over. Short enough to notice a turn -- 8 bars
+    #: is 2 hours on the 15m interval -- without reading noise as a reversal
+    #: on every tick.
+    drift_window_bars: int = 8
+    #: Not in profit: close at market and free the slot. Off: leave it to its
+    #: stop and take-profit.
+    cut_losers: bool = True
+    #: In profit but the market has turned away from the target: bank it.
+    bank_turning_profit: bool = True
+    #: In profit, still moving the right way but too slowly: pull the target in
+    #: to what is reachable and trail harvest_trail_atr_mult behind the peak.
+    harvest: bool = True
+    #: Trail distance once harvesting, in ATR. Tighter than the runner's: the
+    #: point is no longer to let it run, it is to leave on the next swing.
+    harvest_trail_atr_mult: float = 0.5
+
+
+@dataclass
+class FailedBreakoutConfig:
+    #: Rule 4. In profit and price back through the level the breakout broke:
+    #: take the profit. Never fires underwater -- the resting stop is a better
+    #: price than a market exit there.
+    enabled: bool = True
+
+
+GROUPS = {"breakeven": BreakevenConfig, "runner": RunnerConfig,
+          "horizon": HorizonConfig, "failed_breakout": FailedBreakoutConfig,
+          "protect": ProtectConfig, "monitor": MonitorConfig}
+
+
+@dataclass
 class SuperviseConfig:
-    #: OFF by default. An exit rule that has not been measured has no business
-    #: touching money -- the same standard risk.trailing_atr_mult is held to.
+    #: The master switch for the four exit rules. OFF by default: an exit rule
+    #: that has not been measured has no business touching money -- the same
+    #: standard risk.trailing_atr_mult is held to. Each rule also has its own
+    #: `enabled` below. protect and monitor are NOT under this switch: the
+    #: watchdog guards positions whether or not the rules run.
     enabled: bool = False
 
     #: Round-trip cost as a percentage of notional, used as the margin above
@@ -96,39 +173,10 @@ class SuperviseConfig:
     #: microcap is the larger half. Never set this to the fee figure alone.
     cost_buffer_pct: float = 0.15
 
-    # -- rule 1
-    breakeven_at_r: float = 1.0
-
-    # -- rule 2
-    #: Fraction of the way to the ORIGINAL target at which the runner arms.
-    #: Must be < 1.0: at 1.0 the take-profit has already filled and there is
-    #: nothing left to decide.
-    runner_at_target_frac: float = 0.8
-    #: Trail distance for the runner, in ATR.
-    trail_atr_mult: float = 1.5
-
-    # -- rule 3
-    horizon_hours: float = 5.0
-    #: A trade is left alone for this long before the horizon rule may fire.
-    #: Without it a position that ticks adverse in its first seconds is killed
-    #: before the setup has had a single bar to work.
-    grace_minutes: float = 20.0
-    #: Trail distance once harvesting, in ATR. Tighter than the runner's: the
-    #: point is no longer to let it run, it is to leave on the next swing.
-    harvest_trail_atr_mult: float = 0.5
-    #: Efficiency ratio below which the trend is no longer considered intact.
-    #: Keep at or above params.regime.trend_above, or the supervisor will call
-    #: a trend healthy that the router would not have entered on.
-    min_trend_efficiency: float = 0.25
-
-    #: Bars the drift estimate is measured over. Short enough to notice a turn
-    #: -- 8 bars is 2 hours on the 15m interval -- without reading noise as a
-    #: reversal on every tick.
-    drift_window_bars: int = 8
-
-    # -- rule 4
-    failed_breakout_exit: bool = True
-
+    breakeven: BreakevenConfig = field(default_factory=BreakevenConfig)
+    runner: RunnerConfig = field(default_factory=RunnerConfig)
+    horizon: HorizonConfig = field(default_factory=HorizonConfig)
+    failed_breakout: FailedBreakoutConfig = field(default_factory=FailedBreakoutConfig)
     #: The protection watchdog (bot/protect.py): puts back a missing stop or
     #: take-profit on any open position, adopting untracked ones.
     protect: ProtectConfig = field(default_factory=ProtectConfig)
@@ -137,27 +185,22 @@ class SuperviseConfig:
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
     def __post_init__(self):
-        if self.monitor is None:
-            self.monitor = MonitorConfig()
-        elif isinstance(self.monitor, dict):
-            try:
-                self.monitor = MonitorConfig(**self.monitor)
-            except TypeError as e:
-                valid = ", ".join(sorted(MonitorConfig.__dataclass_fields__))
-                raise TypeError(f"bad key under supervise.monitor ({e}). "
-                                f"Valid keys: {valid}") from None
-        # config.yaml hands the group over as a dict.
-        if self.protect is None:
-            self.protect = ProtectConfig()
-        elif isinstance(self.protect, dict):
-            try:
-                self.protect = ProtectConfig(**self.protect)
-            except TypeError as e:
-                if "supervise.protect" in str(e):
-                    raise
-                valid = ", ".join(sorted(ProtectConfig.__dataclass_fields__))
-                raise TypeError(f"bad key under supervise.protect ({e}). "
-                                f"Valid keys: {valid}") from None
+        # config.yaml hands each group over as a dict.
+        for name, cls in GROUPS.items():
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, cls())
+            elif isinstance(value, dict):
+                try:
+                    setattr(self, name, cls(**value))
+                except TypeError as e:
+                    if "supervise." in str(e):
+                        raise           # a nested group already named itself
+                    valid = ", ".join(sorted(cls.__dataclass_fields__))
+                    raise TypeError(f"bad key under supervise.{name} ({e}). "
+                                    f"Valid keys: {valid}") from None
+            elif not isinstance(value, cls):
+                raise TypeError(f"supervise.{name} must be a block of settings")
 
 
 def _sign(pos) -> int:
@@ -255,7 +298,7 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
     in_profit = favour(pos, price) > cost
 
     # ---------------------------------------------------------------- rule 1
-    if r_peak >= cfg.breakeven_at_r:
+    if cfg.breakeven.enabled and r_peak >= cfg.breakeven.at_r:
         moved = _tighter(pos, pos.stop, breakeven)
         if moved is not None:
             plan.stop = moved
@@ -267,10 +310,11 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
     # which is deliberate: without a scale-out it would cancel a take-profit
     # that is about to fill and gamble a booked win on a trail.
     target_r = abs(pos.initial_target - pos.entry) / r_unit if pos.initial_target else 0.0
-    if (not pos.runner and scale_out_qty > 0 and target_r > 0
-            and r_peak >= cfg.runner_at_target_frac * target_r
+    if (cfg.runner.enabled and not pos.runner and scale_out_qty > 0
+            and target_r > 0
+            and r_peak >= cfg.runner.at_target_frac * target_r
             and reading.atr > 0
-            and reading.efficiency >= cfg.min_trend_efficiency):
+            and reading.efficiency >= cfg.runner.min_trend_efficiency):
         plan.target_qty = scale_out_qty
         plan.note(f"runner armed at {r_peak:.2f}R of a {target_r:.2f}R target "
                   f"(ER {reading.efficiency:.2f}): banking {scale_out_qty:g}, "
@@ -280,24 +324,25 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
     # take-profit number would just move the ceiling; removing it for the half
     # that is still open is what "let the winner run" actually means.
     if (pos.runner or plan.target_qty) and reading.atr > 0:
-        trail = peak - sign * cfg.trail_atr_mult * reading.atr
-        floor = breakeven if r_peak >= cfg.breakeven_at_r else None
+        trail = peak - sign * cfg.runner.trail_atr_mult * reading.atr
+        floor = breakeven if r_peak >= cfg.breakeven.at_r else None
         if floor is not None:
             trail = max(trail, floor) if pos.is_long else min(trail, floor)
         moved = _tighter(pos, plan.stop if plan.stop is not None else pos.stop, trail)
         if moved is not None:
             plan.stop = moved
-            plan.note(f"runner trail {cfg.trail_atr_mult:g}xATR from {peak:.6g}")
+            plan.note(f"runner trail {cfg.runner.trail_atr_mult:g}xATR from {peak:.6g}")
 
     # ---------------------------------------------------------------- rule 3
-    horizon_bars = (cfg.horizon_hours * 3600.0 / reading.bar_seconds
+    hz = cfg.horizon
+    horizon_bars = (hz.hours * 3600.0 / reading.bar_seconds
                     if reading.bar_seconds > 0 else 0.0)
-    past_grace = reading.age_seconds >= cfg.grace_minutes * 60.0
+    past_grace = reading.age_seconds >= hz.grace_minutes * 60.0
     # A negative efficiency reading means "not enough bars to know", which is
     # NOT the same as "no directional progress". Treating the two alike would
     # make a cold start -- the one moment the bot knows least -- close the
     # position for being unreachable.
-    if (past_grace and horizon_bars > 0 and reading.atr > 0
+    if (hz.enabled and past_grace and horizon_bars > 0 and reading.atr > 0
             and pos.take_profit and reading.efficiency >= 0):
         remaining = (pos.take_profit - price) * sign
         # Progress per bar in THIS position's favour. Negative means the market
@@ -312,25 +357,27 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
 
         if bars_needed > horizon_bars:
             if not in_profit:
-                plan.exit_now = True
-                plan.note(f"target needs {bars_needed:.0f} bars against a "
-                          f"{horizon_bars:.0f}-bar horizon and the trade is not "
-                          f"in profit; releasing the slot")
+                if hz.cut_losers:
+                    plan.exit_now = True
+                    plan.note(f"target needs {bars_needed:.0f} bars against a "
+                              f"{horizon_bars:.0f}-bar horizon and the trade is "
+                              f"not in profit; releasing the slot")
             elif drift <= 0:
                 # In profit and the market has turned. This is the case worth
                 # the most: take what the trade can actually give rather than
                 # holding out for a number it is now walking away from.
-                plan.exit_now = True
-                plan.note(f"in profit at {r_now:.2f}R and drifting away from "
-                          f"the target; banking it")
-            else:
+                if hz.bank_turning_profit:
+                    plan.exit_now = True
+                    plan.note(f"in profit at {r_now:.2f}R and drifting away "
+                              f"from the target; banking it")
+            elif hz.harvest:
                 reachable = price + sign * horizon_bars * drift
                 pull = _pull_in(pos, pos.take_profit, reachable)
                 if pull is not None and favour(pos, pull) > cost:
                     plan.target = pull
                     plan.note(f"target needs {bars_needed:.0f} bars; pulled in "
                               f"to {pull:.6g}")
-                tight = peak - sign * cfg.harvest_trail_atr_mult * reading.atr
+                tight = peak - sign * hz.harvest_trail_atr_mult * reading.atr
                 # Never settle for a harvest that the costs would eat. The
                 # runner branch floors its trail at break even and this one
                 # has to as well: "take the profit that is there" is not
@@ -343,13 +390,13 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
                 moved = _tighter(pos, plan.stop if plan.stop is not None else pos.stop, tight)
                 if moved is not None:
                     plan.stop = moved
-                    plan.note(f"harvest trail {cfg.harvest_trail_atr_mult:g}xATR")
+                    plan.note(f"harvest trail {hz.harvest_trail_atr_mult:g}xATR")
 
     # ---------------------------------------------------------------- rule 4
     # Only ever banks a profit. A breakout that has failed AND is underwater is
     # left to the stop: exiting at market there converts a maybe into a certain
     # loss at a worse price than the stop that is already resting.
-    if (cfg.failed_breakout_exit and pos.ref_level and in_profit
+    if (cfg.failed_breakout.enabled and pos.ref_level and in_profit
             and not plan.exit_now):
         given_back = (price - pos.ref_level) * sign <= 0
         if given_back:

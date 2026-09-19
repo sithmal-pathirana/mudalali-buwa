@@ -74,8 +74,11 @@ SETTINGS  (written to config.yaml, applied on restart)
 /aggressive           aggressive mode and profile
 /aggressive on|off    turn it on or off
 /aggressive <profile> moderate | high | maximum
-/supervisor           position supervisor state
-/supervisor on|off    turn the position supervisor on or off
+/supervisor           every supervisor ability and whether it is on
+/supervisor on|off    turn the whole supervisor on or off
+/supervisor <name> on|off  one ability: breakeven, runner, horizon,
+                      cutlosers, bankturn, harvest, breakout, review
+/supervisor report <minutes>  position report interval (0 = off)
 /gainer               gainer mining settings and their values
 /gainer <name> <value> change one: size, confirm, rising, minrise,
                       cooldown, target, onleader, hold
@@ -242,7 +245,7 @@ class TelegramControl:
             "/resume": lambda: self._ask("resume", "Clear the halt and resume trading?"),
             "/set": lambda: self._set(arg, rest),
             "/aggressive": lambda: self._aggressive(arg),
-            "/supervisor": lambda: self._supervisor(arg),
+            "/supervisor": lambda: self._supervisor(arg, rest),
             "/gainer": lambda: self._gainer(arg, rest),
             "/restart": lambda: self._ask(
                 "restart", "Restart the bot?"),
@@ -382,23 +385,56 @@ class TelegramControl:
             return
         self._ask("set", f"Change {key}?", value=f"{key}={value}")
 
-    def _supervisor(self, arg: str) -> None:
-        """A shorthand over /set for supervise.enabled."""
-        from .settings import EDITABLE, parse_value
+    #: /supervisor's short names, in the order the rules run.
+    SUPERVISOR_KEYS = {
+        "breakeven": "supervise.breakeven.enabled",
+        "runner": "supervise.runner.enabled",
+        "horizon": "supervise.horizon.enabled",
+        "cutlosers": "supervise.horizon.cut_losers",
+        "bankturn": "supervise.horizon.bank_turning_profit",
+        "harvest": "supervise.horizon.harvest",
+        "breakout": "supervise.failed_breakout.enabled",
+        "review": "supervise.monitor.review_exits",
+        "report": "supervise.monitor.report_minutes",
+    }
 
-        key = "supervise.enabled"
+    def _supervisor(self, arg: str, rest: list[str] | None = None) -> None:
+        """
+        `/supervisor` lists every ability, `/supervisor on|off` is the master
+        switch, `/supervisor <name> <value>` changes one ability. A shorthand
+        over /set, so every change is validated and confirmed the same way.
+        """
+        from .settings import EDITABLE, TRUE, FALSE, parse_value
+
+        master = "supervise.enabled"
         if not arg:
-            self.send(f"{self.read().get('mode_line', '')}\n\n"
-                      f"{key}   {self._fmt_current(key)}\n\n"
-                      f"/supervisor on | off\n\n"
-                      f"Written to config.yaml; /restart applies it.")
+            lines = [self.read().get("mode_line", ""), "",
+                     f"  {'on/off':<10}{master}  {self._fmt_current(master)}", ""]
+            for name, key in self.SUPERVISOR_KEYS.items():
+                lines.append(f"  {name:<10}{key}  {self._fmt_current(key)}")
+            lines += ["",
+                      "/supervisor on|off          all four rules",
+                      "/supervisor <name> on|off   one ability",
+                      "/supervisor <name>          explains one",
+                      "",
+                      "The protection watchdog is not switchable from here.",
+                      "Written to config.yaml; /restart applies it."]
+            self.send("\n".join(lines))
             return
-        try:
-            value = parse_value(EDITABLE[key], arg)
-        except ValueError as e:
-            self.send(f"Refused: {e}")
+        if arg in TRUE or arg in FALSE:
+            try:
+                value = parse_value(EDITABLE[master], arg)
+            except ValueError as e:
+                self.send(f"Refused: {e}")
+                return
+            self._ask("set", f"Change {master}?", value=f"{master}={value}")
             return
-        self._ask("set", f"Change {key}?", value=f"{key}={value}")
+        key = self.SUPERVISOR_KEYS.get(arg)
+        if key is None:
+            self.send(f"Refused: {arg!r} is not a supervisor ability. Use on, "
+                      f"off, or one of: {', '.join(self.SUPERVISOR_KEYS)}.")
+            return
+        self._set(key, rest or [])
 
     #: /gainer's short names, grouped as config.yaml groups them.
     GAINER_KEYS = {

@@ -172,6 +172,17 @@ aggressive:
 # NEARUSDT and inert on the 6-9%-ATR microcaps the scanner keeps picking.
 #
 #   run.py trade      the supervisor logs every level it moves and why
+#
+# EVERY ABILITY HAS ITS OWN SWITCH (2026-09-19, by request), so each can be
+# measured on its own. `enabled` directly under supervise: is the master
+# switch for the four exit rules; protect: and monitor: further down are NOT
+# under it -- the watchdog guards positions whether or not the rules run.
+# From Telegram: /supervisor lists every switch, /supervisor <name> on|off.
+#
+# Replayed on all 53 past strategy trades (2026-09-07 to 09-19, report
+# "Supervisor Replay Review"): the four rules as below +4.5R, no rules at all
+# +5.9R, failed_breakout off +6.5R, horizon off +0.5R. The rules roughly halve
+# the average loss (-0.47R vs -0.96R) and the worst day (-2.4R vs -4.6R).
 supervise:
   enabled: true
 
@@ -180,13 +191,16 @@ supervise:
   # 0.05% taker out = about $0.006 on an $8 order); the rest is slippage,
   # which on a thin microcap is the larger half. Do NOT cut this to the fee
   # figure -- a break-even stop that does not clear slippage is a losing stop.
+  # Shared by every rule that moves a stop to break even.
   cost_buffer_pct: 0.15
 
-  # RULE 1 -- break even. Once the trade has been this far ahead at any point,
+  # RULE 1 -- break even. Once the trade has been at_r ahead at any point,
   # the stop moves to entry + cost_buffer and the trade can no longer lose.
   # Measured on the peak, not the current price, so giving back an advance
   # still banks the protection.
-  breakeven_at_r: 1.0
+  breakeven:
+    enabled: true
+    at_r: 1.0
 
   # RULE 2 -- the runner. Approaching the target with the trend intact, bank
   # half at the original target and let the rest run on a trail with no
@@ -196,46 +210,58 @@ supervise:
   # a rule that fired there would cancel an order about to fill and gamble a
   # booked win on a trail. 0.8 of 1.5R = 1.2R, comfortably before the fill.
   #
-  # THIS RULE ENABLES ITSELF. Splitting a position needs BOTH halves to clear
-  # the $5 exchange minimum, so it stays dormant until the position is worth
-  # $10. At risk 3.5% over a 7% stop the order is equity x 0.5, which puts the
-  # switch-on point at $20.00 of equity -- about $3 above where the account is
-  # now. Nothing to remember to turn on: engine.scale_out_qty returns 0 below
-  # that and the rule simply does not fire.
-  runner_at_target_frac: 0.8
-  trail_atr_mult: 1.5
+  # IT STAYS DORMANT ON ITS OWN until a position is worth twice the $5
+  # exchange minimum (engine.scale_out_qty returns 0 below that). A position
+  # already split keeps its trail even if this is switched off later.
+  runner:
+    enabled: true
+    at_target_frac: 0.8
+    trail_atr_mult: 1.5
+    # Below this efficiency ratio the trend is not intact and the runner does
+    # not arm. Keep at or above params.regime.trend_above below, or the
+    # supervisor calls a trend healthy that the router would not enter on.
+    min_trend_efficiency: 0.25
 
   # RULE 3 -- the horizon. Not a timeout: nothing is force-closed for being
   # old. On every tick the bot asks whether the target can still arrive inside
-  # this many hours --
-  #     distance to target  /  (efficiency ratio x ATR per bar)  =  bars needed
-  # -- and if it cannot, it stops reaching for it: pull the target in to
-  # something reachable and tighten to harvest_trail when the trade is in
-  # profit, leave at market when it is not. The second case is the one that
-  # matters most here: it frees the only position slot. That slot was occupied
-  # 86% of 2026-09-12 while the scanner ranked the rest of the board every 300
-  # seconds and discarded the result.
+  # `hours` at the pace of the last drift_window_bars --
+  #     distance to target  /  pace per bar  =  bars needed
+  # -- and if it cannot, it stops reaching for it. What it does then depends
+  # on the trade, and each outcome has its own switch:
+  #   cut_losers           not in profit: close at market, free the slot
+  #   bank_turning_profit  in profit, market turned away: bank it
+  #   harvest              in profit, just slow: pull the target in to what is
+  #                        reachable, trail harvest_trail_atr_mult behind peak
+  # Replay: cut_losers was right 16 times of 23 (+10.0R saved, -13.0R given up
+  # on the 7 that recovered), but the rule as a whole is worth keeping --
+  # horizon off drops the replay from +4.5R to +0.5R.
   #
   # The forecast is an EXTRAPOLATION of the velocity the symbol has just had,
   # not a prediction, and it is wrong exactly when the regime turns. It is
   # used only to stop reaching for a target, never to justify holding one.
-  horizon_hours: 5.0
-  harvest_trail_atr_mult: 0.5
-  # Left alone for this long first. Without it a position that ticks adverse
-  # in its first seconds is closed before the setup has had one bar to work --
-  # 龙虾USDT was 95% of the way to its stop 103 seconds after entry on
-  # 2026-09-12, and cutting there would have been noise, not judgement.
-  grace_minutes: 20
-  # Keep at or above params.regime.trend_above below, or the supervisor calls
-  # a trend healthy that the router would not have entered on.
-  min_trend_efficiency: 0.25
+  horizon:
+    enabled: true
+    hours: 5.0
+    # Left alone for this long first. Without it a position that ticks adverse
+    # in its first seconds is closed before the setup has had one bar to
+    # work -- 龙虾USDT was 95% of the way to its stop 103 seconds after entry
+    # on 2026-09-12, and cutting there would have been noise, not judgement.
+    grace_minutes: 20
+    drift_window_bars: 8       # 2 hours of 15m bars
+    cut_losers: true
+    bank_turning_profit: true
+    harvest: true
+    harvest_trail_atr_mult: 0.5
 
   # RULE 4 -- a breakout that gives back its own trigger level is over. The
   # level comes from the strategy (Signal.ref_level, the channel high or low
   # it broke). Only ever banks a PROFIT: underwater, the resting stop is a
   # better price than a market exit, so this rule stands aside. Adopted
-  # positions have no recorded level, so it is off for them.
-  failed_breakout_exit: true
+  # positions have no recorded level, so it is off for them. The one rule that
+  # replays worse than no supervisor (+6.5R with it off vs +4.5R), on few
+  # trades -- a candidate to test off, not yet a verdict.
+  failed_breakout:
+    enabled: true
 
   # THE PROTECTION WATCHDOG (bot/protect.py). About once a minute, halted or
   # not, every open position is checked for a stop-loss AND a take-profit on
@@ -276,6 +302,7 @@ supervise:
       # alert, never close.
       close_after_attempts: 3
     entry:
+      enabled: true
       # Skip an entry when the price has moved since the signal so that less
       # than this fraction of the planned entry-to-stop distance is left. STG
       # had 0.19 left (fill 0.1523, stop 0.1513, planned from 0.1566).
