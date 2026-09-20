@@ -80,7 +80,15 @@ risk:
   # In a flat or falling market specifically, 2.0% halts 85.8% of the time,
   # and the best median available at ANY risk level is $93 at 0.25%. The user
   # accepted that to raise the chance of a $140 month from ~1% to ~35%.
-  risk_per_trade_pct: 2.0
+  #
+  # BACK TO 0.5 on 2026-09-20 at the user's request, after the entry signal was
+  # measured. Over a year of hourly data on 53 perpetuals, the breakout wins
+  # 41.2% against a coin flip's 40.0%: an edge of +0.030R a trade against a
+  # round-trip cost of 0.147R. Sixteen replacement entry signals were screened
+  # in and out of sample and none survived. Size cannot fix a negative
+  # expectancy, so this goes back to the level that bleeds slowest while the
+  # strategy is still unproven. 0.5% of $84 = about $0.42 risked per trade.
+  risk_per_trade_pct: 0.5
   max_position_pct: 100.0
   # 10% of $12 = $1.20: roughly three consecutive stop-outs at 3.5% each ends
   # the day. Was 30.0, which was sized for aggressive mode's ~14.3% trades.
@@ -214,7 +222,18 @@ aggressive:
 # +5.9R, failed_breakout off +6.5R, horizon off +0.5R. The rules roughly halve
 # the average loss (-0.47R vs -0.96R) and the worst day (-2.4R vs -4.6R).
 supervise:
-  enabled: true
+  # OFF from 2026-09-20 at the user's request, and the measurement agrees.
+  # Re-running the strategy over 62 days with the horizon rule on took the
+  # win rate from 41.2% to 19.4% and profit per trade from -0.117R to
+  # -0.164R: it halves the losses and still loses more, because it releases
+  # trades that had not turned profitable YET. In the live rehearsal it
+  # closed all six shorts before any of them reached a stop or a target,
+  # five at exactly the 20-minute grace mark.
+  #
+  # This switch is the whole module, so break-even and the runner trail go
+  # off with the horizon rule. That matches what was measured: -0.117R is
+  # the supervisor-off number.
+  enabled: false
 
   # Round-trip cost as a percent of notional, and the margin above entry that
   # "break even" actually means. Fees are only ~0.07% of it (0.02% maker in,
@@ -512,9 +531,9 @@ portfolio:
   # $100 basis (2026-09-19): 0.5% = $0.50 per position. Keep equal to
   # risk.risk_per_trade_pct.
   #
-  # 2.0 from 2026-09-20, tracking risk.risk_per_trade_pct as the note there
-  # requires. $2.00 per position on a $100 basis.
-  single_position_cap_pct: 2.0
+  # Back to 0.5 on 2026-09-20 with risk.risk_per_trade_pct, which this must
+  # stay equal to -- see the note there for why the raise was reverted.
+  single_position_cap_pct: 0.5
   # Equal to the single-position cap on purpose: one position at a time, so
   # the most a correlated selloff takes in one event is 3.5%, not a multiple
   # of it. Raise this one alone if you later want concurrency.
@@ -523,17 +542,16 @@ portfolio:
   # four positions of 0.5%. On 2026-09-18 ten correlated longs opened in one
   # hour at 3.75% combined; this caps what one market-wide drop can take.
   #
-  # 8.0 from 2026-09-20, so four positions of 2.0% still fit. allocate()
-  # sizes each position at min(single_position_cap_pct, this / eligible) and
-  # trims to hard_cap (4 below), so at 2.0% a budget of 8.0 is what makes
-  # 4 x 2.00% reachable; leaving it at 2.0 would have given 4 x 0.50% and
-  # quietly kept the old risk level while the config claimed otherwise.
+  # Back to 2.0 on 2026-09-20 with the risk revert. allocate() sizes each
+  # position at min(single_position_cap_pct, this / eligible) and trims to
+  # hard_cap (4 below), so a budget of 2.0 against a 0.5% cap gives exactly
+  # 4 x 0.50% = 2.00% total -- the allocation as it stood before the raise.
   #
   # Read the consequence plainly: four correlated longs at their stops in one
   # market-wide drop now takes 8% of equity in a single event, four times
   # what the 2026-09-18 note above was written to prevent. That is the cost
   # of the 2.0% decision, and it is why the equity floor is the last guard.
-  portfolio_risk_pct: 8.0
+  portfolio_risk_pct: 2.0
   # Left at the MEASURED stop distance, not lowered to flatter the sizing.
   # Real signals here stop ~7% away (PUMPUSDT needed 7.2%); the earlier 0.025
   # was fiction and made allocate() ask for 8x equity. Lowering it would shrink
