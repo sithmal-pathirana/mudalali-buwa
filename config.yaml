@@ -64,7 +64,23 @@ risk:
   # $100 BASIS, 2026-09-19, for the go-live on 2026-09-25 (applied to the
   # testnet rehearsal first, by request). 0.5% of $100 = $0.50 risked per
   # trade. Still equal to portfolio.single_position_cap_pct below.
-  risk_per_trade_pct: 0.5
+  #
+  # RAISED TO 2.0 on 2026-09-20 at the user's explicit request, after being
+  # shown what it does. $2.00 risked per trade. This is a deliberate bet on
+  # upside, not a measured improvement -- the strategy has no edge
+  # out-of-sample, so bigger size buys variance, not return. Simulated over
+  # 20,000 months on the measured trade distribution, blended across three
+  # market windows:
+  #
+  #   risk    median   5th    95th   halts <$70   P(>=$140)
+  #   0.5%    106.68   88     129        1.2%         0.9%
+  #   1.0%    112.32   75     163        4.2%        16.5%
+  #   2.0%    116.20   69     251       28.6%        35.2%   <- here
+  #
+  # In a flat or falling market specifically, 2.0% halts 85.8% of the time,
+  # and the best median available at ANY risk level is $93 at 0.25%. The user
+  # accepted that to raise the chance of a $140 month from ~1% to ~35%.
+  risk_per_trade_pct: 2.0
   max_position_pct: 100.0
   # 10% of $12 = $1.20: roughly three consecutive stop-outs at 3.5% each ends
   # the day. Was 30.0, which was sized for aggressive mode's ~14.3% trades.
@@ -72,7 +88,14 @@ risk:
   # $100 basis: 3% = $3.00, six full $0.50 stop-outs. The supervisor cut the
   # average 2026-09-18 loss to ~0.4R, so about fourteen ordinary losers. 10%
   # would have let one bad day take $10.
-  daily_loss_limit_pct: 3.0
+  #
+  # OFF (0) from 2026-09-20 at the user's request -- "i dont care about the
+  # daily losses i need monthly income". 0 means no limit; risk.py guards the
+  # zero explicitly, because >= 0 would otherwise halt on the first tick the
+  # account is not up, permanently, and engine.py will not boot past a halt.
+  # With this off, min_equity_usdt below is the ONLY remaining circuit
+  # breaker: nothing stops a single bad day short of a 30% drawdown.
+  daily_loss_limit_pct: 0
   # Entries sent per day, filled or not; 0 = no cap. OFF (0) for the demo from
   # 2026-09-19 at the user's request, to gather more trades on the new
   # settings. What still limits activity: the daily loss limit above, the
@@ -93,7 +116,13 @@ risk:
   # representative stop no longer funds the $5 minimum and allocate() would
   # skip every signal in silence; halting at $80 says so first and leaves the
   # decision to you.
-  min_equity_usdt: 80.00
+  #
+  # LOWERED TO 70.00 on 2026-09-20, the drawdown the user said they accept.
+  # The silent-skip reasoning above was written for 0.5% risk; at 2.0% the
+  # budget clears the $5 minimum down to about $17.50 of equity, so $70 is
+  # a policy floor now, not an arithmetic one. With the daily loss limit off
+  # this is the only thing that stops a losing run.
+  min_equity_usdt: 70.00
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
@@ -482,7 +511,10 @@ portfolio:
   #
   # $100 basis (2026-09-19): 0.5% = $0.50 per position. Keep equal to
   # risk.risk_per_trade_pct.
-  single_position_cap_pct: 0.5
+  #
+  # 2.0 from 2026-09-20, tracking risk.risk_per_trade_pct as the note there
+  # requires. $2.00 per position on a $100 basis.
+  single_position_cap_pct: 2.0
   # Equal to the single-position cap on purpose: one position at a time, so
   # the most a correlated selloff takes in one event is 3.5%, not a multiple
   # of it. Raise this one alone if you later want concurrency.
@@ -490,7 +522,18 @@ portfolio:
   # $100 basis: 2.0% = $2.00 with every position at its stop at once, i.e.
   # four positions of 0.5%. On 2026-09-18 ten correlated longs opened in one
   # hour at 3.75% combined; this caps what one market-wide drop can take.
-  portfolio_risk_pct: 2.0
+  #
+  # 8.0 from 2026-09-20, so four positions of 2.0% still fit. allocate()
+  # sizes each position at min(single_position_cap_pct, this / eligible) and
+  # trims to hard_cap (4 below), so at 2.0% a budget of 8.0 is what makes
+  # 4 x 2.00% reachable; leaving it at 2.0 would have given 4 x 0.50% and
+  # quietly kept the old risk level while the config claimed otherwise.
+  #
+  # Read the consequence plainly: four correlated longs at their stops in one
+  # market-wide drop now takes 8% of equity in a single event, four times
+  # what the 2026-09-18 note above was written to prevent. That is the cost
+  # of the 2.0% decision, and it is why the equity floor is the last guard.
+  portfolio_risk_pct: 8.0
   # Left at the MEASURED stop distance, not lowered to flatter the sizing.
   # Real signals here stop ~7% away (PUMPUSDT needed 7.2%); the earlier 0.025
   # was fiction and made allocate() ask for 8x equity. Lowering it would shrink
