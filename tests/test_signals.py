@@ -31,9 +31,26 @@ class TestNeverLeaksTheAccount(unittest.TestCase):
         return ch.sent[0]
 
     def test_entry_carries_the_prices(self):
+        """
+        Symbol, direction and all three prices. The labels moved in the
+        2026-09-20 restyle (pair naming, "Stop"/"Target", percentages), so
+        this asserts the VALUES as well -- a relabel is cosmetic, a dropped
+        price is a reader acting on an incomplete signal.
+        """
         msg = self._entry()
-        for part in ("BUY DOGEUSDT", "Entry", "Stop loss", "Take profit"):
+        for part in ("DOGE/USDT", "BUY", "Entry", "Stop", "Target"):
             self.assertIn(part, msg)
+        for price in ("0.0862", "0.0845", "0.0895"):
+            self.assertIn(price, msg)
+
+    def test_entry_states_the_direction_unambiguously(self):
+        """SELL must not be readable as BUY by a skimming reader."""
+        ch = channel()
+        ch.entry("DOGEUSDT", "SELL", 0.0862, 0.0880, 0.0820,
+                 mode="live", dry_run=False)
+        head = ch.sent[0].split("\n\n")[1]
+        self.assertIn("SELL", head)
+        self.assertNotIn("BUY", head)
 
     def test_entry_never_mentions_size_or_balance(self):
         msg = self._entry().lower()
