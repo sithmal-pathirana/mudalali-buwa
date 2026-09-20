@@ -20,6 +20,8 @@ from bot.positions import ActivePosition                # noqa: E402
 from bot.risk import KILL_FILE                          # noqa: E402
 from bot.state import STATE_PATH, State                 # noqa: E402
 from bot.strategies.base import Bar, Signal, Strategy   # noqa: E402
+from bot import backtest as bt
+from bot.strategies.trend_atr import TrendATR
 
 
 class TestF1PositionTracking(unittest.TestCase):
@@ -604,3 +606,38 @@ class TestDocumentedPathsMatchTheCode(unittest.TestCase):
     def test_setup_locates_its_source_without_naming_the_directory(self):
         """So the checkout can be called anything."""
         self.assertIn('dirname "$0"', self.setup)
+
+
+class TestSignalBarIsNotTheFillBar(unittest.TestCase):
+    """
+    A breakout limit rests at a level price has just left, so it fills bars
+    later and price has retraced by then. Measuring entry QUALITY at the fill
+    bar therefore reads the trade's own early profit back as if it were a
+    property of the decision -- an apparent +0.47R "edge" on 2026-09-20 was
+    entirely this. Trade records both indices so the distinction stays visible.
+    """
+
+    @staticmethod
+    def _bars(closes, spread=0.5):
+        return [Bar(i * 900_000, c, c + spread, c - spread, c, 100.0)
+                for i, c in enumerate(closes)]
+
+    def test_fill_bar_is_later_than_the_signal_bar(self):
+        # Flat, one bar pops above the channel at index 30 (the signal), price
+        # eases back and the limit fills at index 32, then it runs to target.
+        closes = [100.0] * 30 + [104.0, 103.0, 104.5] + [110.0] * 20
+        strat = TrendATR(channel=6, atr_period=14)
+        res = bt.run(self._bars(closes), strat, equity=1000.0, risk_pct=1.0,
+                     max_leverage=10.0, min_notional=1.0, entry_expiry_bars=8)
+        self.assertTrue(res.trades, "expected the breakout to fill")
+        t = res.trades[0]
+        self.assertGreater(t.entry_index, t.signal_index,
+                           "the fill must come after the bar that decided")
+
+    def test_signal_index_points_at_the_breakout_bar(self):
+        closes = [100.0] * 30 + [104.0, 103.0, 104.5] + [110.0] * 20
+        strat = TrendATR(channel=6, atr_period=14)
+        res = bt.run(self._bars(closes), strat, equity=1000.0, risk_pct=1.0,
+                     max_leverage=10.0, min_notional=1.0, entry_expiry_bars=8)
+        t = res.trades[0]
+        self.assertEqual(closes[t.signal_index], 104.0)

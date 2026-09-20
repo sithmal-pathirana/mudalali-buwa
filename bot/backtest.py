@@ -39,7 +39,13 @@ class Trade:
     reason: str
     pnl: float = 0.0
     fees: float = 0.0
+    #: bar the limit entry FILLED on. Not the bar that produced the signal --
+    #: a breakout entry rests at a level price has just left, so the fill is
+    #: typically several bars later and price has retraced by then.
     entry_index: int = 0
+    #: bar whose close produced the signal, i.e. where the strategy decided.
+    #: Anything measuring the QUALITY OF THE DECISION must use this one.
+    signal_index: int = 0
 
 
 @dataclass
@@ -166,7 +172,8 @@ def run(bars: list[Bar], strategy, equity: float, risk_pct: float,
                 day_pnl += pnl
                 res.trades.append(Trade(pos["side"], pos["entry"], exit_px, pos["qty"],
                                         i - pos["opened_at"], reason, pnl, fees,
-                                        entry_index=pos["opened_at"]))
+                                        entry_index=pos["opened_at"],
+                                        signal_index=pos["placed_at"]))
                 pos = None
 
         # Day boundary, in UTC, matching the live engine's roll.
