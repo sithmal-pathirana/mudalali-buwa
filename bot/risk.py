@@ -56,7 +56,13 @@ class RiskManager:
             # mode the README tells you to live in for days.
             by_realized = -self.state.realized_today / self.state.day_start_equity * 100
             drawdown_pct = max(by_equity, by_realized)
-            if drawdown_pct >= self.cfg.daily_loss_limit_pct:
+            # 0 = no daily limit, matching max_trades_per_day below. Without
+            # this guard, 0 means "halt at >= 0% drawdown", which fires on the
+            # first tick the account is not up -- a PERMANENT halt that the
+            # engine then refuses to boot past. Anyone switching the limit off
+            # the obvious way would brick the bot.
+            if (self.cfg.daily_loss_limit_pct > 0
+                    and drawdown_pct >= self.cfg.daily_loss_limit_pct):
                 self.state.halt(
                     f"daily loss limit hit: -{drawdown_pct:.2f}% "
                     f"(limit {self.cfg.daily_loss_limit_pct:.2f}%). "

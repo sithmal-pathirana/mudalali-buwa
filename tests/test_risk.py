@@ -209,3 +209,40 @@ class TestBacktestHonesty(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDailyLossLimitOff(unittest.TestCase):
+    """0 must mean "no limit", not "halt at zero drawdown"."""
+
+    def setUp(self):
+        self.tmp = Path("data/test_dll_state.json")
+        self.tmp.unlink(missing_ok=True)
+
+    def tearDown(self):
+        self.tmp.unlink(missing_ok=True)
+
+    def _guard(self, limit, realized):
+        g, st = fresh(self.tmp, min_equity_usdt=0.0,
+                      daily_loss_limit_pct=limit, max_trades_per_day=0)
+        st.day_start_equity = 100.0
+        st.realized_today = realized
+        return g, st
+
+    def test_zero_does_not_halt_on_a_losing_day(self):
+        g, st = self._guard(0.0, -25.0)
+        self.assertTrue(g.preflight(75.0).allowed)
+        self.assertFalse(st.halted)
+
+    def test_zero_does_not_halt_on_a_flat_day(self):
+        g, st = self._guard(0.0, 0.0)
+        self.assertTrue(g.preflight(100.0).allowed)
+        self.assertFalse(st.halted)
+
+    def test_a_real_limit_still_halts(self):
+        g, st = self._guard(3.0, -5.0)
+        self.assertFalse(g.preflight(95.0).allowed)
+        self.assertTrue(st.halted)
+
+
+if __name__ == "__main__":
+    unittest.main()
