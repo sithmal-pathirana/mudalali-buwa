@@ -517,6 +517,25 @@ universe:
   min_atr_pct: 0.25
   rescan_seconds: 300
 
+  # WHICH VENUE'S LIQUIDITY COUNTS. Testnet reports synthetic 24h volume --
+  # test bots churn it -- so min_quote_volume above measures nothing there.
+  # Checked 2026-09-20: the scanner ranked XRPUSDT at $124,551M (real: $1,295M)
+  # and TAGUSDT at $1,902M (real: $5.8M). 54 of the 100 selected symbols were
+  # below the $20M floor on real volume, and only 46 would have appeared in the
+  # live universe at all -- so the rehearsal was measuring the strategy on
+  # coins the live bot would never choose, and paying microcap slippage to do
+  # it (AKEUSDT's stop at 0.0611 filled near 0.0580).
+  #
+  # With this on, the floor and the ranking read the live exchange while orders
+  # still go to the venue in `mode`. Both are no-ops in live mode, where the
+  # trading venue already is the live one -- which is the point: the rehearsal
+  # now picks the same universe the go-live run will.
+  rank_by_live_volume: true
+  # Testnet keeps delisted contracts in TRADING status long after the real
+  # venue has settled them. On 2026-09-20 that was FXSUSDT, RDNTUSDT and
+  # SLERFUSDT -- tradable here, gone there.
+  require_listed_live: true
+
 # Telegram control. Outbound-only: the bot long-polls Telegram, so the host
 # needs no inbound port and nothing opened in a cloud security list. Commands
 # are accepted ONLY from TELEGRAM_CHAT_ID, and close/halt/resume each require

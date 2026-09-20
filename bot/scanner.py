@@ -78,6 +78,20 @@ class ScanConfig:
     weight_atr: float = 0.35
     weight_liquidity: float = 0.15
 
+    #: Rank and filter by volume from the LIVE exchange even while trading on
+    #: testnet. Testnet's own 24h volume is synthetic -- test bots churn it --
+    #: which makes min_quote_volume above meaningless there. Measured
+    #: 2026-09-20: of the 100 symbols selected on testnet volume, 54 were under
+    #: the $20M floor on real volume, and only 46 would have been in the live
+    #: universe at all. The bot was trading $5M microcaps believing them to be
+    #: $1B markets, and paying for it in slippage. No effect in live mode,
+    #: where the trading venue already IS the live venue.
+    rank_by_live_volume: bool = False
+    #: Drop symbols the live exchange no longer lists. Testnet keeps delisted
+    #: contracts in TRADING status long after the real venue has settled them
+    #: -- FXSUSDT, RDNTUSDT and SLERFUSDT on 2026-09-20.
+    require_listed_live: bool = False
+
 
 @dataclass
 class ScanResult:
@@ -118,6 +132,11 @@ class ScanResult:
 
 
 class Scanner:
+    #: How long live-venue liquidity data is reused. The scan runs every
+    #: rescan_seconds; refetching a 700-symbol ticker board each time would be
+    #: pure waste when 24h volume barely moves in five minutes.
+    REF_TTL = 900.0
+
     def __init__(self, api, cfg: ScanConfig | None = None):
         self.api = api
         self.cfg = cfg or ScanConfig()
@@ -125,8 +144,65 @@ class Scanner:
         self._info = None
         self.last: ScanResult | None = None
         self._last_scan = 0.0
+        self._ref = None
+        self._ref_cache = None
+        self._ref_at = 0.0
+        self._ref_warned = False
+        self._last_delisted: list[str] = []
 
     # ----------------------------------------------------------- universe
+    def _live_reference(self):
+        """
+        Read-only public client on the LIVE venue, for liquidity data only.
+
+        The trading client is untouched: this one never places an order and
+        needs no credentials, because /exchangeInfo and /ticker/24hr are
+        unsigned. Returns None when there is nothing to borrow -- either the
+        feature is off, or the bot is already trading live.
+        """
+        if not (self.cfg.rank_by_live_volume or self.cfg.require_listed_live):
+            return None
+        if not getattr(self.api, "testnet", False):
+            return None
+        if self._ref is None:
+            from .binanceapi import Binance
+            self._ref = Binance(testnet=False,
+                                timeout=getattr(self.api, "timeout", 10))
+        return self._ref
+
+    def _live_liquidity(self):
+        """
+        (quote volumes, listed symbols) from the live venue, cached.
+
+        Returns (None, None) when unavailable, and the caller then falls back
+        to the trading venue's own figures -- a scan on imperfect volume data
+        beats no scan at all.
+        """
+        ref = self._live_reference()
+        if ref is None:
+            return None, None
+        if self._ref_cache and time.time() - self._ref_at < self.REF_TTL:
+            return self._ref_cache
+        try:
+            info = ref.exchange_info()
+            listed = {s["symbol"] for s in info["symbols"]
+                      if s.get("status") == "TRADING"
+                      and s.get("contractType") == "PERPETUAL"}
+            vols = {t["symbol"]: float(t.get("quoteVolume", 0) or 0)
+                    for t in ref.ticker_24hr()}
+        except Exception as exc:
+            if not self._ref_warned:
+                log.warning("live liquidity reference unreachable (%s); using "
+                            "the trading venue's own volume instead", exc)
+                self._ref_warned = True
+            return None, None
+        if self._ref_warned:
+            log.info("live liquidity reference is back")
+            self._ref_warned = False
+        self._ref_cache = (vols, listed)
+        self._ref_at = time.time()
+        return self._ref_cache
+
     def universe(self) -> list[dict]:
         """
         Liquid, actively traded USDT perpetuals, cheapest-first by one request.
@@ -143,16 +219,37 @@ class Scanner:
             and s.get("quoteAsset") == "USDT"
             and s.get("baseAsset") not in EXCLUDE_BASES
         }
+        live_vols, live_listed = self._live_liquidity()
+
+        if live_listed is not None and self.cfg.require_listed_live:
+            gone = sorted(s for s in tradable if s not in live_listed)
+            for sym in gone:
+                del tradable[sym]
+            if gone != self._last_delisted:
+                if gone:
+                    log.info("universe: dropped %d symbol(s) the live exchange "
+                             "no longer lists: %s", len(gone), ", ".join(gone[:12]))
+                self._last_delisted = gone
+
+        # Volume decides both the floor and the ranking, so it has to be the
+        # real thing. Price still comes from the venue we actually trade on.
+        ranking_vols = live_vols if self.cfg.rank_by_live_volume else None
+
         tickers = self.api.ticker_24hr()
         rows = []
         for t in tickers:
             sym = t.get("symbol")
             if sym not in tradable:
                 continue
-            try:
-                qv = float(t.get("quoteVolume", 0))
-            except (TypeError, ValueError):
-                continue
+            if ranking_vols is not None:
+                qv = ranking_vols.get(sym)
+                if qv is None:
+                    continue      # not quoted live: no real liquidity to rank
+            else:
+                try:
+                    qv = float(t.get("quoteVolume", 0))
+                except (TypeError, ValueError):
+                    continue
             if qv < self.cfg.min_quote_volume:
                 continue
             rows.append({"symbol": sym, "quote_volume": qv,
