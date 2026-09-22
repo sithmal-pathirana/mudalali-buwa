@@ -254,10 +254,10 @@ supervise:
   # RULE 2 -- the runner. Approaching the target with the trend intact, bank
   # half at the original target and let the rest run on a trail with no
   # ceiling. Arms at this FRACTION of the way to the target, never at the
-  # target itself: params.trend below sets atr_stop_mult 2.0 and
-  # atr_target_mult 3.0, so the take-profit already sits at exactly 1.5R, and
+  # target itself: params.trend below sets atr_stop_mult 3.0 and
+  # atr_target_mult 3.0, so the take-profit already sits at exactly 1.0R, and
   # a rule that fired there would cancel an order about to fill and gamble a
-  # booked win on a trail. 0.8 of 1.5R = 1.2R, comfortably before the fill.
+  # booked win on a trail. 0.8 of 1.0R = 0.8R, comfortably before the fill.
   #
   # IT STAYS DORMANT ON ITS OWN until a position is worth twice the $5
   # exchange minimum (engine.scale_out_qty returns 0 below that). A position
@@ -353,7 +353,7 @@ supervise:
       # instead of only warning every minute.
       adopt_untracked: true
     stop:
-      atr_mult: 2.0          # = params.trend.atr_stop_mult, the strategy's own distance
+      atr_mult: 3.0          # = params.trend.atr_stop_mult, the strategy's own distance
       fallback_pct: 3.0      # used when the symbol's bars cannot be read
       min_gap_pct: 0.5       # never nearer the mark than this; nearer is the STG -2021
     target:
@@ -669,9 +669,24 @@ params:
     recent_er_window: 20
     min_recent_er: 0.25
     atr_period: 14
-    atr_stop_mult: 2.0
+    # 2026-09-22, at the user's request ("C longs only"): replayed over the
+    # 80 top-volume coins x 78 days (2026-07-05 to 09-22), 4 slots, $100 at
+    # 0.5% risk, 0.15% round-trip cost, halves split at 2026-08-20:
+    #                                 win   R/trade  1st / 2nd half  max DD
+    #   old (2/3 ATR, both sides)     40%   -0.113   -0.154 / -0.062   53%
+    #   these settings                57%   +0.099   +0.048 / +0.134  7.6%
+    # Still +0.063R at double the cost. Shorts lost in both halves under
+    # every exit tried (-0.19R here); breakouts under 0.8% ATR lose to costs,
+    # because the round trip is a bigger share of a small ATR; breakouts with
+    # little lead over the 50-bar EMA lost the most. The wider stop is where
+    # the win rate comes from: 2 ATR sat inside normal noise. The 2nd half
+    # was an alt rally (median coin +42%), the 1st flat (+2%).
+    atr_stop_mult: 3.0
     atr_target_mult: 3.0
-    min_atr_pct: 0.15
+    min_atr_pct: 0.8         # ATR(14) as % of price; was 0.15
+    allow_shorts: false
+    min_ema_lead_pct: 3.0    # close at least 3% beyond its 50-bar EMA
+    lead_ema_period: 50
   revert:
     window: 20
     z_entry: 2.0

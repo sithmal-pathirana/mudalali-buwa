@@ -144,6 +144,11 @@ class Scanner:
         self._info = None
         self.last: ScanResult | None = None
         self._last_scan = 0.0
+        #: Bars fetched per symbol, when more than the scan itself needs. The
+        #: engine sets this to the strategy's warmup: the candidates' bars are
+        #: what the strategy is evaluated on, and too few of them make it
+        #: return None for every symbol without saying why.
+        self.history_bars = 0
         self._ref = None
         self._ref_cache = None
         self._ref_at = 0.0
@@ -296,7 +301,8 @@ class Scanner:
             sym = row["symbol"]
             try:
                 kl = self.api.klines(sym, self.cfg.interval,
-                                     limit=self.cfg.lookback + 2)
+                                     limit=max(self.cfg.lookback + 2,
+                                               self.history_bars))
             except Exception as e:
                 res.rejected.append(Candidate(sym, row["price"], row["quote_volume"],
                                               0, 0, 0, rejected=f"klines: {e}"))

@@ -1410,6 +1410,7 @@ class Engine:
         if self.cfg.portfolio.enabled:
             from .scanner import ScanConfig, Scanner
             self.scanner = Scanner(self.api, ScanConfig(**(self.cfg.universe or {})))
+            self.scanner.history_bars = self.strategy.warmup + 2
             log.info("portfolio mode ON: scanning up to %d symbols every %ds",
                      self.scanner.cfg.max_symbols, self.scanner.cfg.rescan_seconds)
             # Scan once now. Waiting for the first bar close meant /scan and the
