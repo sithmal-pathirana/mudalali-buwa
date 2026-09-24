@@ -43,7 +43,10 @@ strategy: switcher     # switcher | trend_atr | mean_reversion | funding_arb
 poll_seconds: 20       # only used when realtime: false
 
 risk:
-  max_leverage: 3            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
+  # 2 from 2026-09-24, the user's go-ahead for the gainer go-live: at 2x
+  # isolated a position is liquidated near -49%, well past the gainer's 30%
+  # stop (at 3x liquidation sat near -32%, barely beyond it).
+  max_leverage: 2            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
   # 3.5% of $12 = $0.42 risked between entry and stop, down from 20.0.
   # MUST STAY EQUAL to portfolio.single_position_cap_pct below. Portfolio mode
   # sizes from that cap, but engine._scan_budget filters the universe from
@@ -130,7 +133,11 @@ risk:
   # budget clears the $5 minimum down to about $17.50 of equity, so $70 is
   # a policy floor now, not an arithmetic one. With the daily loss limit off
   # this is the only thing that stops a losing run.
-  min_equity_usdt: 70.00
+  #
+  # LOWERED TO 25.00 on 2026-09-24 at the user's go-ahead, for the gainer
+  # go-live with $50 (+$50/month): half the first deposit. At $70 a $50
+  # account could not start at all.
+  min_equity_usdt: 25.00
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
