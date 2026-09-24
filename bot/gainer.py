@@ -192,6 +192,19 @@ class GainerSweepConfig:
     pct: float = 25.0
     #: Amounts under this are carried forward and added to the next one.
     min_transfer_usdt: float = 1.0
+    #: Principal recovery. When the trading balance reaches principal_trigger_x
+    #: times everything deposited so far, move the deposits not yet moved out
+    #: to Funding; the rest (1.5x the deposits at the default 2.5) is profit,
+    #: and that keeps trading.
+    principal_enabled: bool = False
+    principal_trigger_x: float = 2.5
+    #: Deposits are the transfers INTO the USD-M futures wallet from this UTC
+    #: date on (YYYY-MM-DD), read from Binance's income history. Required:
+    #: the rule stays off until it is set, so years-old transfers never count.
+    deposits_since: str = ""
+    #: Use this figure instead of Binance's history (paper/testnet rehearsals,
+    #: or deposits made before deposits_since). 0 = read Binance.
+    deposits_override_usdt: float = 0.0
 
 
 GROUPS = {"board": GainerBoardConfig, "entry": GainerEntryConfig,
@@ -443,6 +456,12 @@ class GainerMiner:
         self.sweep_pending = 0.0
         self.swept_total = 0.0
         self._sweep_error = ""
+        #: Principal already moved to Funding, and principal whose transfer
+        #: failed and is waiting. Pending amounts are ring-fenced: the engine
+        #: takes them out of the equity it sizes and risks trades with.
+        self.principal_withdrawn = 0.0
+        self.principal_pending = 0.0
+        self._principal_note = ""
         self.load()
 
     @property
@@ -460,6 +479,8 @@ class GainerMiner:
         self.closed_at = {s: float(t) for s, t in (raw.get("closed_at") or {}).items()}
         self.sweep_pending = float(raw.get("sweep_pending", 0.0))
         self.swept_total = float(raw.get("swept_total", 0.0))
+        self.principal_withdrawn = float(raw.get("principal_withdrawn", 0.0))
+        self.principal_pending = float(raw.get("principal_pending", 0.0))
         for sym, t in (raw.get("tracks") or {}).items():
             try:
                 self.tracks[sym] = Track(**t)
@@ -476,6 +497,8 @@ class GainerMiner:
                  "closed_at": self.closed_at,
                  "sweep_pending": self.sweep_pending,
                  "swept_total": self.swept_total,
+                 "principal_withdrawn": self.principal_withdrawn,
+                 "principal_pending": self.principal_pending,
                  "tracks": {s: asdict(t) for s, t in self.tracks.items()}},
                 indent=2))
             tmp.replace(self.path)
@@ -859,6 +882,7 @@ class GainerMiner:
             self.notify(f"PAPER CLOSED {symbol} at {price:,.6g} for {pnl:+.2f} USDT\n{why}",
                         symbol=symbol)
             self.sweep_profit(symbol, pnl)
+            self.check_principal()
             return
         if self.engine.close_position(f"gainer mining -- {why}", symbol=symbol):
             del self.tracks[symbol]
@@ -957,30 +981,119 @@ class GainerMiner:
             log.info("gainer sweep: %s +%.2f, %.2f USDT pending (moves at %.2f)",
                      symbol, pnl, self.sweep_pending, sw.min_transfer_usdt)
             return
-        simulated = self.paper or getattr(self.engine.api, "testnet", False)
-        if not simulated:
-            try:
-                self.engine.api.universal_transfer("USDT", f"{amount:.2f}")
-            except Exception as e:           # noqa: BLE001 -- see docstring
-                self.save()
-                msg = str(e)
-                log.error("gainer sweep of %.2f USDT failed: %s", amount, msg)
-                if msg != self._sweep_error:
-                    self._sweep_error = msg
-                    self.notify(f"SWEEP FAILED: could not move {amount:.2f} USDT to the "
-                                f"Funding wallet ({msg}). It stays pending and is retried "
-                                f"after the next winning trade. Check that the API key has "
-                                f"\"Permits Universal Transfer\" enabled.",
-                                event=Event.ERROR)
-                return
-            self._sweep_error = ""
+        if not self._transfer(amount, "profit"):
+            self.save()
+            return
         self.sweep_pending = round(self.sweep_pending - amount, 8)
         self.swept_total += amount
         self.save()
-        where = ("would have moved (paper/testnet: nothing sent)" if simulated
-                 else "moved to the Funding wallet")
-        self.notify(f"SWEEP: {amount:.2f} USDT {where} -- {sw.pct:g}% of {symbol}'s "
-                    f"+{pnl:.2f}. Total banked: {self.swept_total:.2f} USDT", symbol=symbol)
+        self.notify(f"SWEEP: {amount:.2f} USDT {self._where()} -- {sw.pct:g}% of "
+                    f"{symbol}'s +{pnl:.2f}. Total banked: {self.swept_total:.2f} USDT",
+                    symbol=symbol)
+
+    @property
+    def simulated(self) -> bool:
+        return self.paper or bool(getattr(self.engine.api, "testnet", False))
+
+    def _where(self) -> str:
+        return ("would have moved (paper/testnet: nothing sent)" if self.simulated
+                else "moved to the Funding wallet")
+
+    def _transfer(self, amount: float, what: str) -> bool:
+        """Futures -> Funding. True when it moved (or, simulated, would have)."""
+        if self.simulated:
+            return True
+        try:
+            self.engine.api.universal_transfer("USDT", f"{amount:.2f}")
+        except Exception as e:               # noqa: BLE001 -- never disturb a close
+            msg = str(e)
+            log.error("gainer %s transfer of %.2f USDT failed: %s", what, amount, msg)
+            if msg != self._sweep_error:
+                self._sweep_error = msg
+                self.notify(f"SWEEP FAILED: could not move {amount:.2f} USDT ({what}) to "
+                            f"the Funding wallet ({msg}). It is set aside -- the bot will "
+                            f"not trade with it -- and retried after the next close. "
+                            f"Check that the API key has \"Permits Universal Transfer\".",
+                            event=Event.ERROR)
+            return False
+        self._sweep_error = ""
+        return True
+
+    @property
+    def reserved_usdt(self) -> float:
+        """Money waiting to move to Funding. The engine does not trade it."""
+        if not self.cfg.sweep.enabled:
+            return 0.0
+        return max(0.0, self.sweep_pending) + max(0.0, self.principal_pending)
+
+    def deposits(self) -> float | None:
+        """USDT transferred INTO the futures wallet since sweep.deposits_since."""
+        sw = self.cfg.sweep
+        if sw.deposits_override_usdt > 0:
+            return sw.deposits_override_usdt
+        if not sw.deposits_since:
+            return None
+        import datetime as _dt
+        try:
+            since = _dt.datetime.strptime(sw.deposits_since, "%Y-%m-%d").replace(
+                tzinfo=_dt.timezone.utc)
+        except ValueError:
+            return None
+        start = int(since.timestamp() * 1000)
+        total, seen = 0.0, set()
+        for _ in range(20):                  # 1,000 rows a page is plenty per month
+            rows = self.engine.api.income("TRANSFER", start_ms=start, limit=1000) or []
+            for r in rows:
+                key = r.get("tranId") or (r.get("time"), r.get("income"))
+                if key in seen or r.get("asset", "USDT") != "USDT":
+                    continue
+                seen.add(key)
+                amt = float(r.get("income") or 0.0)
+                if amt > 0:                  # our own sweeps out are negative
+                    total += amt
+            if len(rows) < 1000:
+                break
+            start = int(rows[-1].get("time", start)) + 1
+        return total
+
+    def check_principal(self) -> None:
+        """
+        sweep.principal_*: once the trading balance is principal_trigger_x
+        times all deposits so far, move the deposits not yet moved out to
+        Funding. A failed move is ring-fenced and retried. Never raises.
+        """
+        sw = self.cfg.sweep
+        if not (sw.enabled and sw.principal_enabled):
+            return
+        try:
+            dep = self.deposits()
+        except Exception as e:               # noqa: BLE001
+            log.warning("gainer principal check: deposits unreadable (%s)", e)
+            return
+        if dep is None:
+            if self._principal_note != "no-date":
+                self._principal_note = "no-date"
+                self.notify("Principal recovery is on but gainer.sweep.deposits_since is "
+                            "not set, so deposits cannot be counted. It stays idle.")
+            return
+        owed = int((dep - self.principal_withdrawn) * 100) / 100.0
+        if self.principal_pending > 0:
+            amount = self.principal_pending               # retry a failed move
+        elif owed > 0 and self.engine.equity + self.reserved_usdt >= sw.principal_trigger_x * dep:
+            amount = owed
+        else:
+            return
+        if not self._transfer(amount, "principal"):
+            self.principal_pending = amount
+            self.save()
+            return
+        self.principal_pending = 0.0
+        self.principal_withdrawn += amount
+        self.save()
+        self.notify(f"PRINCIPAL SAFE: {amount:.2f} USDT {self._where()}. The trading "
+                    f"balance reached {sw.principal_trigger_x:g}x the {dep:.2f} USDT "
+                    f"deposited; {self.principal_withdrawn:.2f} USDT of deposits is now "
+                    f"in Funding and only profit is trading.")
 
     def check_milestones(self, prices: dict) -> None:
         for sym, t in self.tracks.items():
@@ -1018,8 +1131,10 @@ class GainerMiner:
         if self.waiting:
             lines.append(f"watching {self.waiting} (#1, held back by an entry guard)")
         if self.cfg.sweep.enabled:
-            lines.append(f"banked in Funding: {self.swept_total:.2f} USDT"
-                         + (f" (+{self.sweep_pending:.2f} pending)" if self.sweep_pending else ""))
+            lines.append(f"banked in Funding: {self.swept_total:.2f} USDT profit, "
+                         f"{self.principal_withdrawn:.2f} USDT principal"
+                         + (f"; set aside, not traded: {self.reserved_usdt:.2f} USDT"
+                            if self.reserved_usdt else ""))
         lines.append("")
         lines += self.board.board_lines(now, set(self.tracks))
         fc = self.board.forecast(now)

@@ -519,6 +519,17 @@ gainer:
     enabled: true
     pct: 25.0
     min_transfer_usdt: 1.0     # smaller amounts wait for the next win
+    # Principal recovery, requested 2026-09-24: when the trading balance
+    # reaches 2.5x everything deposited, move the deposits to Funding and keep
+    # trading the remaining 1.5x. Deposits are transfers INTO the futures
+    # wallet from deposits_since on, read from Binance; the rule stays idle
+    # until that date is set. Money waiting to move (a failed transfer, or a
+    # sweep under min_transfer_usdt) is set aside: the bot sizes and risks
+    # trades on the balance WITHOUT it.
+    principal_enabled: true
+    principal_trigger_x: 2.5
+    deposits_since: ""         # YYYY-MM-DD, the day the gainer account is funded
+    deposits_override_usdt: 0.0
 
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,

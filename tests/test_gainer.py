@@ -646,6 +646,100 @@ class Sweep(unittest.TestCase):
         self.assertEqual(len(e.api.transfers), 1)
 
 
+class Principal(unittest.TestCase):
+    """sweep.principal_*: deposits out at 2.5x; money waiting to move is not traded."""
+
+    class API(Sweep.LiveAPI):
+        def __init__(self, deposits=(), **kw):
+            super().__init__(**kw)
+            self.rows = [{"incomeType": "TRANSFER", "asset": "USDT", "income": str(d),
+                          "time": 1000 + i, "tranId": i} for i, d in enumerate(deposits)]
+
+        def income(self, income_type=None, start_ms=None, limit=100):
+            return list(self.rows)
+
+    def make(self, equity, deposits=(100.0,), fail=None, **sweep):
+        api = self.API(deposits=deposits, fail=fail)
+        cfg = dict(enabled=True, pct=25, principal_enabled=True,
+                   deposits_since="2026-09-25")
+        cfg.update(sweep)
+        m, e = miner(dry=False, api=api, sweep=cfg)
+        e.equity = equity
+        return m, e
+
+    def test_deposits_count_only_money_coming_in(self):
+        m, e = self.make(100, deposits=(100.0, 50.0, -25.0))
+        self.assertAlmostEqual(m.deposits(), 150.0)
+
+    def test_below_two_and_a_half_times_nothing_moves(self):
+        m, e = self.make(249.0)
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [])
+
+    def test_at_two_and_a_half_times_the_deposits_move_out(self):
+        m, e = self.make(250.0)
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [("USDT", "100.00", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.principal_withdrawn, 100.0)
+        self.assertTrue(any("PRINCIPAL SAFE" in b for b in bodies(e)))
+
+    def test_deposits_already_moved_out_are_not_moved_twice(self):
+        m, e = self.make(250.0)
+        m.check_principal()
+        e.equity = 400.0
+        m.check_principal()
+        self.assertEqual(len(e.api.transfers), 1)
+
+    def test_a_later_deposit_moves_out_at_the_next_trigger(self):
+        m, e = self.make(250.0)
+        m.check_principal()                              # 100 out
+        e.api.rows.append({"incomeType": "TRANSFER", "asset": "USDT",
+                           "income": "50", "time": 5000, "tranId": 9})
+        e.equity = 374.0                                 # 2.5 x 150 = 375
+        m.check_principal()
+        self.assertEqual(len(e.api.transfers), 1)
+        e.equity = 375.0
+        m.check_principal()
+        self.assertEqual(e.api.transfers[-1][1], "50.00")
+
+    def test_a_failed_move_is_set_aside_and_not_traded(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        self.assertAlmostEqual(m.principal_pending, 100.0)
+        self.assertAlmostEqual(m.reserved_usdt, 100.0)
+        e.effective_equity = lambda actual: actual
+        self.assertAlmostEqual(e.sizing_equity(250.0), 150.0)
+
+    def test_a_failed_profit_sweep_is_also_set_aside(self):
+        m, e = self.make(50.0, fail="no permission")
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertAlmostEqual(m.reserved_usdt, 2.0)
+        e.effective_equity = lambda actual: actual
+        self.assertAlmostEqual(e.sizing_equity(50.0), 48.0)
+
+    def test_the_set_aside_money_moves_on_the_retry(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        e.api.fail = None
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [("USDT", "100.00", "UMFUTURE_FUNDING")])
+        self.assertEqual(m.reserved_usdt, 0.0)
+        self.assertAlmostEqual(m.principal_withdrawn, 100.0)
+
+    def test_without_a_start_date_it_stays_idle_and_says_so_once(self):
+        m, e = self.make(1000.0, deposits_since="")
+        m.check_principal()
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [])
+        self.assertEqual(sum("deposits_since" in b for b in bodies(e)), 1)
+
+    def test_state_survives_a_restart(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        again = GainerMiner(e, m.cfg, path=m.path)
+        self.assertAlmostEqual(again.principal_pending, 100.0)
+
+
 def time_now():
     import time
     return time.time()

@@ -1328,7 +1328,7 @@ class Engine:
 
         snap = reconcile(self.api, self.cfg.symbol)
         self.actual_equity = snap["equity"]
-        self.equity = self.effective_equity(snap["equity"])
+        self.equity = self.sizing_equity(snap["equity"])
         if self.equity != self.actual_equity:
             log.warning("equity capped at %.2f USDT for sizing "
                         "(account actually holds %.2f)",
@@ -2198,7 +2198,7 @@ class Engine:
 
         snap = reconcile(self.api, self.cfg.symbol)
         self.actual_equity = snap["equity"]
-        self.equity = self.effective_equity(snap["equity"])
+        self.equity = self.sizing_equity(snap["equity"])
 
         self.rebase_day_start_equity()
         if self.state.roll_day_if_needed(self.equity):
@@ -2797,13 +2797,21 @@ class Engine:
             self.review.add(pos, pnl, reason)
 
     def sweep_gainer_profit(self, pos: ActivePosition, pnl: float) -> None:
-        """gainer.sweep: bank part of a winning gainer trade. Never raises."""
+        """gainer.sweep: bank part of a winning gainer trade, then check the
+        principal rule. Never raises."""
         if self.gainer is None or getattr(pos, "strategy", "") != "gainer":
             return
         try:
             self.gainer.sweep_profit(pos.symbol, pnl)
+            self.gainer.check_principal()
         except Exception:
             log.exception("gainer sweep after %s failed", pos.symbol)
+
+    def sizing_equity(self, actual: float) -> float:
+        """effective_equity, less money set aside for the Funding wallet: a
+        transfer that failed must not be traded and lost meanwhile."""
+        reserved = self.gainer.reserved_usdt if self.gainer is not None else 0.0
+        return max(0.0, self.effective_equity(actual) - reserved)
 
     def monitor_positions(self, now: float | None = None) -> None:
         """
