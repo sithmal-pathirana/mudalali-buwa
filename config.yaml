@@ -233,7 +233,7 @@ supervise:
   # This switch is the whole module, so break-even and the runner trail go
   # off with the horizon rule. That matches what was measured: -0.117R is
   # the supervisor-off number.
-  enabled: false
+  enabled: true
 
   # Round-trip cost as a percent of notional, and the margin above entry that
   # "break even" actually means. Fees are only ~0.07% of it (0.02% maker in,
@@ -596,6 +596,10 @@ universe:
   # venue has settled them. On 2026-09-20 that was FXSUSDT, RDNTUSDT and
   # SLERFUSDT -- tradable here, gone there.
   require_listed_live: true
+  # Compute signals on LIVE candles too; orders still go to the venue in
+  # `mode`. Testnet's own candles gave 26 breakout bars from 2026-09-22 to
+  # 09-24 that the live market never printed. No-op in live mode.
+  signal_bars_from_live: true
 
 # Telegram control. Outbound-only: the bot long-polls Telegram, so the host
 # needs no inbound port and nothing opened in a cloud security list. Commands
@@ -681,8 +685,16 @@ params:
     # little lead over the 50-bar EMA lost the most. The wider stop is where
     # the win rate comes from: 2 ATR sat inside normal noise. The 2nd half
     # was an alt rally (median coin +42%), the 1st flat (+2%).
+    # 2026-09-24: target 3.0 -> 4.5 ATR. Replayed over the top 80 coins x
+    # 186 days (2026-03 to 09-24), per-coin regime, 0.15% cost:
+    #                 win   R/trade   R by month (Mar..Sep)
+    #   3 / 3 ATR     54%   +0.042    -10 -22 +21 +11 +14 +18 +30
+    #   3 / 4.5 ATR   46%   +0.105    -5 -19 +40 +17 +17 +50 +46
+    #   3 / 6 ATR     39%   +0.123    -8 -35 +25 +13  +8 +85 +73
+    # 4.5 beat 3 in every month; 6 earned more in total but only through two
+    # rally months, and lost more in the weak ones.
     atr_stop_mult: 3.0
-    atr_target_mult: 3.0
+    atr_target_mult: 4.5
     min_atr_pct: 0.8         # ATR(14) as % of price; was 0.15
     allow_shorts: false
     min_ema_lead_pct: 3.0    # close at least 3% beyond its 50-bar EMA

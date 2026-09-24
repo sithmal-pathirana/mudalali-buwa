@@ -118,7 +118,9 @@ class RegimeSwitcher(Strategy):
         if len(bars) < self.warmup:
             return None
 
-        reading = self.detector.update(bars)
+        # read(), not update(): one switcher is asked about every coin the
+        # scanner passes, so the regime must come from these bars alone.
+        reading = self.detector.read(bars)
         self.last_reading = reading
         self.bars_in[reading.regime.value] += 1
 

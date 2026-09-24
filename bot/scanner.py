@@ -91,6 +91,13 @@ class ScanConfig:
     #: contracts in TRADING status long after the real venue has settled them
     #: -- FXSUSDT, RDNTUSDT and SLERFUSDT on 2026-09-20.
     require_listed_live: bool = False
+    #: Read the candidates' candles -- the bars every signal is computed on --
+    #: from the live exchange. Testnet candles are its own thin book: from
+    #: 2026-09-22 to 09-24 they gave 26 breakout bars the live market never
+    #: printed (BCHUSDT, METUSDT, BOMEUSDT among the trades), with ranges
+    #: about 17% narrower. Orders and fills stay on the trading venue. No
+    #: effect in live mode.
+    signal_bars_from_live: bool = False
 
 
 @dataclass
@@ -165,7 +172,8 @@ class Scanner:
         unsigned. Returns None when there is nothing to borrow -- either the
         feature is off, or the bot is already trading live.
         """
-        if not (self.cfg.rank_by_live_volume or self.cfg.require_listed_live):
+        if not (self.cfg.rank_by_live_volume or self.cfg.require_listed_live
+                or self.cfg.signal_bars_from_live):
             return None
         if not getattr(self.api, "testnet", False):
             return None
@@ -296,13 +304,15 @@ class Scanner:
         res = ScanResult()
         rows = self.universe()
         res.considered = len(rows)
+        source = (self._live_reference() if self.cfg.signal_bars_from_live
+                  else None) or self.api
 
         for row in rows:
             sym = row["symbol"]
             try:
-                kl = self.api.klines(sym, self.cfg.interval,
-                                     limit=max(self.cfg.lookback + 2,
-                                               self.history_bars))
+                kl = source.klines(sym, self.cfg.interval,
+                                   limit=max(self.cfg.lookback + 2,
+                                             self.history_bars))
             except Exception as e:
                 res.rejected.append(Candidate(sym, row["price"], row["quote_volume"],
                                               0, 0, 0, rejected=f"klines: {e}"))
