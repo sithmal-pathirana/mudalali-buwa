@@ -170,15 +170,38 @@ class PatienceConfig:
     skip_bank_turning_profit: bool = False
 
 
+@dataclass
+class LadderConfig:
+    #: Rule 5. Walk the stop, and later the target, up in steps once a trade
+    #: has proven itself. A step is step_frac of the distance from entry to
+    #: the ORIGINAL target. With the defaults (5 steps to the target):
+    #:   3 steps reached (60%)  stop to entry
+    #:   4 steps reached (80%)  stop to +1 step, target to +6 steps
+    #:   every step after       both move up one more step
+    #: Replayed 2026-09-24 over the top 80 coins x 186 days (3/4.5 ATR exits,
+    #: 8 slots at 1%): typical month $117 -> $118, losing months 18% -> 12%,
+    #: worst low $71 -> $76. Starting the stop at step 1 (break even at 20%)
+    #: replayed far worse, $105: normal 15m noise is about one step, so an
+    #: early stop sells the trades that were going to win.
+    enabled: bool = False
+    step_frac: float = 0.2
+    #: The stop starts moving at this many steps and trails this many behind.
+    stop_lag_steps: int = 3
+    #: The target starts moving at this many steps, to this many steps ahead
+    #: of the step reached. 0 = the target never moves.
+    target_from_step: int = 4
+    target_lead_steps: int = 2
+
+
 GROUPS = {"breakeven": BreakevenConfig, "runner": RunnerConfig,
           "horizon": HorizonConfig, "failed_breakout": FailedBreakoutConfig,
-          "patience": PatienceConfig,
+          "patience": PatienceConfig, "ladder": LadderConfig,
           "protect": ProtectConfig, "monitor": MonitorConfig}
 
 
 @dataclass
 class SuperviseConfig:
-    #: The master switch for the four exit rules. OFF by default: an exit rule
+    #: The master switch for the five exit rules. OFF by default: an exit rule
     #: that has not been measured has no business touching money -- the same
     #: standard risk.trailing_atr_mult is held to. Each rule also has its own
     #: `enabled` below. protect and monitor are NOT under this switch: the
@@ -196,6 +219,7 @@ class SuperviseConfig:
     horizon: HorizonConfig = field(default_factory=HorizonConfig)
     failed_breakout: FailedBreakoutConfig = field(default_factory=FailedBreakoutConfig)
     patience: PatienceConfig = field(default_factory=PatienceConfig)
+    ladder: LadderConfig = field(default_factory=LadderConfig)
     #: The protection watchdog (bot/protect.py): puts back a missing stop or
     #: take-profit on any open position, adopting untracked ones.
     protect: ProtectConfig = field(default_factory=ProtectConfig)
@@ -288,6 +312,14 @@ def _pull_in(pos, current: float, proposed: float) -> float | None:
         return proposed
     closer = proposed < current if pos.is_long else proposed > current
     return proposed if closer else None
+
+
+def _push_out(pos, current: float, proposed: float) -> float | None:
+    """A take-profit moved FURTHER from entry, or None if it is not."""
+    if current <= 0:
+        return proposed
+    further = proposed > current if pos.is_long else proposed < current
+    return proposed if further else None
 
 
 def supervise(pos, reading: Reading, cfg: SuperviseConfig,
@@ -432,6 +464,32 @@ def supervise(pos, reading: Reading, cfg: SuperviseConfig,
             plan.exit_now = True
             plan.note(f"breakout failed: price back through {pos.ref_level:.6g} "
                       f"with {r_now:.2f}R in hand")
+
+    # ---------------------------------------------------------------- rule 5
+    # Steps are counted on the peak, like rule 1, so a pullback after a step
+    # keeps what that step locked in.
+    lad = cfg.ladder
+    if lad.enabled and pos.initial_target and not plan.exit_now:
+        step = abs(pos.initial_target - pos.entry) * lad.step_frac
+        reached = int(favour(pos, peak) // step) if step > 0 else 0
+        if lad.stop_lag_steps > 0 and reached >= lad.stop_lag_steps:
+            level = pos.entry + sign * (reached - lad.stop_lag_steps) * step
+            moved = _tighter(pos, plan.stop if plan.stop is not None else pos.stop,
+                             level)
+            if moved is not None:
+                plan.stop = moved
+                plan.note(f"ladder: {reached} steps reached, stop to "
+                          f"+{reached - lad.stop_lag_steps} steps")
+        if (lad.target_from_step > 0 and reached >= lad.target_from_step
+                and pos.take_profit and not pos.runner
+                and plan.target_qty is None):
+            # A runner banks its half at the ORIGINAL target and trails the
+            # rest; extending that target would undo the split.
+            level = pos.entry + sign * (reached + lad.target_lead_steps) * step
+            pushed = _push_out(pos, plan.target or pos.take_profit, level)
+            if pushed is not None:
+                plan.target = pushed
+                plan.note(f"ladder: target to +{reached + lad.target_lead_steps} steps")
 
     # ------------------------------------------------------------ safety net
     # Binance rejects a trigger the mark price has already passed (-2021), and

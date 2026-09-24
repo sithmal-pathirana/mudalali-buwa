@@ -468,3 +468,48 @@ class TestApplyPlan(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLadder(unittest.TestCase):
+    """Rule 5, alone. Entry 100, target 110: one step is 2.0."""
+
+    OFF = dict(breakeven={"enabled": False}, runner={"enabled": False},
+               horizon={"enabled": False}, failed_breakout={"enabled": False})
+
+    def plan(self, peak, price=None, pos=None, **ladder):
+        c = cfg(ladder={"enabled": True, **ladder}, **self.OFF)
+        pos = pos or long_pos(stop=94.0, tp=110.0, peak=peak)
+        return supervise(pos, ok(price if price is not None else peak), c)
+
+    def test_nothing_moves_before_three_steps(self):
+        self.assertFalse(self.plan(peak=105.9))
+
+    def test_three_steps_moves_the_stop_to_entry(self):
+        p = self.plan(peak=106.0)
+        self.assertAlmostEqual(p.stop, 100.0)
+        self.assertIsNone(p.target)
+
+    def test_four_steps_locks_a_step_and_extends_the_target(self):
+        p = self.plan(peak=108.1)
+        self.assertAlmostEqual(p.stop, 102.0)
+        self.assertAlmostEqual(p.target, 112.0)
+
+    def test_steps_count_on_the_peak_not_the_price(self):
+        p = self.plan(peak=108.1, price=104.0)
+        self.assertAlmostEqual(p.stop, 102.0)
+
+    def test_the_target_never_comes_back_in(self):
+        pos = long_pos(stop=94.0, tp=116.0, peak=108.1)
+        self.assertIsNone(self.plan(peak=108.1, pos=pos).target)
+
+    def test_short_mirrors_the_long(self):
+        pos = short_pos(stop=106.0, tp=90.0, peak=91.9)
+        p = supervise(pos, ok_short(91.9),
+                      cfg(ladder={"enabled": True}, **self.OFF))
+        self.assertAlmostEqual(p.stop, 98.0)
+        self.assertAlmostEqual(p.target, 88.0)
+
+    def test_off_by_default(self):
+        c = cfg(**self.OFF)
+        self.assertFalse(supervise(long_pos(stop=94.0, tp=110.0, peak=109.0),
+                                   ok(109.0), c))
