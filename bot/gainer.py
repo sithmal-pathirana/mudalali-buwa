@@ -117,6 +117,11 @@ class GainerEntryConfig:
     #: stayed above deposits in 20 of 24 months, against 3 of 24 for one
     #: position at 50%.
     notional_pct_of_equity: float = 0.0
+    #: With notional_pct_of_equity, never size a trade below this: a small
+    #: account's percentage falls under Binance's $5 minimum after lot
+    #: rounding (10% of $50), and every trade would be refused. The engine's
+    #: leverage ceiling and equity floor still apply. 0 = no minimum.
+    min_notional_usdt: float = 0.0
     max_positions: int = 2
 
 
@@ -794,7 +799,8 @@ class GainerMiner:
         """USDT for the next trade: a share of equity, or the fixed amount."""
         en = self.cfg.entry
         if en.notional_pct_of_equity > 0:
-            return max(0.0, self.engine.equity) * en.notional_pct_of_equity / 100.0
+            pct = max(0.0, self.engine.equity) * en.notional_pct_of_equity / 100.0
+            return max(pct, en.min_notional_usdt) if pct > 0 else 0.0
         return en.notional_usdt
 
     def _read_fill(self, symbol: str) -> tuple[float, float]:

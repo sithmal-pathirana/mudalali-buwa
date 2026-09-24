@@ -775,6 +775,18 @@ class PercentSizing(unittest.TestCase):
         self.assertFalse(m.open("AAAUSDT", 1.0, 40))
         self.assertTrue(any("$4.00 is under the cheapest legal" in b for b in bodies(e)))
 
+    def test_a_small_account_trades_at_the_minimum(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10, min_notional_usdt=6.0))
+        e.equity = 50.0
+        self.assertAlmostEqual(m.trade_notional(), 6.0)      # 10% would be 5.00
+        e.equity = 300.0
+        self.assertAlmostEqual(m.trade_notional(), 30.0)     # the percentage takes over
+
+    def test_zero_equity_still_sizes_nothing(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10, min_notional_usdt=6.0))
+        e.equity = 0.0
+        self.assertEqual(m.trade_notional(), 0.0)
+
     def test_zero_keeps_the_fixed_amount(self):
         m, e = miner(entry=dict(notional_usdt=6.0))
         e.equity = 1000.0
