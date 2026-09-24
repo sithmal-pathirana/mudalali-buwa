@@ -2470,7 +2470,10 @@ class Engine:
         if failures is None:
             failures = self._protect_failures = {}
         stop_o, tp_o = self.protective_legs(orders)
-        if stop_o and tp_o:
+        # A position run with no take-profit on purpose (gainer ladder) is
+        # complete with its stop alone.
+        wants_tp = not pos.no_target
+        if stop_o and (tp_o or not wants_tp):
             failures.pop(symbol, None)
             return "ok"
 
@@ -2492,7 +2495,7 @@ class Engine:
         if row is None:
             return "skipped"            # closed meanwhile; reconcile books it
         stop_o, tp_o = self.protective_legs(fresh)
-        if stop_o and tp_o:
+        if stop_o and (tp_o or not wants_tp):
             failures.pop(symbol, None)
             return "ok"
         pos.qty = abs(float(row["positionAmt"]))
@@ -2500,11 +2503,13 @@ class Engine:
         a, er = self.market_reading(symbol)
         plan = plan_protection(
             long=pos.is_long, mark=mark, atr=a, efficiency=er,
-            has_stop=stop_o is not None, has_target=tp_o is not None,
+            has_stop=stop_o is not None,
+            has_target=tp_o is not None or not wants_tp,
             planned_stop=pos.stop, planned_target=pos.take_profit,
             cfg=self.cfg.supervise.protect)
         missing = " and ".join(n for n, o in (("stop-loss", stop_o),
-                                               ("take-profit", tp_o)) if o is None)
+                                               ("take-profit", tp_o or not wants_tp))
+                               if not o)
         log.critical("%s is open with no %s: %s", symbol, missing, plan.why)
 
         if plan.close_now:

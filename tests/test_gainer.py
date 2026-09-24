@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from bot.binanceapi import BinanceError                    # noqa: E402
 from bot.gainer import (GainerBoard, GainerConfig, GainerMiner,  # noqa: E402
-                        Track, net_pnl, rank_board, stop_price, target_price)
+                        Track, ladder_stop, net_pnl, rank_board, stop_price,
+                        target_price)
 from bot.notify import Event                               # noqa: E402
 from test_r2_regressions import StubAPI, engine            # noqa: E402
 
@@ -463,6 +464,108 @@ class SwapGuards(unittest.TestCase):
             m.tick(now=30 * i)
         opened = sum("OPENED" in b for b in bodies(e))
         self.assertEqual(opened, 2, "without the cooldown this opened 10 times")
+
+
+LADDER = dict(exit=dict(ladder_enabled=True, target_usd=0, stop_pct=30,
+                        ladder_first_pct=10, ladder_step_pct=10))
+
+
+class Ladder(unittest.TestCase):
+    """exit.ladder_*: no take-profit, a wide stop, walked up as the coin runs."""
+
+    def held(self, dry=True, api=None, **kw):
+        m, e = miner(dry=dry, api=api, **{**LADDER, **kw})
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    def test_the_three_step_shapes(self):
+        self.assertIsNone(ladder_stop(1.0, 1.099, 10, 10))
+        self.assertAlmostEqual(ladder_stop(1.0, 1.10, 10, 10), 1.0)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.25, 10, 10), 1.10)
+        # first 10, step 20: entry until +40, then one 20% step below
+        self.assertAlmostEqual(ladder_stop(1.0, 1.39, 10, 20), 1.0)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.40, 10, 20), 1.20)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.65, 10, 20), 1.40)
+        # first 20, step 20: nothing until +20
+        self.assertIsNone(ladder_stop(1.0, 1.15, 20, 20))
+
+    def test_opens_with_a_stop_and_no_take_profit(self):
+        m, e = miner(dry=False, **LADDER)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual([a["type"] for a in e.api.algo], ["STOP_MARKET"])
+        pos = e.book["AAAUSDT"]
+        self.assertTrue(pos.no_target)
+        self.assertEqual(pos.take_profit, 0.0)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 0.70)
+
+    def test_without_the_ladder_a_zero_target_is_refused(self):
+        m, e = miner(dry=False, exit=dict(target_usd=0))
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders, [])
+
+    def test_paper_stop_walks_up_and_closes_in_profit(self):
+        m, e = self.held()
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        for i, px in enumerate((1.05, 1.12, 1.26)):
+            e.api.board = [tick("AAAUSDT", 40, px)]
+            m.tick(now=1000 + i)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 1.10)
+        e.api.board = [tick("AAAUSDT", 40, 1.09)]
+        m.tick(now=2000)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("ladder stop hit" in b for b in bodies(e)))
+
+    def test_no_take_profit_means_a_big_move_is_not_sold(self):
+        m, e = self.held()
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        e.api.board = [tick("AAAUSDT", 90, 3.0)]
+        m.tick(now=1000)
+        self.assertIn("AAAUSDT", m.tracks)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 2.9)
+
+    def test_live_stop_is_moved_on_the_exchange(self):
+        m, e = self.held(dry=False)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        moved = []
+        e.replace_protective = lambda pos, leg, level, qty=None: moved.append((leg, level)) or True
+        e.api.board = [tick("AAAUSDT", 45, 1.12)]
+        m.tick(now=time_now() + 60)
+        self.assertEqual(moved, [("stop", 1.0)])
+        self.assertAlmostEqual(e.book["AAAUSDT"].stop, 1.0)
+
+    def test_a_refused_move_keeps_the_old_stop_and_retries(self):
+        m, e = self.held(dry=False)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        e.replace_protective = lambda pos, leg, level, qty=None: False
+        e.api.board = [tick("AAAUSDT", 45, 1.12)]
+        m.tick(now=time_now() + 60)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 0.70)
+
+    def test_unarmed_time_limit_closes_a_drifting_coin(self):
+        m, e = self.held(exit=dict(**LADDER["exit"], unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        e.api.board = [tick("AAAUSDT", 40, 0.95)]
+        m.tick(now=71 * 3600)
+        self.assertIn("AAAUSDT", m.tracks)
+        m.tick(now=72 * 3600)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("time limit" in b for b in bodies(e)))
+
+    def test_armed_positions_ignore_the_time_limit(self):
+        m, e = self.held(exit=dict(**LADDER["exit"], unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 1.0, 0.0, 0, paper=True, peak=1.15)
+        e.api.board = [tick("AAAUSDT", 40, 1.05)]
+        m.tick(now=500 * 3600)
+        self.assertIn("AAAUSDT", m.tracks)
+
+    def test_old_state_files_without_a_peak_still_load(self):
+        t = Track("AAAUSDT", 1.0, 10, 0.7, 0.0, 0)
+        self.assertEqual(t.peak, 0.0)
+
+
+def time_now():
+    import time
+    return time.time()
 
 
 class Config(unittest.TestCase):

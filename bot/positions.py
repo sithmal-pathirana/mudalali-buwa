@@ -62,6 +62,10 @@ class ActivePosition:
     #: Set once the position has been split: part banked at the original
     #: target, the remainder left to run on a trail with no ceiling.
     runner: bool = False
+    #: The strategy deliberately runs this position with no take-profit (the
+    #: gainer ladder exits only on its stop). The protection watchdog must
+    #: then not "repair" the missing target.
+    no_target: bool = False
     #: Why the bot closed it, when the bot did ("supervisor -- ...",
     #: "protection watchdog -- ..."). Empty for a stop or take-profit that
     #: filled on the exchange. Recorded in data/trades.csv.

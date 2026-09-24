@@ -129,11 +129,34 @@ class GainerExitConfig:
     on_new_leader: str = "close_if_losing"
     #: A position younger than this is never sold because of a new leader.
     min_hold_minutes: float = 15.0
+    #: The stop ladder. Once the price has been ladder_first_pct above entry,
+    #: the stop moves to the entry price. From two steps of ladder_step_pct
+    #: on, it sits one step below the highest step reached:
+    #:   first 10, step 10:  +10 -> entry, +20 -> +10, +30 -> +20, ...
+    #:   first 10, step 20:  +10 -> entry, +40 -> +20, +60 -> +40, ...
+    #:   first 20, step 20:  +20 -> entry, +40 -> +20, +60 -> +40, ...
+    #: With the ladder on, target_usd 0 means no take-profit at all: only the
+    #: stop, walking up, closes the trade.
+    ladder_enabled: bool = False
+    ladder_first_pct: float = 10.0
+    ladder_step_pct: float = 10.0
+    #: Close at market a position whose ladder has not armed (never reached
+    #: ladder_first_pct) after this many hours. 0 = never. Without it one
+    #: coin that drifts between its stop and the first step blocks a
+    #: one-position book for weeks: in the 6-month replay a 30% stop left
+    #: OGNUSDT open from 2026-07-08 to the end of the data.
+    unarmed_max_hours: float = 0.0
 
     def __post_init__(self):
         if self.on_new_leader not in ON_NEW_LEADER:
             raise ValueError(f"gainer.exit.on_new_leader must be one of "
                              f"{' | '.join(ON_NEW_LEADER)}, not {self.on_new_leader!r}")
+        if self.ladder_enabled and (self.ladder_first_pct <= 0 or self.ladder_step_pct <= 0):
+            raise ValueError("gainer.exit.ladder_first_pct and ladder_step_pct must be > 0")
+
+    @property
+    def has_target(self) -> bool:
+        return self.target_usd > 0
 
 
 @dataclass
@@ -342,6 +365,19 @@ def net_pnl(entry: float, qty: float, price: float, fee_pct: float) -> float:
     return (price - entry) * qty - entry * qty * fee_pct / 100.0
 
 
+def ladder_stop(entry: float, peak: float, first_pct: float, step_pct: float) -> float | None:
+    """The stop the ladder calls for at this peak, or None before it arms."""
+    # Rounded so an exact step (1.40 / 1.0 reads 39.999...%) counts as reached.
+    gain = round((peak / entry - 1) * 100.0, 9) if entry > 0 else 0.0
+    if gain < first_pct:
+        return None
+    level = entry
+    steps = int(gain // step_pct)
+    if steps >= 2:
+        level = max(level, entry * (1 + (steps - 1) * step_pct / 100.0))
+    return level
+
+
 # ----------------------------------------------------------------- positions
 @dataclass
 class Track:
@@ -353,6 +389,8 @@ class Track:
     opened_at: float
     paper: bool = True
     milestones_hit: list = field(default_factory=list)
+    #: Highest price seen while held; the ladder steps are counted on it.
+    peak: float = 0.0
 
 
 class GainerMiner:
@@ -436,6 +474,7 @@ class GainerMiner:
                 self._arm(sym, {})
                 continue
             pos.strategy = STRATEGY
+            pos.no_target = t.take_profit <= 0
         self.save()
 
     # -------------------------------------------------------------------- loop
@@ -469,6 +508,7 @@ class GainerMiner:
                 pass
 
         self.sync_tracks(prices, highs, now)
+        self.manage_ladder(prices, now)
         self.check_leader(now, prices, highs)
         self.check_milestones(prices)
         status = self.cfg.alerts.status_minutes
@@ -636,9 +676,10 @@ class GainerMiner:
         if symbol in eng.book:
             self.refuse(symbol, "another strategy already holds it")
             return False
-        if ex.target_usd <= 0 or ex.stop_pct <= 0 or en.notional_usdt <= 0:
-            self.refuse(symbol, "gainer exit.target_usd, exit.stop_pct and "
-                                "entry.notional_usdt must all be > 0")
+        if (ex.target_usd <= 0 and not ex.ladder_enabled) or ex.stop_pct <= 0 \
+                or en.notional_usdt <= 0:
+            self.refuse(symbol, "gainer exit.stop_pct and entry.notional_usdt must be > 0, "
+                                "and exit.target_usd too unless exit.ladder_enabled")
             return False
 
         try:
@@ -708,7 +749,8 @@ class GainerMiner:
         """Stop and take-profit for a filled market entry, or flatten it."""
         eng, ex = self.engine, self.cfg.exit
         sl = float(rules.round_price(stop_price(entry, ex.stop_pct)))
-        tp = float(rules.round_price(target_price(entry, qty, ex.target_usd, ex.fee_pct)))
+        tp = (float(rules.round_price(target_price(entry, qty, ex.target_usd, ex.fee_pct)))
+              if ex.has_target else 0.0)
         qty_s = rules.round_qty(qty)
         eng._seq += 1
         stop_id = client_order_id("s", eng._seq)
@@ -720,10 +762,13 @@ class GainerMiner:
                                reduceOnly="true", workingType="MARK_PRICE",
                                clientAlgoId=stop_id)
             leg = "take-profit"
-            eng.api.algo_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
-                               triggerPrice=rules.round_price(tp), quantity=qty_s,
-                               reduceOnly="true", workingType="MARK_PRICE",
-                               clientAlgoId=tp_id)
+            if tp > 0:
+                eng.api.algo_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                                   triggerPrice=rules.round_price(tp), quantity=qty_s,
+                                   reduceOnly="true", workingType="MARK_PRICE",
+                                   clientAlgoId=tp_id)
+            else:
+                tp_id = ""
         except BinanceError as e:
             log.critical("gainer: %s %s failed (%s) -- flattening", symbol, leg, e)
             try:
@@ -747,7 +792,7 @@ class GainerMiner:
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
             tag=entry_id, opened_ms=int(time.time() * 1000),
             initial_stop=sl, initial_target=tp, initial_risk=entry - sl,
-            filled=True, strategy=STRATEGY)
+            filled=True, strategy=STRATEGY, no_target=tp <= 0)
         eng.risk.record_fill()
         if eng.stream is not None:
             eng.stream.add_symbol(symbol)
@@ -757,16 +802,20 @@ class GainerMiner:
     def _opened(self, symbol, entry, qty, paper, change_pct, stop=0.0, tp=0.0) -> bool:
         ex = self.cfg.exit
         stop = stop or stop_price(entry, ex.stop_pct)
-        tp = tp or target_price(entry, qty, ex.target_usd, ex.fee_pct)
-        self.tracks[symbol] = Track(symbol, entry, qty, stop, tp, time.time(), paper=paper)
+        if not tp and ex.has_target:
+            tp = target_price(entry, qty, ex.target_usd, ex.fee_pct)
+        self.tracks[symbol] = Track(symbol, entry, qty, stop, tp, time.time(), paper=paper,
+                                    peak=entry)
         self.save()
         loss = net_pnl(entry, qty, stop, ex.fee_pct)
+        tp_line = (f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets ${ex.target_usd:.2f})"
+                   if tp > 0 else "TP none")
+        ladder = (f"\nLadder: stop to entry at +{ex.ladder_first_pct:g}%, then one "
+                  f"{ex.ladder_step_pct:g}% step below each new step" if ex.ladder_enabled else "")
         self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} (top gainer "
                     f"{change_pct:+.2f}%)\nBUY {qty:g} @ {entry:,.6g}  "
-                    f"(${entry * qty:,.2f})\n"
-                    f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets "
-                    f"${ex.target_usd:.2f})\n"
-                    f"SL {stop:,.6g} (-{ex.stop_pct:g}%, about {loss:+.2f} USDT)",
+                    f"(${entry * qty:,.2f})\n{tp_line}\n"
+                    f"SL {stop:,.6g} (-{ex.stop_pct:g}%, about {loss:+.2f} USDT)" + ladder,
                     symbol=symbol, event=Event.TRADE_OPEN)
         return True
 
@@ -812,15 +861,56 @@ class GainerMiner:
             px = prices.get(sym, 0.0)
             if px <= 0:
                 continue
-            if px >= t.take_profit:
+            if t.take_profit > 0 and px >= t.take_profit:
                 self.close(sym, t.take_profit, f"take-profit hit (target ${ex.target_usd:.2f})",
                            now=now)
             elif px <= t.stop:
-                self.close(sym, t.stop, f"stop-loss hit (-{ex.stop_pct:g}%)", now=now)
+                what = ("ladder stop hit" if t.stop >= t.entry
+                        else f"stop-loss hit (-{ex.stop_pct:g}%)")
+                self.close(sym, t.stop, what, now=now)
             else:
                 continue
             if sym not in self.tracks:
                 self._arm(sym, highs)
+
+    def manage_ladder(self, prices: dict, now: float) -> None:
+        """Walk each stop up the ladder, and apply exit.unarmed_max_hours."""
+        ex = self.cfg.exit
+        if not ex.ladder_enabled:
+            return
+        for sym, t in list(self.tracks.items()):
+            px = prices.get(sym, 0.0)
+            if px <= 0:
+                continue
+            if px > t.peak:
+                t.peak = px
+                self.save()
+            level = ladder_stop(t.entry, t.peak, ex.ladder_first_pct, ex.ladder_step_pct)
+            if level is None:
+                hours = (now - t.opened_at) / 3600.0
+                if ex.unarmed_max_hours > 0 and hours >= ex.unarmed_max_hours:
+                    self.close(sym, px, f"time limit: {hours:.0f}h without reaching "
+                                        f"+{ex.ladder_first_pct:g}%", now=now)
+                continue
+            if level <= t.stop:
+                continue
+            gain = (t.peak / t.entry - 1) * 100
+            if px <= level:
+                # Already back through the level it should now be protected
+                # at: the ladder's own rule says take it.
+                self.close(sym, px, f"ladder: peak +{gain:.1f}%, price back under "
+                                    f"the {level:,.6g} step", now=now)
+                continue
+            if not t.paper:
+                pos = self.engine.book.get(sym)
+                if pos is None or not self.engine.replace_protective(pos, "stop", level):
+                    continue            # the old stop stays; retried next poll
+                pos.stop = level
+            t.stop = level
+            self.save()
+            locked = (level / t.entry - 1) * 100
+            self.notify(f"{sym} LADDER: peak +{gain:.1f}%, stop moved to {level:,.6g} "
+                        f"({'entry' if locked < 0.01 else f'+{locked:.0f}%'})", symbol=sym)
 
     def check_milestones(self, prices: dict) -> None:
         for sym, t in self.tracks.items():
@@ -832,8 +922,10 @@ class GainerMiner:
                 if pnl >= m and m not in t.milestones_hit:
                     t.milestones_hit.append(m)
                     self.save()
+                    where = (f"TP {t.take_profit:,.6g}" if t.take_profit > 0
+                             else f"stop {t.stop:,.6g}")
                     self.notify(f"{sym} hit the ${m:g} milestone: {pnl:+.2f} USDT\n"
-                                f"now {px:,.6g}, TP {t.take_profit:,.6g}", symbol=sym)
+                                f"now {px:,.6g}, {where}", symbol=sym)
 
     # ----------------------------------------------------------------- alerts
     def send_status(self, now: float, prices: dict) -> None:

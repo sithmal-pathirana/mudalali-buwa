@@ -363,6 +363,30 @@ class TestTheWatchdog(unittest.TestCase):
         self.assertFalse(api.placed("STOP_MARKET"))
         self.assertEqual(api.placed("TAKE_PROFIT_MARKET")[0][3], "0.164400")
 
+    def test_a_deliberate_no_target_position_keeps_no_target(self):
+        """The gainer ladder runs on its stop alone; no TP is put back."""
+        api = ExchangeAPI(
+            positions={"STGUSDT": (71.0, 0.1523)}, marks={"STGUSDT": 0.1540},
+            orders=[{"symbol": "STGUSDT", "type": "STOP_MARKET",
+                     "clientOrderId": "s-1", "stopPrice": "0.1513"}])
+        e = _engine(api)
+        pos = _tracked()
+        pos.no_target = True
+        e.book["STGUSDT"] = pos
+        e.reconcile_book()
+        self.assertFalse([c for c in api.calls if c[0] == "algo_order"])
+
+    def test_a_no_target_position_still_gets_a_missing_stop(self):
+        api = ExchangeAPI(positions={"STGUSDT": (71.0, 0.1523)},
+                          marks={"STGUSDT": 0.1540})
+        e = _engine(api)
+        pos = _tracked()
+        pos.no_target = True
+        e.book["STGUSDT"] = pos
+        e.reconcile_book()
+        self.assertEqual(len(api.placed("STOP_MARKET")), 1)
+        self.assertFalse(api.placed("TAKE_PROFIT_MARKET"))
+
     def test_repeated_stop_failures_close_the_position(self):
         api = ExchangeAPI(positions={"STGUSDT": (71.0, 0.1523)},
                           marks={"STGUSDT": 0.1540}, stop_failures=99)
