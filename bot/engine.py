@@ -2154,6 +2154,7 @@ class Engine:
             self.state.realized_today += pnl
             self.note_realized(pnl)
             self.state.save()
+            self.sweep_gainer_profit(pos, pnl)
             event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
             if self.signals is not None and pos.entry:
                 move = (upd.avg_price - pos.entry) / pos.entry * 100
@@ -2787,12 +2788,22 @@ class Engine:
 
     def after_close(self, pos: ActivePosition, how: str, pnl: float) -> None:
         """Journal a booked close, and queue a supervisor exit for review."""
+        self.sweep_gainer_profit(pos, pnl)
         if self.journal is not None:
             self.journal.record(pos, pnl, closed_by=how, mode=self.cfg.mode)
         reason = pos.exit_reason or ""
         if (self.review is not None and reason.startswith("supervisor")
                 and self.cfg.supervise.monitor.review_exits):
             self.review.add(pos, pnl, reason)
+
+    def sweep_gainer_profit(self, pos: ActivePosition, pnl: float) -> None:
+        """gainer.sweep: bank part of a winning gainer trade. Never raises."""
+        if self.gainer is None or getattr(pos, "strategy", "") != "gainer":
+            return
+        try:
+            self.gainer.sweep_profit(pos.symbol, pnl)
+        except Exception:
+            log.exception("gainer sweep after %s failed", pos.symbol)
 
     def monitor_positions(self, now: float | None = None) -> None:
         """

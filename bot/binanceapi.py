@@ -28,6 +28,10 @@ LIVE = "https://fapi.binance.com"
 TESTNET = "https://demo-fapi.binance.com"
 TESTNET_LEGACY = "https://testnet.binancefuture.com"
 
+#: Wallet endpoints (/sapi) live on the spot host, not the futures one, and
+#: have no testnet at all.
+SAPI_LIVE = "https://api.binance.com"
+
 RECV_WINDOW = 5000
 
 
@@ -114,7 +118,8 @@ class Binance:
         self.last_sync = 0.0
 
     # ---------------------------------------------------------------- plumbing
-    def _request(self, method: str, path: str, params: dict | None = None, signed: bool = False):
+    def _request(self, method: str, path: str, params: dict | None = None, signed: bool = False,
+                 base: str | None = None):
         params = dict(params or {})
         if signed:
             if not self.key or not self.secret:
@@ -127,7 +132,7 @@ class Binance:
         else:
             query = urllib.parse.urlencode(params, doseq=True)
 
-        url = f"{self.base}{path}"
+        url = f"{base or self.base}{path}"
         data = None
         if method in ("POST", "PUT", "DELETE"):
             data = query.encode()
@@ -242,6 +247,20 @@ class Binance:
         return self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
 
     # ---------------------------------------------------------------- private
+    def universal_transfer(self, asset: str, amount: str, type_: str = "UMFUTURE_FUNDING"):
+        """
+        Move funds between the account's own wallets. UMFUTURE_FUNDING is
+        USD-M futures -> Funding. Needs an API key with "Permits Universal
+        Transfer" enabled, which Binance only allows on an IP-restricted key.
+        Live only: the futures testnet has no wallet endpoints.
+        """
+        if self.testnet:
+            raise BinanceError(-1, "wallet transfers do not exist on testnet",
+                               "/sapi/v1/asset/transfer")
+        return self._request("POST", "/sapi/v1/asset/transfer",
+                             {"type": type_, "asset": asset, "amount": amount},
+                             signed=True, base=SAPI_LIVE)
+
     def balances(self):
         return self._request("GET", "/fapi/v2/balance", signed=True)
 

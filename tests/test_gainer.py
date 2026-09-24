@@ -563,6 +563,89 @@ class Ladder(unittest.TestCase):
         self.assertEqual(t.peak, 0.0)
 
 
+class Sweep(unittest.TestCase):
+    """gainer.sweep: 25% of each winning trade to the Funding wallet."""
+
+    class LiveAPI(BoardAPI):
+        testnet = False
+
+        def __init__(self, fail=None, **kw):
+            super().__init__(**kw)
+            self.transfers = []
+            self.fail = fail
+
+        def universal_transfer(self, asset, amount, type_="UMFUTURE_FUNDING"):
+            if self.fail:
+                raise BinanceError(-1002, self.fail, "/sapi/v1/asset/transfer")
+            self.transfers.append((asset, amount, type_))
+            return {"tranId": 1}
+
+    def live(self, **kw):
+        api = self.LiveAPI(**kw)
+        return miner(dry=False, api=api, sweep=dict(enabled=True, pct=25, min_transfer_usdt=1.0))
+
+    def test_a_winning_trade_moves_a_quarter_of_its_profit(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [("USDT", "2.00", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.swept_total, 2.0)
+
+    def test_losses_move_nothing(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", -5.0)
+        m.sweep_profit("AAAUSDT", 0.0)
+        self.assertEqual(e.api.transfers, [])
+
+    def test_small_amounts_wait_until_they_reach_the_minimum(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 2.0)            # 0.50 pending
+        self.assertEqual(e.api.transfers, [])
+        m.sweep_profit("BBBUSDT", 2.4)            # 0.50 + 0.60 = 1.10
+        self.assertEqual(e.api.transfers, [("USDT", "1.10", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.sweep_pending, 0.0)
+
+    def test_a_failed_transfer_stays_pending_and_says_so_once(self):
+        m, e = self.live(fail="This API key has no permission")
+        m.sweep_profit("AAAUSDT", 8.0)
+        m.sweep_profit("BBBUSDT", 4.0)
+        self.assertAlmostEqual(m.sweep_pending, 3.0)
+        self.assertEqual(m.swept_total, 0.0)
+        self.assertEqual(sum("SWEEP FAILED" in b for b in bodies(e)), 1)
+
+    def test_testnet_simulates_and_sends_nothing(self):
+        api = self.LiveAPI()
+        api.testnet = True
+        m, e = miner(dry=False, api=api, sweep=dict(enabled=True))
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(api.transfers, [])
+        self.assertAlmostEqual(m.swept_total, 2.0)
+        self.assertTrue(any("nothing sent" in b for b in bodies(e)))
+
+    def test_off_by_default(self):
+        m, e = miner(dry=False, api=self.LiveAPI())
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [])
+
+    def test_totals_survive_a_restart(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 8.0)
+        m.sweep_profit("BBBUSDT", 1.0)
+        again = GainerMiner(e, m.cfg, path=m.path)
+        self.assertAlmostEqual(again.swept_total, 2.0)
+        self.assertAlmostEqual(again.sweep_pending, 0.25)
+
+    def test_the_engine_sweeps_only_gainer_closes(self):
+        m, e = self.live()
+        from bot.positions import ActivePosition
+        pos = ActivePosition(symbol="AAAUSDT", side="BUY", entry=1.0, stop=0.7,
+                             take_profit=0.0, qty=10, entry_order_id="g-1")
+        e.sweep_gainer_profit(pos, 8.0)
+        self.assertEqual(e.api.transfers, [])
+        pos.strategy = "gainer"
+        e.sweep_gainer_profit(pos, 8.0)
+        self.assertEqual(len(e.api.transfers), 1)
+
+
 def time_now():
     import time
     return time.time()

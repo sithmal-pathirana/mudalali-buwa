@@ -177,9 +177,26 @@ class GainerForecastConfig:
     trend_eps: float = 0.05
 
 
+@dataclass
+class GainerSweepConfig:
+    """Banking part of each winning trade in the Funding wallet."""
+    #: After every profitable gainer trade, move pct of its profit from the
+    #: USD-M futures wallet to the Funding wallet, where it is no longer
+    #: traded. In a 2-year replay of the hybrid ladder, 25% per winning trade
+    #: left $1,009 in Funding and cut the months spent below deposits from 22
+    #: of 24 to 20; a monthly sweep of profit above deposits almost never
+    #: fired, because this strategy's gains arrive in sudden spikes.
+    #: Live only (testnet has no Funding wallet): paper and testnet report
+    #: what would have moved. The API key needs "Permits Universal Transfer".
+    enabled: bool = False
+    pct: float = 25.0
+    #: Amounts under this are carried forward and added to the next one.
+    min_transfer_usdt: float = 1.0
+
+
 GROUPS = {"board": GainerBoardConfig, "entry": GainerEntryConfig,
           "exit": GainerExitConfig, "alerts": GainerAlertsConfig,
-          "forecast": GainerForecastConfig}
+          "forecast": GainerForecastConfig, "sweep": GainerSweepConfig}
 
 
 @dataclass
@@ -194,6 +211,7 @@ class GainerConfig:
     exit: GainerExitConfig = field(default_factory=GainerExitConfig)
     alerts: GainerAlertsConfig = field(default_factory=GainerAlertsConfig)
     forecast: GainerForecastConfig = field(default_factory=GainerForecastConfig)
+    sweep: GainerSweepConfig = field(default_factory=GainerSweepConfig)
 
     def __post_init__(self):
         # config.yaml hands each group over as a dict.
@@ -420,6 +438,11 @@ class GainerMiner:
         self._last_status = time.time()
         self._tradable: set = set()
         self._tradable_at = 0.0
+        #: Sweep bookkeeping: waiting to reach min_transfer_usdt, and the
+        #: running total moved (or, on paper/testnet, that would have moved).
+        self.sweep_pending = 0.0
+        self.swept_total = 0.0
+        self._sweep_error = ""
         self.load()
 
     @property
@@ -435,6 +458,8 @@ class GainerMiner:
         self.leader = raw.get("leader", "")
         self.rearm = {s: float(h) for s, h in (raw.get("rearm") or {}).items()}
         self.closed_at = {s: float(t) for s, t in (raw.get("closed_at") or {}).items()}
+        self.sweep_pending = float(raw.get("sweep_pending", 0.0))
+        self.swept_total = float(raw.get("swept_total", 0.0))
         for sym, t in (raw.get("tracks") or {}).items():
             try:
                 self.tracks[sym] = Track(**t)
@@ -449,6 +474,8 @@ class GainerMiner:
                 {"leader": self.leader,
                  "rearm": self.rearm,
                  "closed_at": self.closed_at,
+                 "sweep_pending": self.sweep_pending,
+                 "swept_total": self.swept_total,
                  "tracks": {s: asdict(t) for s, t in self.tracks.items()}},
                 indent=2))
             tmp.replace(self.path)
@@ -831,6 +858,7 @@ class GainerMiner:
             self.save()
             self.notify(f"PAPER CLOSED {symbol} at {price:,.6g} for {pnl:+.2f} USDT\n{why}",
                         symbol=symbol)
+            self.sweep_profit(symbol, pnl)
             return
         if self.engine.close_position(f"gainer mining -- {why}", symbol=symbol):
             del self.tracks[symbol]
@@ -912,6 +940,48 @@ class GainerMiner:
             self.notify(f"{sym} LADDER: peak +{gain:.1f}%, stop moved to {level:,.6g} "
                         f"({'entry' if locked < 0.01 else f'+{locked:.0f}%'})", symbol=sym)
 
+    # ------------------------------------------------------------------ sweep
+    def sweep_profit(self, symbol: str, pnl: float) -> None:
+        """
+        Bank sweep.pct of a winning trade in the Funding wallet. Called for
+        every booked gainer close; losses move nothing. Never raises: the
+        close has already happened and must not be disturbed.
+        """
+        sw = self.cfg.sweep
+        if not sw.enabled or pnl <= 0:
+            return
+        self.sweep_pending += pnl * sw.pct / 100.0
+        amount = int(self.sweep_pending * 100) / 100.0      # whole cents, rounded down
+        if amount < sw.min_transfer_usdt:
+            self.save()
+            log.info("gainer sweep: %s +%.2f, %.2f USDT pending (moves at %.2f)",
+                     symbol, pnl, self.sweep_pending, sw.min_transfer_usdt)
+            return
+        simulated = self.paper or getattr(self.engine.api, "testnet", False)
+        if not simulated:
+            try:
+                self.engine.api.universal_transfer("USDT", f"{amount:.2f}")
+            except Exception as e:           # noqa: BLE001 -- see docstring
+                self.save()
+                msg = str(e)
+                log.error("gainer sweep of %.2f USDT failed: %s", amount, msg)
+                if msg != self._sweep_error:
+                    self._sweep_error = msg
+                    self.notify(f"SWEEP FAILED: could not move {amount:.2f} USDT to the "
+                                f"Funding wallet ({msg}). It stays pending and is retried "
+                                f"after the next winning trade. Check that the API key has "
+                                f"\"Permits Universal Transfer\" enabled.",
+                                event=Event.ERROR)
+                return
+            self._sweep_error = ""
+        self.sweep_pending = round(self.sweep_pending - amount, 8)
+        self.swept_total += amount
+        self.save()
+        where = ("would have moved (paper/testnet: nothing sent)" if simulated
+                 else "moved to the Funding wallet")
+        self.notify(f"SWEEP: {amount:.2f} USDT {where} -- {sw.pct:g}% of {symbol}'s "
+                    f"+{pnl:.2f}. Total banked: {self.swept_total:.2f} USDT", symbol=symbol)
+
     def check_milestones(self, prices: dict) -> None:
         for sym, t in self.tracks.items():
             px = prices.get(sym, 0.0)
@@ -947,6 +1017,9 @@ class GainerMiner:
             lines.append("no open gainer positions")
         if self.waiting:
             lines.append(f"watching {self.waiting} (#1, held back by an entry guard)")
+        if self.cfg.sweep.enabled:
+            lines.append(f"banked in Funding: {self.swept_total:.2f} USDT"
+                         + (f" (+{self.sweep_pending:.2f} pending)" if self.sweep_pending else ""))
         lines.append("")
         lines += self.board.board_lines(now, set(self.tracks))
         fc = self.board.forecast(now)
