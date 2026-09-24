@@ -509,6 +509,17 @@ gainer:
     # |slope| below this (24h % points per minute) reads as "holding".
     trend_eps: 0.05
 
+  # Bank part of every winning gainer trade: move pct of its profit from the
+  # USD-M futures wallet to the Funding wallet, where it is no longer traded.
+  # Requested 2026-09-24. Replayed over 2 years of the hybrid ladder, 25% per
+  # winning trade left $1,009 in Funding out of $1,786 total. Live only:
+  # testnet and paper report what would have moved. The API key needs
+  # "Permits Universal Transfer" (Binance requires an IP-restricted key).
+  sweep:
+    enabled: true
+    pct: 25.0
+    min_transfer_usdt: 1.0     # smaller amounts wait for the next win
+
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.
