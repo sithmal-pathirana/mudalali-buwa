@@ -441,7 +441,7 @@ gainer:
   entry:
     # true: trade the #1 found at first boot. The last leader is saved in
     # data/gainer.json, so a restart does not re-buy a leader already traded.
-    trade_on_start: true
+    trade_on_start: false
 
     # THE SWAP GUARDS. On 2026-09-15 AINUSDT and POWERUSDT, both fading after a
     # 50-95% day, swapped first place 7 times in 77 minutes. Every swap sold one
@@ -451,12 +451,12 @@ gainer:
     #
     # A new #1 must hold first place this long before it counts. It was 2 polls
     # (1 minute), and those swaps were 2-5 minutes apart.
-    confirm_minutes: 5.0
+    confirm_minutes: 0
     # Buy a leader only while its 24h % is still climbing. Every swap above
     # bought a leader reported as fading (-0.7 to -1.1 %/min): it reached #1
     # because the other coin fell faster. A fading leader is watched while it
     # stays #1 and bought if it starts rising again.
-    buy_only_if_rising: true
+    buy_only_if_rising: false
     # The climb that counts as rising, in 24h % points per minute over
     # forecast.slope_minutes. 0.05 matches the board's "holding" band, so a
     # flat leader is not bought either.
@@ -464,11 +464,11 @@ gainer:
     # A coin sold for any reason is not bought again as a new leader for this
     # long; 0 turns it off. This is what breaks an A-B-A-B loop. Re-entry on a
     # new high below is exempt: it has its own trigger.
-    rebuy_cooldown_minutes: 60
+    rebuy_cooldown_minutes: 180
 
     # After a stop or take-profit on the coin that is still #1, buy it again
     # once it trades above the 24h high recorded at that close (one attempt).
-    reentry_on_new_high: true
+    reentry_on_new_high: false
 
     # LIVE since 2026-09-15 by request ("set those parameters as your wish and
     # deploy and go live"), sized for $9.23 of equity:
@@ -476,27 +476,40 @@ gainer:
     #   2 positions     two stop-outs ~$0.62, inside the 10% daily loss limit
     #                   ($0.92) and clear of the $8.00 equity floor
     notional_usdt: 6.0
-    max_positions: 2
+    # 2026-09-24: each trade is 10% of the traded equity, up to 5 at once,
+    # so the whole book is at most 50% of equity. Replayed over 2 years
+    # (hourly board, $50 + $50/month): +37%, above deposits in 20 of 24
+    # months, worst drop 27%. notional_usdt is ignored while this is > 0.
+    notional_pct_of_equity: 10.0
+    max_positions: 5
 
   exit:
     # 2026-09-15, by request ("2$ is bit large. what about .25$"): $0.25 is
     # about +4.3% on $6.00, reachable inside a leader's run; $2.00 needed +34%
     # and never filled. Against the 5% stop that is a payoff under 1:1, so it
     # needs a win rate above ~55%.
-    target_usd: 0.25
+    target_usd: 0
     # ~$0.31 with fees per stop-out on $6.00, ~3.4% of equity.
-    stop_pct: 5.0
+    stop_pct: 30.0
     # Round-trip cost estimate, % of notional. Added to the take-profit so the
     # target is net, and subtracted before calling a position profitable.
     fee_pct: 0.15
     # When another coin takes #1, what happens to the positions already held:
     #   close_if_losing  sell the ones not in profit (net of fee_pct)
     #   keep             leave every one to its own stop and take-profit
-    on_new_leader: close_if_losing
+    on_new_leader: keep
     # A position younger than this is never sold because of a new leader; its
     # stop still protects it. The swaps above sold positions 2-5 minutes old,
     # before the trade had any chance to reach its target.
     min_hold_minutes: 15
+    # The hybrid ladder, chosen 2026-09-24: no take-profit; the stop goes to
+    # entry at +10%, then sits one 20% step below each new step (+40 -> +20,
+    # +60 -> +40, ...). A position that never reaches +10% is closed after 72h
+    # so one drifting coin cannot hold a slot for weeks.
+    ladder_enabled: true
+    ladder_first_pct: 10.0
+    ladder_step_pct: 20.0
+    unarmed_max_hours: 72
 
   alerts:
     milestones_usd: [1.0, 1.5, 2.0]

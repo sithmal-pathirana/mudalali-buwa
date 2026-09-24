@@ -110,6 +110,13 @@ class GainerEntryConfig:
     reentry_on_new_high: bool = True
     #: USDT per trade. Must clear Binance's $5 minimum after lot rounding.
     notional_usdt: float = 5.5
+    #: Size each trade as this percent of the equity the bot trades with
+    #: (money set aside for the Funding wallet excluded) instead of the fixed
+    #: notional_usdt. 0 = use notional_usdt. With max_positions 5, 10 keeps
+    #: the whole book at 50% of equity: in the 2-year replay that version
+    #: stayed above deposits in 20 of 24 months, against 3 of 24 for one
+    #: position at 50%.
+    notional_pct_of_equity: float = 0.0
     max_positions: int = 2
 
 
@@ -726,10 +733,13 @@ class GainerMiner:
         if symbol in eng.book:
             self.refuse(symbol, "another strategy already holds it")
             return False
+        notional = self.trade_notional()
         if (ex.target_usd <= 0 and not ex.ladder_enabled) or ex.stop_pct <= 0 \
-                or en.notional_usdt <= 0:
-            self.refuse(symbol, "gainer exit.stop_pct and entry.notional_usdt must be > 0, "
-                                "and exit.target_usd too unless exit.ladder_enabled")
+                or notional <= 0:
+            self.refuse(symbol, "gainer exit.stop_pct and the trade size must be > 0 "
+                                "(entry.notional_usdt, or notional_pct_of_equity of a "
+                                "positive equity), and exit.target_usd too unless "
+                                "exit.ladder_enabled")
             return False
 
         try:
@@ -737,9 +747,9 @@ class GainerMiner:
         except (KeyError, BinanceError) as e:
             self.refuse(symbol, f"no symbol filters ({e})")
             return False
-        sized = rules.size_for_notional(en.notional_usdt, price)
+        sized = rules.size_for_notional(notional, price)
         if sized is None:
-            self.refuse(symbol, f"${en.notional_usdt:.2f} is under the cheapest legal "
+            self.refuse(symbol, f"${notional:.2f} is under the cheapest legal "
                                 f"order (${rules.min_affordable_notional(price):.2f})")
             return False
         qty = float(sized[0])
@@ -779,6 +789,13 @@ class GainerMiner:
                         f"position.", symbol=symbol, event=Event.HALT)
             return False
         return self._protect(symbol, entry, amt, entry_id, rules, change_pct)
+
+    def trade_notional(self) -> float:
+        """USDT for the next trade: a share of equity, or the fixed amount."""
+        en = self.cfg.entry
+        if en.notional_pct_of_equity > 0:
+            return max(0.0, self.engine.equity) * en.notional_pct_of_equity / 100.0
+        return en.notional_usdt
 
     def _read_fill(self, symbol: str) -> tuple[float, float]:
         for attempt in range(self.FILL_WAIT_ATTEMPTS):

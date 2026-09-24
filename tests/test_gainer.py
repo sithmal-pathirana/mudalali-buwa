@@ -740,6 +740,47 @@ class Principal(unittest.TestCase):
         self.assertAlmostEqual(again.principal_pending, 100.0)
 
 
+class PercentSizing(unittest.TestCase):
+    """entry.notional_pct_of_equity: each trade is a share of the equity."""
+
+    def test_trade_is_a_share_of_equity(self):
+        m, e = miner(dry=False, entry=dict(notional_pct_of_equity=10, max_positions=5))
+        e.equity = 200.0
+        self.assertAlmostEqual(m.trade_notional(), 20.0)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders[0]["quantity"], "21")    # Rules rounds 20/1.0 up
+
+    def test_it_grows_and_shrinks_with_equity(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10))
+        e.equity = 500.0
+        self.assertAlmostEqual(m.trade_notional(), 50.0)
+        e.equity = 80.0
+        self.assertAlmostEqual(m.trade_notional(), 8.0)
+
+    def test_money_set_aside_for_funding_is_not_sized_on(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10),
+                     sweep=dict(enabled=True, min_transfer_usdt=1.0))
+        m.sweep_pending = 30.0                  # a failed transfer, waiting
+        e.effective_equity = lambda actual: actual
+        e.equity = e.sizing_equity(130.0)
+        self.assertAlmostEqual(m.trade_notional(), 10.0)
+
+    def test_under_the_exchange_minimum_it_skips_and_says_so(self):
+        class Tiny(Rules):
+            def size_for_notional(self, notional, price):
+                return None
+        m, e = miner(dry=False, entry=dict(notional_pct_of_equity=10))
+        e.rules_for = lambda s: Tiny()
+        e.equity = 40.0
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertTrue(any("$4.00 is under the cheapest legal" in b for b in bodies(e)))
+
+    def test_zero_keeps_the_fixed_amount(self):
+        m, e = miner(entry=dict(notional_usdt=6.0))
+        e.equity = 1000.0
+        self.assertAlmostEqual(m.trade_notional(), 6.0)
+
+
 def time_now():
     import time
     return time.time()
@@ -749,11 +790,14 @@ class Config(unittest.TestCase):
     def test_config_yaml_loads_the_gainer_section(self):
         from bot.config import Config as C
         cfg = C.load(ROOT / "config.yaml")
-        self.assertIsInstance(cfg.gainer, GainerConfig)
-        self.assertGreater(cfg.gainer.exit.target_usd, 0.0)
-        self.assertGreater(cfg.gainer.entry.notional_usdt, 5.0,
-                           "must clear the $5 minimum")
-        self.assertIn(cfg.gainer.exit.on_new_leader, ("close_if_losing", "keep"))
+        g = cfg.gainer
+        self.assertIsInstance(g, GainerConfig)
+        # Every trade needs a way out: a take-profit, or the ladder.
+        self.assertTrue(g.exit.target_usd > 0 or g.exit.ladder_enabled)
+        self.assertGreater(g.exit.stop_pct, 0.0)
+        # And a size: a fixed amount over the $5 minimum, or a share of equity.
+        self.assertTrue(g.entry.notional_pct_of_equity > 0 or g.entry.notional_usdt > 5.0)
+        self.assertIn(g.exit.on_new_leader, ("close_if_losing", "keep"))
 
     def test_event_exists(self):
         self.assertEqual(Event.GAINER.value, "gainer mining")
