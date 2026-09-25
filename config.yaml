@@ -19,7 +19,7 @@
 # $12 basis where they explain history.
 # ############################################################################
 
-mode: testnet           # testnet | live   (testnet uses fake money on real markets)
+mode: live              # LIVE from 2026-09-25: gainer, $50 start. testnet | live   (testnet uses fake money on real markets)
 dry_run: false         # true = log intended orders, send nothing. Your first run.
 
 # Live futures WEBSOCKETS ARE SILENT FROM THIS HOST -- `run.py netcheck` reports
@@ -149,13 +149,13 @@ risk:
   # Trade as if the account held this much, whatever the real balance is.
   # 0 = use the real balance. MUST NOT be left at a testnet rehearsal value:
   # at 100.0 the bot sizes for $100 it does not have.
-  equity_cap_usdt: 100.0
+  equity_cap_usdt: 0.0      # live: size on the real balance
   # true: the capped equity starts at the cap and then moves with every real
   # gain and loss, like a funded account. false: it reads exactly the cap
   # forever, so on the 5,000 USDT testnet the equity floor and the daily loss
   # limit could never trigger. Rehearsing the 2026-09-25 $100 go-live needs
   # true. Has no effect when equity_cap_usdt is 0 (live).
-  equity_cap_tracks_pnl: true
+  equity_cap_tracks_pnl: false
 
 # Daily profit targets. stop_when_reached is the real mechanism behind
 # "guarantee the profit": once the day's target is banked the bot stops
@@ -435,7 +435,7 @@ context:
 # (size, confirm, rising, minrise, cooldown, target, onleader, hold).
 # The startup log prints the settings in force.
 gainer:
-  enabled: false
+  enabled: true             # LIVE from 2026-09-25
   # true is PAPER: nothing is sent, fills and exits are simulated.
   dry_run: false
 
@@ -560,7 +560,7 @@ gainer:
     # trades on the balance WITHOUT it.
     principal_enabled: true
     principal_trigger_x: 2.5
-    deposits_since: ""         # YYYY-MM-DD, the day the gainer account is funded
+    deposits_since: "2026-09-25"   # the day the $50 was deposited
     deposits_override_usdt: 0.0
 
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
@@ -618,7 +618,7 @@ portfolio:
   # trims back to one. Portfolio mode is kept on so the SCANNER picks the
   # symbol rather than trading the BTCUSDT above, whose $50 minimum (and
   # ETHUSDT's $22) is still out of reach on this account.
-  enabled: true
+  enabled: false           # breakout scanner off with the breakout strategy (2026-09-25)
   max_concurrent: auto    # auto, or a fixed number
   # THE number that sets trade size in portfolio mode, and the one that was
   # 20.0. At $12 over the representative 7% stop below:
@@ -806,6 +806,6 @@ params:
   # routes to it -- see tools/regime_edge.py. Override at runtime with
   # /strategy in Telegram or the dashboard selector.
   routes:
-    trending: trend_atr
+    trending: null            # breakout strategy OFF from 2026-09-25 (gainer only); was trend_atr
     ranging: null
     unclear: null
