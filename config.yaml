@@ -444,6 +444,10 @@ gainer:
     top_n: 10
     # 24h quote volume floor. A $300k coin can top the board on one order.
     min_quote_volume: 10000000
+    # Pick the leader once an hour, at the top of the hour; stops, the ladder
+    # and the time limit still run on every poll. Every 2-year replay read
+    # the board hourly, so this is the tested behaviour (2026-09-25).
+    leader_check_minutes: 60
 
   entry:
     # true: trade the #1 found at first boot. The last leader is saved in

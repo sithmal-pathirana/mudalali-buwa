@@ -740,6 +740,37 @@ class Principal(unittest.TestCase):
         self.assertAlmostEqual(again.principal_pending, 100.0)
 
 
+class HourlyLeaderCheck(unittest.TestCase):
+    """board.leader_check_minutes: pick leaders hourly, protect every poll."""
+
+    HOUR = 1790208000.0                      # a round hour, UTC
+
+    def test_a_new_leader_is_bought_only_at_the_top_of_the_hour(self):
+        m, e = miner(board=dict(leader_check_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        e.api.board = [tick("AAAUSDT", 40, 1.0), tick("BBBUSDT", 30, 1.0)]
+        m.tick(now=self.HOUR + 30)                     # first poll of the hour
+        e.api.board = [tick("BBBUSDT", 60, 1.0), tick("AAAUSDT", 40, 1.0)]
+        m.tick(now=self.HOUR + 600)                    # same hour: not checked
+        self.assertNotIn("BBBUSDT", m.tracks)
+        m.tick(now=self.HOUR + 3600 + 30)              # next hour
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_stops_still_run_between_checks(self):
+        m, e = miner(board=dict(leader_check_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.9, 1.2, 0, paper=True)
+        m.tick(now=self.HOUR + 30)
+        e.api.board = [tick("AAAUSDT", 40, 0.85)]
+        m.tick(now=self.HOUR + 900)
+        self.assertEqual(m.tracks, {})
+
+    def test_zero_checks_every_poll(self):
+        m, e = miner()
+        self.assertTrue(m.leader_due(self.HOUR))
+        self.assertTrue(m.leader_due(self.HOUR + 1))
+
+
 class TakeProfitAtDouble(unittest.TestCase):
     """exit.target_pct: bank a run that doubles, alongside the ladder."""
 

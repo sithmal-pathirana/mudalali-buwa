@@ -84,6 +84,12 @@ class GainerBoardConfig:
     top_n: int = 10
     #: 24h quote volume floor. A $300k coin can top the board on one order.
     min_quote_volume: float = 10_000_000
+    #: Decide on the leader only once per this many minutes, on the first
+    #: poll of each period (60 = at the top of every hour). Stops, the ladder,
+    #: the time limit and the sweep still run on every poll. 0 = every poll.
+    #: Every 2-year replay read the board hourly, so 60 is the tested
+    #: behaviour; a 30-second board also buys short spikes it never saw.
+    leader_check_minutes: float = 0.0
 
 
 @dataclass
@@ -477,6 +483,7 @@ class GainerMiner:
         #: The confirmed leader an entry guard held back; re-checked each poll
         #: while it stays first.
         self.waiting = ""
+        self._leader_period = -1
         self._last_poll = 0.0
         self._last_status = time.time()
         self._tradable: set = set()
@@ -589,12 +596,24 @@ class GainerMiner:
 
         self.sync_tracks(prices, highs, now)
         self.manage_ladder(prices, now)
-        self.check_leader(now, prices, highs)
+        if self.leader_due(now):
+            self.check_leader(now, prices, highs)
         self.check_milestones(prices)
         status = self.cfg.alerts.status_minutes
         if status and now - self._last_status >= status * 60:
             self._last_status = now
             self.send_status(now, prices)
+
+    def leader_due(self, now: float) -> bool:
+        """board.leader_check_minutes: True on the first poll of each period."""
+        minutes = self.cfg.board.leader_check_minutes
+        if minutes <= 0:
+            return True
+        period = int(now // (minutes * 60))
+        if period == self._leader_period:
+            return False
+        self._leader_period = period
+        return True
 
     def tradable(self, now: float) -> set:
         if self._tradable and now - self._tradable_at < self.EXCHANGE_INFO_MAX_AGE:
