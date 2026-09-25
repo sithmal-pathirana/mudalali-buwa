@@ -447,7 +447,7 @@ gainer:
     # Pick the leader once an hour, at the top of the hour; stops, the ladder
     # and the time limit still run on every poll. Every 2-year replay read
     # the board hourly, so this is the tested behaviour (2026-09-25).
-    leader_check_minutes: 60
+    leader_check_minutes: 5     # 2026-09-25: 6-month replay, every 5 min beat hourly for every ladder
 
   entry:
     # true: trade the #1 found at first boot. The last leader is saved in
@@ -504,6 +504,10 @@ gainer:
     # and never filled. Against the 5% stop that is a payoff under 1:1, so it
     # needs a win rate above ~55%.
     target_usd: 0
+    # 2026-09-25: take profit once a trade is +95% above entry. Best in both
+    # periods on real 1-minute data with lock 10/10 (+$51 over 2 years hourly;
+    # +$162 over the last 6 months checking every 5 minutes).
+    target_pct: 95
     # ~$0.31 with fees per stop-out on $6.00, ~3.4% of equity.
     stop_pct: 30.0
     # Round-trip cost estimate, % of notional. Added to the take-profit so the
@@ -523,7 +527,7 @@ gainer:
     # so one drifting coin cannot hold a slot for weeks.
     ladder_enabled: true
     ladder_first_pct: 10.0
-    ladder_step_pct: 20.0
+    ladder_step_pct: 10.0       # lock 10/10: entry at +10%, then 10% steps
     unarmed_max_hours: 72
 
   alerts:
