@@ -247,6 +247,17 @@ class Binance:
         return self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
 
     # ---------------------------------------------------------------- private
+    def funding_rates_since(self, start_ms: int, limit: int = 1000):
+        """Funding settlements of EVERY symbol since start_ms (no symbol sent).
+        Shares a separate limit of ~500 requests per 5 minutes per IP."""
+        return self._request("GET", "/fapi/v1/fundingRate",
+                             {"startTime": start_ms, "limit": limit})
+
+    def funding_info(self):
+        """Symbols whose funding interval differs from 8h, with
+        fundingIntervalHours. Symbols not listed settle every 8 hours."""
+        return self._request("GET", "/fapi/v1/fundingInfo")
+
     def universal_transfer(self, asset: str, amount: str, type_: str = "UMFUTURE_FUNDING"):
         """
         Move funds between the account's own wallets. UMFUTURE_FUNDING is

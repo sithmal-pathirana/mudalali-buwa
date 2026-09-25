@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from .context import ContextConfig
 from .gainer import GainerConfig
+from .squeeze import SqueezeConfig
 from .supervise import SuperviseConfig
 from pathlib import Path
 
@@ -131,6 +132,7 @@ class Config:
     aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
     supervise: SuperviseConfig = field(default_factory=SuperviseConfig)
     gainer: GainerConfig = field(default_factory=GainerConfig)
+    squeeze: SqueezeConfig = field(default_factory=SqueezeConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
@@ -180,6 +182,7 @@ class Config:
                     "dashboard": DashboardConfig, "telegram": TelegramConfig,
                     "portfolio": PortfolioConfig, "aggressive": AggressiveConfig,
                     "supervise": SuperviseConfig, "gainer": GainerConfig,
+                    "squeeze": SqueezeConfig,
                     "context": ContextConfig}
         built = {}
         for name, factory in sections.items():

@@ -559,6 +559,51 @@ gainer:
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.
 #   run.py scan --equity <n>   shows the capacity and what would fill it
+# SQUEEZE MODE (bot/squeeze.py). Buy the coins whose shorts are most crowded:
+# shortly after each 00/08/16 UTC funding settlement, the most negative
+# funding rates (scaled to 8 hours) at or below entry.funding_at_most_pct.
+# Each long gets an exchange-side stop and no take-profit, and is closed
+# after exit.max_hold_hours. Shorts pay longs while it is held.
+# Replayed on 2 years of live data (every USDT perpetual, delisted included,
+# 0.2% cost): -0.10%, 72h, 20% stop gave +1.29% per trade over 2,272
+# trades, positive in both years. Added 2026-09-25; not live.
+#
+#   board     what is watched
+#   entry     when a coin is bought, and how much
+#   exit      when a position is sold
+#   alerts    what is announced beyond each trade
+#   sweep     25% of each win to the Funding wallet (same rules as gainer)
+squeeze:
+  enabled: false
+  dry_run: true
+
+  board:
+    check_minutes_after_funding: 2
+    act_within_minutes: 30      # a restart later in the 8h does not re-buy the round
+    min_quote_volume: 20000000
+    poll_seconds: 60
+
+  entry:
+    funding_at_most_pct: -0.10  # percent per 8 hours
+    max_new_per_round: 3
+    max_positions: 5
+    notional_pct_of_equity: 10.0
+    min_notional_usdt: 6.0
+
+  exit:
+    stop_pct: 20.0
+    max_hold_hours: 72
+    fee_pct: 0.15
+
+  alerts:
+    status_minutes: 60
+
+  sweep:
+    enabled: true
+    pct: 25.0
+    min_transfer_usdt: 1.0
+    principal_enabled: false
+
 portfolio:
   # At $12 the derived slot count is still 1: splitting a 3.5% budget over two
   # positions asks for $3.00 each, under the $5 exchange minimum, so allocate()

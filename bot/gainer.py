@@ -438,6 +438,12 @@ class Track:
 
 class GainerMiner:
     EXCHANGE_INFO_MAX_AGE = 3600.0     # new listings are often the top gainers
+    #: Tag on the engine's positions, so the supervisor stands aside and a
+    #: restart re-attaches them to the right strategy. Subclasses override.
+    strategy = STRATEGY
+    #: How an entry is described in alerts, and the prefix of a close reason.
+    entry_label = "top gainer"
+    close_label = "gainer mining"
     FILL_WAIT_ATTEMPTS = 4
     FILL_WAIT_SECONDS = 0.5
 
@@ -535,7 +541,7 @@ class GainerMiner:
                 self.closed_at[sym] = time.time()
                 self._arm(sym, {})
                 continue
-            pos.strategy = STRATEGY
+            pos.strategy = self.strategy
             pos.no_target = t.take_profit <= 0
         self.save()
 
@@ -865,7 +871,7 @@ class GainerMiner:
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
             tag=entry_id, opened_ms=int(time.time() * 1000),
             initial_stop=sl, initial_target=tp, initial_risk=entry - sl,
-            filled=True, strategy=STRATEGY, no_target=tp <= 0)
+            filled=True, strategy=self.strategy, no_target=tp <= 0)
         eng.risk.record_fill()
         if eng.stream is not None:
             eng.stream.add_symbol(symbol)
@@ -883,14 +889,18 @@ class GainerMiner:
         loss = net_pnl(entry, qty, stop, ex.fee_pct)
         tp_line = (f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets ${ex.target_usd:.2f})"
                    if tp > 0 else "TP none")
-        ladder = (f"\nLadder: stop to entry at +{ex.ladder_first_pct:g}%, then one "
-                  f"{ex.ladder_step_pct:g}% step below each new step" if ex.ladder_enabled else "")
-        self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} (top gainer "
+        ladder = self.exit_plan_text()
+        self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} ({self.entry_label} "
                     f"{change_pct:+.2f}%)\nBUY {qty:g} @ {entry:,.6g}  "
                     f"(${entry * qty:,.2f})\n{tp_line}\n"
                     f"SL {stop:,.6g} (-{ex.stop_pct:g}%, about {loss:+.2f} USDT)" + ladder,
                     symbol=symbol, event=Event.TRADE_OPEN)
         return True
+
+    def exit_plan_text(self) -> str:
+        ex = self.cfg.exit
+        return (f"\nLadder: stop to entry at +{ex.ladder_first_pct:g}%, then one "
+                f"{ex.ladder_step_pct:g}% step below each new step" if ex.ladder_enabled else "")
 
     # ------------------------------------------------------------------ close
     def close(self, symbol: str, price: float, why: str, now: float | None = None) -> None:
@@ -907,7 +917,7 @@ class GainerMiner:
             self.sweep_profit(symbol, pnl)
             self.check_principal()
             return
-        if self.engine.close_position(f"gainer mining -- {why}", symbol=symbol):
+        if self.engine.close_position(f"{self.close_label} -- {why}", symbol=symbol):
             del self.tracks[symbol]
             self.closed_at[symbol] = time.time() if now is None else now
             self.save()

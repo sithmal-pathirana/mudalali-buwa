@@ -156,6 +156,8 @@ class Engine:
     _prepared: set = None
     #: bot/gainer.py's GainerMiner when gainer.enabled, else None
     gainer = None
+    #: bot/squeeze.py's SqueezeTrader when squeeze.enabled, else None
+    squeeze = None
     #: Net realised P&L booked since this process started, and when it did.
     #: In memory on purpose: "since the last restart" resets with the process.
     session_realized = 0.0
@@ -219,6 +221,10 @@ class Engine:
         if gcfg is not None and gcfg.enabled:
             from .gainer import GainerMiner
             self.gainer = GainerMiner(self, gcfg)
+        scfg = getattr(cfg, "squeeze", None)
+        if scfg is not None and scfg.enabled:
+            from .squeeze import SqueezeTrader
+            self.squeeze = SqueezeTrader(self, scfg)
 
     # ------------------------------------------------------------ dashboard
     # ------------------------------------------------------------- the book
@@ -572,7 +578,7 @@ class Engine:
             self.notify.clear_position_alerts(p.tag)
             # Only a trade that happened starts a cooldown: an entry that
             # rested and was cancelled never took the move being chased.
-            if p.filled and getattr(p, "strategy", "") != "gainer":
+            if p.filled and getattr(p, "strategy", "") not in ("gainer", "squeeze"):
                 self.note_exit(symbol)
         if self.stream is not None and symbol != self.cfg.symbol:
             self.stream.remove_symbol(symbol)
@@ -1380,6 +1386,15 @@ class Engine:
         adopted = self.adopt_open_positions()
         if adopted:
             log.info("resumed %d position(s) from the exchange", adopted)
+        if self.squeeze is not None:
+            self.squeeze.restore()
+            q = self.squeeze.squeeze_cfg
+            log.info("squeeze mode ON%s: funding <= %.3f%%/8h, %d per round, up to %d "
+                     "positions at %.0f%% of equity (min $%.2f), stop %.0f%%, closed after %gh",
+                     " (PAPER)" if self.squeeze.paper else " (LIVE ORDERS)",
+                     q.entry.funding_at_most_pct, q.entry.max_new_per_round,
+                     q.entry.max_positions, q.entry.notional_pct_of_equity,
+                     q.entry.min_notional_usdt, q.exit.stop_pct, q.exit.max_hold_hours)
         if self.gainer is not None:
             self.gainer.restore()
             g = self.gainer.cfg
@@ -1536,6 +1551,8 @@ class Engine:
                     self.periodic()
                     if self.gainer is not None:
                         self.gainer.tick()
+                    if self.squeeze is not None:
+                        self.squeeze.tick()
                 except BinanceError as e:
                     log.error("exchange error: %s", e)
                     if e.code in (-1021, -1022):
@@ -1906,8 +1923,8 @@ class Engine:
             return
         if not pos.filled:
             return          # a resting entry has nothing to supervise
-        if getattr(pos, "strategy", "") == "gainer":
-            return          # bot/gainer.py owns its exits; the R rules do not apply
+        if getattr(pos, "strategy", "") in ("gainer", "squeeze"):
+            return          # their own modules own their exits; the R rules do not apply
         bars = self.held_bars(pos.symbol)
         params = self.cfg.params or {}
         atr_period = int((params.get("trend") or {}).get("atr_period", 14))
@@ -2799,18 +2816,20 @@ class Engine:
     def sweep_gainer_profit(self, pos: ActivePosition, pnl: float) -> None:
         """gainer.sweep: bank part of a winning gainer trade, then check the
         principal rule. Never raises."""
-        if self.gainer is None or getattr(pos, "strategy", "") != "gainer":
+        owner = {"gainer": self.gainer, "squeeze": self.squeeze}.get(
+            getattr(pos, "strategy", ""))
+        if owner is None:
             return
         try:
-            self.gainer.sweep_profit(pos.symbol, pnl)
-            self.gainer.check_principal()
+            owner.sweep_profit(pos.symbol, pnl)
+            owner.check_principal()
         except Exception:
             log.exception("gainer sweep after %s failed", pos.symbol)
 
     def sizing_equity(self, actual: float) -> float:
         """effective_equity, less money set aside for the Funding wallet: a
         transfer that failed must not be traded and lost meanwhile."""
-        reserved = self.gainer.reserved_usdt if self.gainer is not None else 0.0
+        reserved = sum(m.reserved_usdt for m in (self.gainer, self.squeeze) if m is not None)
         return max(0.0, self.effective_equity(actual) - reserved)
 
     def monitor_positions(self, now: float | None = None) -> None:
