@@ -130,6 +130,10 @@ class GainerExitConfig:
     """When a position is sold."""
     #: Net profit the take-profit is placed to bank, in USDT.
     target_usd: float = 2.0
+    #: Take-profit this percent above the entry instead (100 = when the coin
+    #: has doubled); 0 = use target_usd. It works alongside the ladder: the
+    #: stop walks up as usual, and a run that reaches it is banked.
+    target_pct: float = 0.0
     stop_pct: float = 5.0
     #: Round-trip cost estimate as % of notional. Added to the take-profit
     #: distance so the target is NET, and subtracted before calling a position
@@ -168,7 +172,15 @@ class GainerExitConfig:
 
     @property
     def has_target(self) -> bool:
-        return self.target_usd > 0
+        return self.target_pct > 0 or self.target_usd > 0
+
+    def target_for(self, entry: float, qty: float) -> float:
+        """The take-profit level for a fill, or 0.0 for none."""
+        if self.target_pct > 0:
+            return entry * (1 + self.target_pct / 100.0)
+        if self.target_usd > 0:
+            return target_price(entry, qty, self.target_usd, self.fee_pct)
+        return 0.0
 
 
 @dataclass
@@ -745,7 +757,7 @@ class GainerMiner:
             self.refuse(symbol, "another strategy already holds it")
             return False
         notional = self.trade_notional()
-        if (ex.target_usd <= 0 and not ex.ladder_enabled) or ex.stop_pct <= 0 \
+        if (not ex.has_target and not ex.ladder_enabled) or ex.stop_pct <= 0 \
                 or notional <= 0:
             self.refuse(symbol, "gainer exit.stop_pct and the trade size must be > 0 "
                                 "(entry.notional_usdt, or notional_pct_of_equity of a "
@@ -828,8 +840,7 @@ class GainerMiner:
         """Stop and take-profit for a filled market entry, or flatten it."""
         eng, ex = self.engine, self.cfg.exit
         sl = float(rules.round_price(stop_price(entry, ex.stop_pct)))
-        tp = (float(rules.round_price(target_price(entry, qty, ex.target_usd, ex.fee_pct)))
-              if ex.has_target else 0.0)
+        tp = float(rules.round_price(ex.target_for(entry, qty))) if ex.has_target else 0.0
         qty_s = rules.round_qty(qty)
         eng._seq += 1
         stop_id = client_order_id("s", eng._seq)
@@ -882,13 +893,14 @@ class GainerMiner:
         ex = self.cfg.exit
         stop = stop or stop_price(entry, ex.stop_pct)
         if not tp and ex.has_target:
-            tp = target_price(entry, qty, ex.target_usd, ex.fee_pct)
+            tp = ex.target_for(entry, qty)
         self.tracks[symbol] = Track(symbol, entry, qty, stop, tp, time.time(), paper=paper,
                                     peak=entry)
         self.save()
         loss = net_pnl(entry, qty, stop, ex.fee_pct)
-        tp_line = (f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets ${ex.target_usd:.2f})"
-                   if tp > 0 else "TP none")
+        tp_line = ("TP none" if tp <= 0 else
+                   f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%)" if ex.target_pct > 0 else
+                   f"TP {tp:,.6g} (+{(tp / entry - 1) * 100:.1f}%, nets ${ex.target_usd:.2f})")
         ladder = self.exit_plan_text()
         self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} ({self.entry_label} "
                     f"{change_pct:+.2f}%)\nBUY {qty:g} @ {entry:,.6g}  "

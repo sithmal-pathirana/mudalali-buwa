@@ -740,6 +740,40 @@ class Principal(unittest.TestCase):
         self.assertAlmostEqual(again.principal_pending, 100.0)
 
 
+class TakeProfitAtDouble(unittest.TestCase):
+    """exit.target_pct: bank a run that doubles, alongside the ladder."""
+
+    CFG = dict(exit=dict(ladder_enabled=True, target_usd=0, target_pct=100, stop_pct=30,
+                         ladder_first_pct=10, ladder_step_pct=20))
+
+    def test_live_entry_gets_a_take_profit_at_double(self):
+        m, e = miner(dry=False, **self.CFG)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        kinds = {a["type"]: a["triggerPrice"] for a in e.api.algo}
+        self.assertEqual(set(kinds), {"STOP_MARKET", "TAKE_PROFIT_MARKET"})
+        self.assertEqual(kinds["TAKE_PROFIT_MARKET"], "2.000000")
+        self.assertFalse(e.book["AAAUSDT"].no_target)
+
+    def test_paper_take_profit_banks_the_double(self):
+        m, e = miner(**self.CFG)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.api.board = [tick("AAAUSDT", 150, 2.05)]
+        m.tick(now=time_now() + 60)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("take-profit hit" in b for b in bodies(e)))
+
+    def test_ladder_still_walks_below_the_target(self):
+        m, e = miner(**self.CFG)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.api.board = [tick("AAAUSDT", 80, 1.45)]
+        m.tick(now=time_now() + 60)
+        t = m.tracks["AAAUSDT"]
+        self.assertAlmostEqual(t.stop, 1.20)
+        self.assertAlmostEqual(t.take_profit, 2.0)
+
+
 class PercentSizing(unittest.TestCase):
     """entry.notional_pct_of_equity: each trade is a share of the equity."""
 
