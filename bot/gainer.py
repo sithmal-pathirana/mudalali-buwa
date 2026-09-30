@@ -90,6 +90,24 @@ class GainerBoardConfig:
     #: Every 2-year replay read the board hourly, so 60 is the tested
     #: behaviour; a 30-second board also buys short spikes it never saw.
     leader_check_minutes: float = 0.0
+    #: What makes a coin "the leader". change_24h: the biggest 24h % rise,
+    #: which by the time it tops the board has usually already happened
+    #: (typically +37%). climb: the biggest rise over the last climb_minutes,
+    #: the coin moving fastest now. Needs climb_minutes of price history after
+    #: a start before it picks anyone; stops and the ladder run meanwhile.
+    rank_by: str = "change_24h"
+    climb_minutes: float = 60.0
+    #: With rank_by climb, only coins whose volume over the climb window is at
+    #: least this many times their 24h average for such a window. It is
+    #: estimated from the rolling 24h volume Binance reports. 0 = off.
+    climb_volume_surge_x: float = 0.0
+
+    def __post_init__(self):
+        if self.rank_by not in ("change_24h", "climb"):
+            raise ValueError("gainer.board.rank_by must be change_24h or climb, "
+                             f"not {self.rank_by!r}")
+        if self.rank_by == "climb" and self.climb_minutes <= 0:
+            raise ValueError("gainer.board.climb_minutes must be > 0")
 
 
 @dataclass
@@ -281,6 +299,8 @@ class Row:
     price: float
     quote_volume: float
     rank: int = 0
+    #: % rise over board.climb_minutes, when the board ranks by climb.
+    climb_pct: float = 0.0
 
 
 def rank_board(tickers: list, tradable: set, min_quote_volume: float) -> list[Row]:
@@ -303,6 +323,41 @@ def rank_board(tickers: list, tradable: set, min_quote_volume: float) -> list[Ro
     for i, r in enumerate(rows, 1):
         r.rank = i
     return rows
+
+
+def rank_by_climb(rows: list[Row], history: dict, now: float, minutes: float,
+                  surge_x: float = 0.0) -> list[Row]:
+    """
+    The same rows, fastest climber first, using `history` (symbol -> list of
+    (time, price, 24h quote volume), oldest first). A symbol whose history
+    does not yet reach back `minutes` is left out.
+    """
+    window = minutes * 60.0
+    ranked = []
+    for r in rows:
+        h = history.get(r.symbol)
+        if not h or now - h[0][0] < window:
+            continue
+        base = None
+        for t, px, qv in h:                  # the last sample at or before the window start
+            if now - t >= window:
+                base = (px, qv)
+            else:
+                break
+        if base is None or base[0] <= 0:
+            continue
+        if surge_x > 0:
+            share = window / 86400.0
+            # rolling 24h volume: what arrived = change + what rolled out (~average)
+            recent = r.quote_volume - base[1] + base[1] * share
+            if recent < surge_x * r.quote_volume * share:
+                continue
+        r.climb_pct = (r.price / base[0] - 1) * 100.0
+        ranked.append(r)
+    ranked.sort(key=lambda x: -x.climb_pct)
+    for i, r in enumerate(ranked, 1):
+        r.rank = i
+    return ranked
 
 
 @dataclass
@@ -488,6 +543,9 @@ class GainerMiner:
         self._last_status = time.time()
         self._tradable: set = set()
         self._tradable_at = 0.0
+        #: symbol -> [(time, price, 24h quote volume)], for board.rank_by climb.
+        self.price_history: dict = {}
+        self._warming_noted = False
         #: Sweep bookkeeping: waiting to reach min_transfer_usdt, and the
         #: running total moved (or, on paper/testnet, that would have moved).
         self.sweep_pending = 0.0
@@ -578,6 +636,21 @@ class GainerMiner:
         rows = rank_board(tickers, self.tradable(now), self.cfg.board.min_quote_volume)
         if not rows:
             return
+        choose = True
+        bd = self.cfg.board
+        if bd.rank_by == "climb":
+            self.record_history(rows, now)
+            climbers = rank_by_climb(rows, self.price_history, now, bd.climb_minutes,
+                                     bd.climb_volume_surge_x)
+            if climbers:
+                rows = climbers + [r for r in rows if r not in climbers]
+                self._warming_noted = False
+            else:
+                choose = False              # no history yet: protect, do not pick
+                if not self._warming_noted:
+                    self._warming_noted = True
+                    log.info("gainer: collecting %g min of prices before picking "
+                             "the fastest climber", bd.climb_minutes)
         self.board.update(rows, now)
         self.closed_at = {s: t for s, t in self.closed_at.items()
                           if now - t < CLOSED_AT_MAX_AGE}
@@ -596,13 +669,24 @@ class GainerMiner:
 
         self.sync_tracks(prices, highs, now)
         self.manage_ladder(prices, now)
-        if self.leader_due(now):
+        if choose and self.leader_due(now):
             self.check_leader(now, prices, highs)
         self.check_milestones(prices)
         status = self.cfg.alerts.status_minutes
         if status and now - self._last_status >= status * 60:
             self._last_status = now
             self.send_status(now, prices)
+
+    def record_history(self, rows: list, now: float) -> None:
+        """Keep climb_minutes (+10 min) of prices per symbol for rank_by climb."""
+        keep = self.cfg.board.climb_minutes * 60 + 600
+        for r in rows:
+            h = self.price_history.setdefault(r.symbol, [])
+            h.append((now, r.price, r.quote_volume))
+            while h and now - h[0][0] > keep:
+                h.pop(0)
+        for sym in [s for s, h in self.price_history.items() if not h or now - h[-1][0] > keep]:
+            del self.price_history[sym]
 
     def leader_due(self, now: float) -> bool:
         """board.leader_check_minutes: True on the first poll of each period."""
@@ -690,7 +774,9 @@ class GainerMiner:
 
     def on_new_leader(self, lead: Row, previous: str, now: float, prices: dict) -> None:
         fc = self.board.forecast(now)
-        self.notify(f"NEW TOP GAINER: {lead.symbol} {lead.change_pct:+.2f}% "
+        climb = (f", climbing {lead.climb_pct:+.2f}% in {self.cfg.board.climb_minutes:g} min"
+                 if self.cfg.board.rank_by == "climb" else "")
+        self.notify(f"NEW TOP GAINER: {lead.symbol} {lead.change_pct:+.2f}% 24h{climb} "
                     f"(was {previous or 'none'})"
                     + (f"\n{fc.text()}" if fc else ""), symbol=lead.symbol)
 

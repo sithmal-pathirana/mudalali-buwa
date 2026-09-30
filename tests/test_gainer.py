@@ -19,8 +19,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from bot.binanceapi import BinanceError                    # noqa: E402
 from bot.gainer import (GainerBoard, GainerConfig, GainerMiner,  # noqa: E402
-                        Track, ladder_stop, net_pnl, rank_board, stop_price,
-                        target_price)
+                        Row, Track, ladder_stop, net_pnl, rank_board, rank_by_climb,
+                        stop_price, target_price)
 from bot.notify import Event                               # noqa: E402
 from test_r2_regressions import StubAPI, engine            # noqa: E402
 
@@ -738,6 +738,59 @@ class Principal(unittest.TestCase):
         m.check_principal()
         again = GainerMiner(e, m.cfg, path=m.path)
         self.assertAlmostEqual(again.principal_pending, 100.0)
+
+
+class FastestClimber(unittest.TestCase):
+    """board.rank_by climb: the leader is the coin rising fastest now."""
+
+    def rows(self, **px):
+        return [Row(s, pct, price, 50e6) for s, (pct, price) in px.items()]
+
+    def test_ranks_by_the_rise_over_the_window_not_the_24h_change(self):
+        hist = {"OLDUSDT": [(0, 1.00, 50e6)], "NEWUSDT": [(0, 1.00, 50e6)]}
+        rows = self.rows(OLDUSDT=(90.0, 1.02), NEWUSDT=(15.0, 1.12))
+        got = rank_by_climb(rows, hist, 3600, 60)
+        self.assertEqual([r.symbol for r in got], ["NEWUSDT", "OLDUSDT"])
+        self.assertAlmostEqual(got[0].climb_pct, 12.0)
+
+    def test_a_coin_without_enough_history_is_left_out(self):
+        hist = {"AAAUSDT": [(1800, 1.0, 50e6)]}
+        self.assertEqual(rank_by_climb(self.rows(AAAUSDT=(10, 1.5)), hist, 3600, 60), [])
+
+    def test_the_price_at_the_window_start_is_the_base(self):
+        hist = {"AAAUSDT": [(0, 1.0, 50e6), (1000, 1.1, 50e6), (3000, 1.4, 50e6)]}
+        got = rank_by_climb(self.rows(AAAUSDT=(10, 1.5)), hist, 4700, 60)   # window starts at 1100
+        self.assertAlmostEqual(got[0].climb_pct, (1.5 / 1.1 - 1) * 100)
+
+    def test_volume_surge_filter(self):
+        # 24h volume grew from 48M to 50M in an hour: ~4M traded vs a ~2.1M average
+        hist = {"HOTUSDT": [(0, 1.0, 48e6)], "COLDUSDT": [(0, 1.0, 50e6)]}
+        rows = [Row("HOTUSDT", 5, 1.05, 50e6), Row("COLDUSDT", 5, 1.10, 50e6)]
+        got = rank_by_climb(rows, hist, 3600, 60, surge_x=1.5)
+        self.assertEqual([r.symbol for r in got], ["HOTUSDT"])
+
+    def test_warm_up_picks_no_leader_but_stops_still_run(self):
+        m, e = miner(board=dict(rank_by="climb", climb_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.9, 1.2, 0, paper=True)
+        e.api.board = [tick("AAAUSDT", 40, 0.85), tick("BBBUSDT", 60, 1.0)]
+        m.tick(now=1000)
+        self.assertEqual(m.tracks, {})                 # the stop still closed it
+        self.assertNotIn("BBBUSDT", m.tracks)          # nobody picked yet
+
+    def test_after_the_window_the_fastest_climber_is_bought(self):
+        m, e = miner(board=dict(rank_by="climb", climb_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        e.api.board = [tick("AAAUSDT", 90, 1.0), tick("BBBUSDT", 10, 1.0)]
+        m.tick(now=1000)
+        e.api.board = [tick("AAAUSDT", 91, 1.01), tick("BBBUSDT", 25, 1.15)]
+        m.tick(now=1000 + 3700)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertTrue(any("climbing +15.00% in 60 min" in b for b in bodies(e)))
+
+    def test_bad_rank_by_is_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(board=dict(rank_by="fastest"))
 
 
 class HourlyLeaderCheck(unittest.TestCase):
