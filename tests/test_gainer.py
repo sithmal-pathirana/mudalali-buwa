@@ -242,6 +242,19 @@ class LiveOrders(unittest.TestCase):
         self.assertEqual(pos.strategy, "gainer")
         self.assertTrue(pos.filled)
 
+    def test_manual_trade_symbol_is_never_bought(self):
+        m, e = miner(dry=False)
+        e.cfg.manual_trades.symbols = ["AAAUSDT"]
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders, [])
+        self.assertIn("manual trade", bodies(e)[-1])
+
+    def test_manual_trade_symbol_is_not_on_the_board(self):
+        m, e = miner()
+        e.cfg.manual_trades.symbols = ["AAAUSDT"]
+        m._tradable = set()
+        self.assertNotIn("AAAUSDT", m.tradable(1.0))
+
     def test_failed_stop_flattens_the_position(self):
         api = BoardAPI()
         api.fail_algo = True

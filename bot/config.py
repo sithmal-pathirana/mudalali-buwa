@@ -77,6 +77,16 @@ class DashboardConfig:
 
 
 @dataclass
+class ManualTradesConfig:
+    """Positions that belong to the user, not the bot."""
+    #: Symbols the bot keeps its hands off: an open position on one is never
+    #: adopted, protected, supervised or closed, and no strategy opens a new
+    #: one there. Its stop-loss and take-profit are whatever was set on
+    #: Binance by hand. Remove a symbol once its trade has closed.
+    symbols: list = field(default_factory=list)
+
+
+@dataclass
 class AggressiveConfig:
     """
     Off by default and deliberately so. When on it REPLACES the risk profile
@@ -134,6 +144,7 @@ class Config:
     gainer: GainerConfig = field(default_factory=GainerConfig)
     squeeze: SqueezeConfig = field(default_factory=SqueezeConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    manual_trades: ManualTradesConfig = field(default_factory=ManualTradesConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -183,7 +194,8 @@ class Config:
                     "portfolio": PortfolioConfig, "aggressive": AggressiveConfig,
                     "supervise": SuperviseConfig, "gainer": GainerConfig,
                     "squeeze": SqueezeConfig,
-                    "context": ContextConfig}
+                    "context": ContextConfig,
+                    "manual_trades": ManualTradesConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}

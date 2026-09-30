@@ -347,6 +347,11 @@ class Engine:
                 stop_o = stop_o or o
         return stop_o, tp_o
 
+    def is_manual(self, symbol: str) -> bool:
+        """manual_trades.symbols: the user's own positions, never touched."""
+        mt = getattr(self.cfg, "manual_trades", None)
+        return bool(mt and symbol in (mt.symbols or ()))
+
     def adopt_row(self, row: dict, orders: list) -> ActivePosition:
         """Track one position the exchange holds, from its row in positions()
         and that symbol's open orders. See adopt_open_positions."""
@@ -421,7 +426,8 @@ class Engine:
             return 0
         try:
             live = [r for r in self.api.positions()
-                    if float(r.get("positionAmt") or 0.0) != 0.0]
+                    if float(r.get("positionAmt") or 0.0) != 0.0
+                    and not self.is_manual(r.get("symbol", ""))]
             orders = list(self.api.open_orders()) + list(self.api.open_algo_orders())
         except BinanceError as e:
             log.error("could not read open positions to adopt: %s", e)
@@ -2407,7 +2413,8 @@ class Engine:
         get noticed for a scanner symbol.
         """
         try:
-            live = {r["symbol"]: r for r in self.api.positions()}
+            live = {r["symbol"]: r for r in self.api.positions()
+                    if not self.is_manual(r["symbol"])}
             # Stops are algo orders now and are absent from open_orders(), so
             # both lists are needed -- on the first alone every protected
             # position looks like it lost its stop. (Binance algo migration)

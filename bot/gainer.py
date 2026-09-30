@@ -837,6 +837,10 @@ class GainerMiner:
         self._leader_period = period
         return True
 
+    def _manual(self, symbol: str) -> bool:
+        is_manual = getattr(self.engine, "is_manual", None)
+        return bool(is_manual and is_manual(symbol) is True)
+
     def tradable(self, now: float) -> set:
         if self._tradable and now - self._tradable_at < self.EXCHANGE_INFO_MAX_AGE:
             return self._tradable
@@ -850,7 +854,8 @@ class GainerMiner:
         self._tradable = {
             s["symbol"] for s in info.get("symbols", [])
             if s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT" and s.get("baseAsset") not in EXCLUDE_BASES}
+            and s.get("quoteAsset") == "USDT" and s.get("baseAsset") not in EXCLUDE_BASES
+            and not self._manual(s["symbol"])}
         self._tradable_at = now
         return self._tradable
 
@@ -1095,6 +1100,9 @@ class GainerMiner:
             return False
         if symbol in eng.book:
             self.refuse(symbol, "another strategy already holds it")
+            return False
+        if self._manual(symbol):
+            self.refuse(symbol, "it is a manual trade (manual_trades.symbols)")
             return False
         notional = self.trade_notional(symbol)
         why = self.limit_reason(time.time(), notional)

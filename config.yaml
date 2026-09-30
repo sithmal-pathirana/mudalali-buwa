@@ -634,6 +634,17 @@ gainer:
     drawdown_pause_pct: 20      # no new trades 20% below the high; setting A 2026-09-30
 
 
+# MANUAL TRADES: positions that belong to the user, not the bot. On these
+# symbols the bot never adopts, protects, supervises or closes a position,
+# and no strategy opens one. Their stop-loss and take-profit are set by hand
+# on Binance. Remove a symbol once its trade has closed.
+#   2026-09-30: the four gainer trades open at the switch to setting A,
+#   separated by request with hand-set levels (SL under support, TP under
+#   resistance): HBAR 0.0995 / 0.1195, MARSCOIN 0.1305 / 0.1545,
+#   CELO 0.0948 / 0.1030, 0G 0.2990 / 0.3580.
+manual_trades:
+  symbols: [HBARUSDT, MARSCOINUSDT, CELOUSDT, 0GUSDT]
+
 squeeze:
   enabled: false
   dry_run: true
