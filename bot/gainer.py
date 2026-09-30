@@ -186,6 +186,20 @@ class GainerExitConfig:
     #: one-position book for weeks: in the 6-month replay a 30% stop left
     #: OGNUSDT open from 2026-07-08 to the end of the data.
     unarmed_max_hours: float = 0.0
+    #: lock: at ladder_first_pct the stop jumps to entry, then one step below
+    #: each new step. trail: the stop rises ladder_step_pct for every
+    #: ladder_step_pct gained, keeping its starting distance.
+    ladder_mode: str = "lock"
+    #: fixed: stop_pct below entry. atr: atr_stop_mult x the coin's 12h ATR %,
+    #: kept between atr_stop_min_pct and atr_stop_max_pct.
+    stop_mode: str = "fixed"
+    atr_stop_mult: float = 3.0
+    atr_stop_min_pct: float = 10.0
+    atr_stop_max_pct: float = 40.0
+    #: Sell partial_fraction of the position once it is this % above entry,
+    #: with an exchange-side take-profit placed at open. 0 = off.
+    partial_take_pct: float = 0.0
+    partial_fraction: float = 0.5
 
     def __post_init__(self):
         if self.on_new_leader not in ON_NEW_LEADER:
@@ -193,6 +207,12 @@ class GainerExitConfig:
                              f"{' | '.join(ON_NEW_LEADER)}, not {self.on_new_leader!r}")
         if self.ladder_enabled and (self.ladder_first_pct <= 0 or self.ladder_step_pct <= 0):
             raise ValueError("gainer.exit.ladder_first_pct and ladder_step_pct must be > 0")
+        if self.ladder_mode not in ("lock", "trail"):
+            raise ValueError("gainer.exit.ladder_mode must be lock or trail")
+        if self.stop_mode not in ("fixed", "atr"):
+            raise ValueError("gainer.exit.stop_mode must be fixed or atr")
+        if not 0 < self.partial_fraction < 1:
+            raise ValueError("gainer.exit.partial_fraction must be between 0 and 1")
 
     @property
     def has_target(self) -> bool:
@@ -205,6 +225,60 @@ class GainerExitConfig:
         if self.target_usd > 0:
             return target_price(entry, qty, self.target_usd, self.fee_pct)
         return 0.0
+
+
+@dataclass
+class GainerFiltersConfig:
+    """Which new leaders are skipped, as a trader would. Every check is off at
+    its default. A skipped leader is not watched or bought later."""
+    #: Skip when the 1-hour RSI(14) is above this (overbought). 0 = off.
+    max_rsi_1h: float = 0.0
+    #: Skip coins listed on futures fewer than this many days ago. 0 = off.
+    min_listing_age_days: float = 0.0
+    #: Skip while BTC's 24h change is below this percent (e.g. -2). None = off.
+    btc_min_change_24h_pct: float | None = None
+    #: Skip while BTC has fallen more than this percent in the last hour. 0 = off.
+    btc_max_drop_1h_pct: float = 0.0
+    #: Skip coins priced below this, in USDT. 0 = off.
+    min_price: float = 0.0
+
+
+@dataclass
+class GainerSizingConfig:
+    """How big each trade is, on top of entry.notional_pct_of_equity."""
+    #: fixed: entry.notional_pct_of_equity. volatility: scaled by
+    #: volatility_target_atr_pct / the coin's 12h ATR %, within min/max.
+    #: conviction: high_pct when the conviction checks all pass, else low_pct.
+    mode: str = "fixed"
+    volatility_target_atr_pct: float = 3.0
+    min_pct: float = 5.0
+    max_pct: float = 15.0
+    conviction_high_pct: float = 15.0
+    conviction_low_pct: float = 7.5
+    conviction_max_rsi_1h: float = 85.0
+    conviction_min_listing_age_days: float = 3.0
+    conviction_btc_min_change_24h_pct: float = -2.0
+
+    def __post_init__(self):
+        if self.mode not in ("fixed", "volatility", "conviction"):
+            raise ValueError("gainer.sizing.mode must be fixed, volatility or conviction")
+
+
+@dataclass
+class GainerLimitsConfig:
+    """When no new gainer trade is opened. Open trades are never touched."""
+    #: New trades per UTC day. 0 = no cap.
+    max_new_trades_per_day: int = 0
+    #: After this many losing trades in a row, open nothing for pause_hours. 0 = off.
+    pause_after_losses: int = 0
+    pause_hours: float = 24.0
+    #: All open gainer positions together at most this % of equity. 0 = off.
+    max_exposure_pct: float = 0.0
+    #: Stop opening for the rest of the UTC day once gainer trades closed
+    #: today lost more than this % of the day's opening equity. 0 = off.
+    daily_loss_limit_pct: float = 0.0
+    #: Stop opening while equity is more than this % below its highest point. 0 = off.
+    drawdown_pause_pct: float = 0.0
 
 
 @dataclass
@@ -240,6 +314,9 @@ class GainerSweepConfig:
     pct: float = 25.0
     #: Amounts under this are carried forward and added to the next one.
     min_transfer_usdt: float = 1.0
+    #: Keep every profit trading until equity reaches this, then start moving
+    #: pct of wins to Funding. 0 = sweep from the first win.
+    start_when_equity_usdt: float = 0.0
     #: Principal recovery. When the trading balance reaches principal_trigger_x
     #: times everything deposited so far, move the deposits not yet moved out
     #: to Funding; the rest (1.5x the deposits at the default 2.5) is profit,
@@ -257,7 +334,9 @@ class GainerSweepConfig:
 
 GROUPS = {"board": GainerBoardConfig, "entry": GainerEntryConfig,
           "exit": GainerExitConfig, "alerts": GainerAlertsConfig,
-          "forecast": GainerForecastConfig, "sweep": GainerSweepConfig}
+          "forecast": GainerForecastConfig, "sweep": GainerSweepConfig,
+          "filters": GainerFiltersConfig, "sizing": GainerSizingConfig,
+          "limits": GainerLimitsConfig}
 
 
 @dataclass
@@ -273,6 +352,9 @@ class GainerConfig:
     alerts: GainerAlertsConfig = field(default_factory=GainerAlertsConfig)
     forecast: GainerForecastConfig = field(default_factory=GainerForecastConfig)
     sweep: GainerSweepConfig = field(default_factory=GainerSweepConfig)
+    filters: GainerFiltersConfig = field(default_factory=GainerFiltersConfig)
+    sizing: GainerSizingConfig = field(default_factory=GainerSizingConfig)
+    limits: GainerLimitsConfig = field(default_factory=GainerLimitsConfig)
 
     def __post_init__(self):
         # config.yaml hands each group over as a dict.
@@ -481,10 +563,14 @@ def net_pnl(entry: float, qty: float, price: float, fee_pct: float) -> float:
     return (price - entry) * qty - entry * qty * fee_pct / 100.0
 
 
-def ladder_stop(entry: float, peak: float, first_pct: float, step_pct: float) -> float | None:
+def ladder_stop(entry: float, peak: float, first_pct: float, step_pct: float,
+                mode: str = "lock", init_stop: float = 0.0) -> float | None:
     """The stop the ladder calls for at this peak, or None before it arms."""
     # Rounded so an exact step (1.40 / 1.0 reads 39.999...%) counts as reached.
     gain = round((peak / entry - 1) * 100.0, 9) if entry > 0 else 0.0
+    if mode == "trail":
+        steps = int(gain // step_pct) if step_pct > 0 else 0
+        return init_stop + entry * steps * step_pct / 100.0 if steps >= 1 else None
     if gain < first_pct:
         return None
     level = entry
@@ -492,6 +578,26 @@ def ladder_stop(entry: float, peak: float, first_pct: float, step_pct: float) ->
     if steps >= 2:
         level = max(level, entry * (1 + (steps - 1) * step_pct / 100.0))
     return level
+
+
+def rsi(closes: list) -> float | None:
+    """Wilder-free simple RSI over the given closes (15 closes = RSI 14)."""
+    if len(closes) < 2:
+        return None
+    up = down = 0.0
+    for a, b in zip(closes, closes[1:]):
+        up += max(b - a, 0.0)
+        down += max(a - b, 0.0)
+    return 100.0 if down == 0 else 100.0 - 100.0 / (1.0 + up / down)
+
+
+def atr_pct(bars: list) -> float | None:
+    """Mean true range of klines as % of the last close. bars: [o,h,l,c] rows."""
+    if len(bars) < 2 or bars[-1][3] <= 0:
+        return None
+    trs = [max(h - l, abs(h - pc), abs(l - pc))
+           for (_, h, l, _c), (_, _, _, pc) in zip(bars[1:], bars[:-1])]
+    return sum(trs) / len(trs) / bars[-1][3] * 100.0
 
 
 # ----------------------------------------------------------------- positions
@@ -507,6 +613,11 @@ class Track:
     milestones_hit: list = field(default_factory=list)
     #: Highest price seen while held; the ladder steps are counted on it.
     peak: float = 0.0
+    #: The stop as first placed (a trail ladder keeps this distance).
+    init_stop: float = 0.0
+    #: exit.partial_take_pct: the level, and whether that part has been sold.
+    partial_price: float = 0.0
+    partial_done: bool = False
 
 
 class GainerMiner:
@@ -546,6 +657,15 @@ class GainerMiner:
         #: symbol -> [(time, price, 24h quote volume)], for board.rank_by climb.
         self.price_history: dict = {}
         self._warming_noted = False
+        #: filters / sizing / limits bookkeeping
+        self._onboard: dict = {}            # symbol -> futures listing time (ms)
+        self._btc_24h: float | None = None
+        self._features: dict = {}           # symbol -> (time, {rsi, atr})
+        self.day_opens: dict = {}           # "YYYY-MM-DD" -> new trades opened
+        self.day_realized: dict = {}        # "YYYY-MM-DD" -> P&L of gainer closes
+        self.loss_streak = 0
+        self.pause_until = 0.0
+        self.peak_equity = 0.0
         #: Sweep bookkeeping: waiting to reach min_transfer_usdt, and the
         #: running total moved (or, on paper/testnet, that would have moved).
         self.sweep_pending = 0.0
@@ -576,6 +696,11 @@ class GainerMiner:
         self.swept_total = float(raw.get("swept_total", 0.0))
         self.principal_withdrawn = float(raw.get("principal_withdrawn", 0.0))
         self.principal_pending = float(raw.get("principal_pending", 0.0))
+        self.day_opens = dict(raw.get("day_opens") or {})
+        self.day_realized = dict(raw.get("day_realized") or {})
+        self.loss_streak = int(raw.get("loss_streak", 0))
+        self.pause_until = float(raw.get("pause_until", 0.0))
+        self.peak_equity = float(raw.get("peak_equity", 0.0))
         for sym, t in (raw.get("tracks") or {}).items():
             try:
                 self.tracks[sym] = Track(**t)
@@ -594,6 +719,11 @@ class GainerMiner:
                  "swept_total": self.swept_total,
                  "principal_withdrawn": self.principal_withdrawn,
                  "principal_pending": self.principal_pending,
+                 "day_opens": dict(list(self.day_opens.items())[-7:]),
+                 "day_realized": dict(list(self.day_realized.items())[-7:]),
+                 "loss_streak": self.loss_streak,
+                 "pause_until": self.pause_until,
+                 "peak_equity": self.peak_equity,
                  "tracks": {s: asdict(t) for s, t in self.tracks.items()}},
                 indent=2))
             tmp.replace(self.path)
@@ -656,8 +786,16 @@ class GainerMiner:
                           if now - t < CLOSED_AT_MAX_AGE}
         prices = {r.symbol: r.price for r in rows}
         highs = {}
+        eq = float(getattr(self.engine, "equity", 0.0) or 0.0)
+        if eq > self.peak_equity:
+            self.peak_equity = eq
         for t in tickers or []:
             sym = t.get("symbol")
+            if sym == "BTCUSDT":
+                try:
+                    self._btc_24h = float(t.get("priceChangePercent"))
+                except (TypeError, ValueError):
+                    pass
             try:
                 if sym in self.tracks or sym in self.rearm:
                     highs[sym] = float(t.get("highPrice") or 0)
@@ -707,6 +845,8 @@ class GainerMiner:
         except BinanceError as e:
             log.warning("exchange info unavailable (%s); keeping the old symbol list", e)
             return self._tradable
+        self._onboard = {s["symbol"]: float(s.get("onboardDate") or 0)
+                         for s in info.get("symbols", []) if s.get("symbol")}
         self._tradable = {
             s["symbol"] for s in info.get("symbols", [])
             if s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
@@ -785,7 +925,102 @@ class GainerMiner:
         if lead.symbol in self.tracks:
             self.notify(f"{lead.symbol} is back on top; already holding it", symbol=lead.symbol)
             return
+        why = self.filter_reason(lead, now)
+        if why:
+            log.info("gainer: skipping %s -- %s", lead.symbol, why)
+            self.notify(f"{lead.symbol} SKIPPED by a filter: {why}", symbol=lead.symbol)
+            return
         self.try_enter(lead, now)
+
+    # ------------------------------------------------------------- filters
+    def features(self, symbol: str) -> dict:
+        """1h RSI(14) and 12h ATR % from one klines request, cached a minute."""
+        hit = self._features.get(symbol)
+        if hit and time.time() - hit[0] < 60:
+            return hit[1]
+        out = {"rsi": None, "atr": None}
+        try:
+            k = self.engine.api.klines(symbol, "1h", limit=16)[:-1]      # closed bars
+            bars = [(float(x[1]), float(x[2]), float(x[3]), float(x[4])) for x in k]
+            out["rsi"] = rsi([b[3] for b in bars[-15:]])
+            out["atr"] = atr_pct(bars[-13:])
+        except (BinanceError, IndexError, TypeError, ValueError) as e:
+            log.warning("gainer: no 1h bars for %s (%s)", symbol, e)
+        self._features[symbol] = (time.time(), out)
+        return out
+
+    def btc_change_1h(self) -> float | None:
+        try:
+            k = self.engine.api.klines("BTCUSDT", "5m", limit=13)[:-1]
+            return (float(k[-1][4]) / float(k[0][1]) - 1) * 100.0
+        except (BinanceError, IndexError, TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def filter_reason(self, lead, now: float) -> str:
+        """Why this new leader is skipped by gainer.filters, or ''."""
+        f = self.cfg.filters
+        if f.min_price > 0 and lead.price < f.min_price:
+            return f"price {lead.price:.6g} under {f.min_price:g}"
+        if f.min_listing_age_days > 0:
+            listed = self._onboard.get(lead.symbol, 0.0)
+            age = (now * 1000 - listed) / 86_400_000 if listed else None
+            if age is not None and age < f.min_listing_age_days:
+                return f"listed {age:.1f} days ago (minimum {f.min_listing_age_days:g})"
+        if f.btc_min_change_24h_pct is not None and self._btc_24h is not None \
+                and self._btc_24h < f.btc_min_change_24h_pct:
+            return f"BTC 24h {self._btc_24h:+.2f}% (minimum {f.btc_min_change_24h_pct:+g}%)"
+        if f.btc_max_drop_1h_pct > 0:
+            b1 = self.btc_change_1h()
+            if b1 is not None and b1 < -f.btc_max_drop_1h_pct:
+                return f"BTC fell {b1:.2f}% in the last hour"
+        if f.max_rsi_1h > 0:
+            r = self.features(lead.symbol)["rsi"]
+            if r is not None and r > f.max_rsi_1h:
+                return f"1h RSI {r:.0f} above {f.max_rsi_1h:g}"
+        return ""
+
+    def limit_reason(self, now: float, notional: float) -> str:
+        """Why gainer.limits blocks a new trade right now, or ''."""
+        lm = self.cfg.limits
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        if lm.max_new_trades_per_day > 0 and self.day_opens.get(day, 0) >= lm.max_new_trades_per_day:
+            return f"{lm.max_new_trades_per_day} new trades already today"
+        if now < self.pause_until:
+            return (f"paused after {lm.pause_after_losses} losses in a row, "
+                    f"{(self.pause_until - now) / 3600:.1f}h left")
+        eq = float(getattr(self.engine, "equity", 0.0) or 0.0)
+        if lm.max_exposure_pct > 0:
+            held = sum(t.entry * t.qty for t in self.tracks.values())
+            if held + notional > eq * lm.max_exposure_pct / 100.0 + 1e-9:
+                return (f"exposure ${held + notional:,.2f} would pass "
+                        f"{lm.max_exposure_pct:g}% of equity")
+        if lm.daily_loss_limit_pct > 0:
+            start = float(getattr(getattr(self.engine, "state", None), "day_start_equity", 0) or eq)
+            lost = self.day_realized.get(day, 0.0)
+            if lost < -start * lm.daily_loss_limit_pct / 100.0:
+                return f"gainer lost ${-lost:.2f} today, over {lm.daily_loss_limit_pct:g}%"
+        if lm.drawdown_pause_pct > 0 and self.peak_equity > 0 \
+                and eq < self.peak_equity * (1 - lm.drawdown_pause_pct / 100.0):
+            return (f"equity ${eq:,.2f} is more than {lm.drawdown_pause_pct:g}% "
+                    f"below its high ${self.peak_equity:,.2f}")
+        return ""
+
+    def note_close(self, pnl: float, now: float | None = None) -> None:
+        """Every booked gainer close: loss streak, pause, and today's P&L."""
+        now = time.time() if now is None else now
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        self.day_realized[day] = self.day_realized.get(day, 0.0) + pnl
+        lm = self.cfg.limits
+        if pnl < 0:
+            self.loss_streak += 1
+            if lm.pause_after_losses > 0 and self.loss_streak >= lm.pause_after_losses:
+                self.pause_until = now + lm.pause_hours * 3600
+                self.loss_streak = 0
+                self.notify(f"PAUSED: {lm.pause_after_losses} losing gainer trades in a row; "
+                            f"no new trades for {lm.pause_hours:g}h")
+        else:
+            self.loss_streak = 0
+        self.save()
 
     def judge_held(self, new_leader: str, now: float, prices: dict) -> None:
         """exit.on_new_leader and exit.min_hold_minutes, for every other position."""
@@ -861,7 +1096,12 @@ class GainerMiner:
         if symbol in eng.book:
             self.refuse(symbol, "another strategy already holds it")
             return False
-        notional = self.trade_notional()
+        notional = self.trade_notional(symbol)
+        why = self.limit_reason(time.time(), notional)
+        if why:
+            self.refuse(symbol, why)
+            return False
+        stop_pct = self.stop_pct_for(symbol)
         if (not ex.has_target and not ex.ladder_enabled) or ex.stop_pct <= 0 \
                 or notional <= 0:
             self.refuse(symbol, "gainer exit.stop_pct and the trade size must be > 0 "
@@ -882,8 +1122,14 @@ class GainerMiner:
             return False
         qty = float(sized[0])
 
+        day = time.strftime("%Y-%m-%d", time.gmtime())
         if self.paper:
-            return self._opened(symbol, price, qty, paper=True, change_pct=change_pct)
+            ok = self._opened(symbol, price, qty, paper=True, change_pct=change_pct,
+                              stop=stop_price(price, stop_pct), stop_pct=stop_pct)
+            if ok:
+                self.day_opens[day] = self.day_opens.get(day, 0) + 1
+                self.save()
+            return ok
 
         gate = eng.risk.preflight(eng.equity)
         if not gate:
@@ -916,15 +1162,42 @@ class GainerMiner:
                         f"read back. Bot HALTED. Check Binance for an unprotected "
                         f"position.", symbol=symbol, event=Event.HALT)
             return False
-        return self._protect(symbol, entry, amt, entry_id, rules, change_pct)
+        ok = self._protect(symbol, entry, amt, entry_id, rules, change_pct, stop_pct=stop_pct)
+        if ok:
+            self.day_opens[day] = self.day_opens.get(day, 0) + 1
+            self.save()
+        return ok
 
-    def trade_notional(self) -> float:
+    def trade_notional(self, symbol: str | None = None) -> float:
         """USDT for the next trade: a share of equity, or the fixed amount."""
-        en = self.cfg.entry
-        if en.notional_pct_of_equity > 0:
-            pct = max(0.0, self.engine.equity) * en.notional_pct_of_equity / 100.0
-            return max(pct, en.min_notional_usdt) if pct > 0 else 0.0
-        return en.notional_usdt
+        en, sz = self.cfg.entry, self.cfg.sizing
+        if en.notional_pct_of_equity <= 0:
+            return en.notional_usdt
+        share = en.notional_pct_of_equity
+        if symbol and sz.mode == "volatility":
+            a = self.features(symbol)["atr"]
+            if a:
+                share = min(sz.max_pct, max(sz.min_pct, share * sz.volatility_target_atr_pct / a))
+        elif symbol and sz.mode == "conviction":
+            feat = self.features(symbol)
+            listed = self._onboard.get(symbol, 0.0)
+            age = (time.time() * 1000 - listed) / 86_400_000 if listed else 1e9
+            strong = ((feat["rsi"] is None or feat["rsi"] <= sz.conviction_max_rsi_1h)
+                      and age >= sz.conviction_min_listing_age_days
+                      and (self._btc_24h is None
+                           or self._btc_24h >= sz.conviction_btc_min_change_24h_pct))
+            share = sz.conviction_high_pct if strong else sz.conviction_low_pct
+        pct = max(0.0, self.engine.equity) * share / 100.0
+        return max(pct, en.min_notional_usdt) if pct > 0 else 0.0
+
+    def stop_pct_for(self, symbol: str) -> float:
+        """exit.stop_mode: the fixed stop_pct, or a multiple of the coin's ATR."""
+        ex = self.cfg.exit
+        if ex.stop_mode == "atr":
+            a = self.features(symbol)["atr"]
+            if a:
+                return min(ex.atr_stop_max_pct, max(ex.atr_stop_min_pct, ex.atr_stop_mult * a))
+        return ex.stop_pct
 
     def _read_fill(self, symbol: str) -> tuple[float, float]:
         for attempt in range(self.FILL_WAIT_ATTEMPTS):
@@ -941,10 +1214,12 @@ class GainerMiner:
                 time.sleep(self.FILL_WAIT_SECONDS)
         return 0.0, 0.0
 
-    def _protect(self, symbol, entry, qty, entry_id, rules, change_pct) -> bool:
+    def _protect(self, symbol, entry, qty, entry_id, rules, change_pct,
+                 stop_pct: float | None = None) -> bool:
         """Stop and take-profit for a filled market entry, or flatten it."""
         eng, ex = self.engine, self.cfg.exit
-        sl = float(rules.round_price(stop_price(entry, ex.stop_pct)))
+        stop_pct = ex.stop_pct if stop_pct is None else stop_pct
+        sl = float(rules.round_price(stop_price(entry, stop_pct)))
         tp = float(rules.round_price(ex.target_for(entry, qty))) if ex.has_target else 0.0
         qty_s = rules.round_qty(qty)
         eng._seq += 1
@@ -982,6 +1257,21 @@ class GainerMiner:
                             f"on Binance now.", symbol=symbol, event=Event.HALT)
             return False
 
+        part_px = 0.0
+        if ex.partial_take_pct > 0:
+            part_qty = rules.round_qty(qty * ex.partial_fraction)
+            part_px = float(rules.round_price(entry * (1 + ex.partial_take_pct / 100.0)))
+            try:
+                if float(part_qty) > 0:
+                    eng._seq += 1
+                    eng.api.algo_order(symbol=symbol, side="SELL", type="TAKE_PROFIT_MARKET",
+                                       triggerPrice=rules.round_price(part_px), quantity=part_qty,
+                                       reduceOnly="true", workingType="MARK_PRICE",
+                                       clientAlgoId=client_order_id("p", eng._seq))
+            except BinanceError as e:
+                # The stop is on; a missing partial exit only means no partial sale.
+                log.warning("gainer: %s partial take-profit not placed: %s", symbol, e)
+                part_px = 0.0
         eng.book[symbol] = ActivePosition(
             symbol=symbol, side="BUY", entry=entry, stop=sl, take_profit=tp, qty=qty,
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
@@ -992,15 +1282,19 @@ class GainerMiner:
         if eng.stream is not None:
             eng.stream.add_symbol(symbol)
         return self._opened(symbol, entry, qty, paper=False, change_pct=change_pct,
-                            stop=sl, tp=tp)
+                            stop=sl, tp=tp, stop_pct=stop_pct, partial_price=part_px)
 
-    def _opened(self, symbol, entry, qty, paper, change_pct, stop=0.0, tp=0.0) -> bool:
+    def _opened(self, symbol, entry, qty, paper, change_pct, stop=0.0, tp=0.0,
+                stop_pct: float | None = None, partial_price: float | None = None) -> bool:
         ex = self.cfg.exit
-        stop = stop or stop_price(entry, ex.stop_pct)
+        stop_pct = ex.stop_pct if stop_pct is None else stop_pct
+        stop = stop or stop_price(entry, stop_pct)
         if not tp and ex.has_target:
             tp = ex.target_for(entry, qty)
+        if partial_price is None:
+            partial_price = entry * (1 + ex.partial_take_pct / 100.0) if ex.partial_take_pct > 0 else 0.0
         self.tracks[symbol] = Track(symbol, entry, qty, stop, tp, time.time(), paper=paper,
-                                    peak=entry)
+                                    peak=entry, init_stop=stop, partial_price=partial_price)
         self.save()
         loss = net_pnl(entry, qty, stop, ex.fee_pct)
         tp_line = ("TP none" if tp <= 0 else
@@ -1010,7 +1304,9 @@ class GainerMiner:
         self.notify(f"{'PAPER ' if paper else ''}OPENED {symbol} ({self.entry_label} "
                     f"{change_pct:+.2f}%)\nBUY {qty:g} @ {entry:,.6g}  "
                     f"(${entry * qty:,.2f})\n{tp_line}\n"
-                    f"SL {stop:,.6g} (-{ex.stop_pct:g}%, about {loss:+.2f} USDT)" + ladder,
+                    f"SL {stop:,.6g} (-{stop_pct:.1f}%, about {loss:+.2f} USDT)" + ladder
+                    + (f"\nPartial: sell {ex.partial_fraction:.0%} at {partial_price:,.6g} "
+                       f"(+{ex.partial_take_pct:g}%)" if partial_price else ""),
                     symbol=symbol, event=Event.TRADE_OPEN)
         return True
 
@@ -1031,6 +1327,7 @@ class GainerMiner:
             self.save()
             self.notify(f"PAPER CLOSED {symbol} at {price:,.6g} for {pnl:+.2f} USDT\n{why}",
                         symbol=symbol)
+            self.note_close(pnl, now)
             self.sweep_profit(symbol, pnl)
             self.check_principal()
             return
@@ -1063,6 +1360,16 @@ class GainerMiner:
             px = prices.get(sym, 0.0)
             if px <= 0:
                 continue
+            if t.partial_price and not t.partial_done and px >= t.partial_price:
+                part = t.qty * ex.partial_fraction
+                pnl = net_pnl(t.entry, part, t.partial_price, ex.fee_pct)
+                t.qty -= part
+                t.partial_done = True
+                self.save()
+                self.notify(f"PAPER PARTIAL {sym}: sold {part:g} at {t.partial_price:,.6g} "
+                            f"for {pnl:+.2f} USDT", symbol=sym)
+                self.note_close(pnl, now)
+                self.sweep_profit(sym, pnl)
             if t.take_profit > 0 and px >= t.take_profit:
                 self.close(sym, t.take_profit, f"take-profit hit (target ${ex.target_usd:.2f})",
                            now=now)
@@ -1087,14 +1394,19 @@ class GainerMiner:
             if px > t.peak:
                 t.peak = px
                 self.save()
-            level = ladder_stop(t.entry, t.peak, ex.ladder_first_pct, ex.ladder_step_pct)
-            if level is None:
+            if not t.paper and t.partial_price and not t.partial_done and px >= t.partial_price:
+                t.partial_done = True
+                self.save()
+                self.notify(f"{sym} PARTIAL: price reached {t.partial_price:,.6g}; the "
+                            f"exchange sells {ex.partial_fraction:.0%} there", symbol=sym)
+            level = ladder_stop(t.entry, t.peak, ex.ladder_first_pct, ex.ladder_step_pct,
+                                mode=ex.ladder_mode,
+                                init_stop=t.init_stop or stop_price(t.entry, ex.stop_pct))
+            if level is None or level <= t.stop:
                 hours = (now - t.opened_at) / 3600.0
-                if ex.unarmed_max_hours > 0 and hours >= ex.unarmed_max_hours:
-                    self.close(sym, px, f"time limit: {hours:.0f}h without reaching "
-                                        f"+{ex.ladder_first_pct:g}%", now=now)
-                continue
-            if level <= t.stop:
+                if t.stop < t.entry and ex.unarmed_max_hours > 0 and hours >= ex.unarmed_max_hours:
+                    self.close(sym, px, f"time limit: {hours:.0f}h without the stop "
+                                        f"reaching entry", now=now)
                 continue
             gain = (t.peak / t.entry - 1) * 100
             if px <= level:
@@ -1124,6 +1436,9 @@ class GainerMiner:
         sw = self.cfg.sweep
         if not sw.enabled or pnl <= 0:
             return
+        if sw.start_when_equity_usdt > 0 and float(getattr(self.engine, "equity", 0) or 0) \
+                < sw.start_when_equity_usdt:
+            return                              # keep compounding until the threshold
         self.sweep_pending += pnl * sw.pct / 100.0
         amount = int(self.sweep_pending * 100) / 100.0      # whole cents, rounded down
         if amount < sw.min_transfer_usdt:

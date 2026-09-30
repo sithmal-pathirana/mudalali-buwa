@@ -935,3 +935,179 @@ class Config(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def kl(closes, high_pad=0.0):
+    """Fake klines rows [t, o, h, l, c, v] from closes, plus one forming bar."""
+    rows = [[i, c, c * (1 + high_pad), c * (1 - high_pad), c, 1] for i, c in enumerate(closes)]
+    return rows + [[len(closes), closes[-1], closes[-1], closes[-1], closes[-1], 1]]
+
+
+class TraderSettings(unittest.TestCase):
+    """gainer.filters / sizing / limits and the new exit options. All off by default."""
+
+    def lead(self, sym="BBBUSDT", price=1.0):
+        return Row(sym, 40.0, price, 50e6)
+
+    def fresh(self, **kw):
+        m, e = miner(**kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    # ---- filters
+    def test_filters_are_off_by_default(self):
+        m, e = self.fresh()
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_min_price(self):
+        m, e = self.fresh(filters=dict(min_price=0.01))
+        m.on_new_leader(self.lead(price=0.001), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("SKIPPED" in b and "price" in b for b in bodies(e)))
+
+    def test_new_listing_is_skipped(self):
+        m, e = self.fresh(filters=dict(min_listing_age_days=3))
+        now = 10 * 86400
+        m._onboard["BBBUSDT"] = (now - 86400) * 1000            # listed 1 day ago
+        m.on_new_leader(self.lead(), "AAAUSDT", now, {})
+        self.assertEqual(m.tracks, {})
+        m._onboard["BBBUSDT"] = (now - 5 * 86400) * 1000
+        m.on_new_leader(self.lead(), "AAAUSDT", now, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_btc_falling_24h_is_skipped(self):
+        m, e = self.fresh(filters=dict(btc_min_change_24h_pct=-2))
+        m._btc_24h = -3.5
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+
+    def test_btc_crash_in_the_last_hour_is_skipped(self):
+        m, e = self.fresh(filters=dict(btc_max_drop_1h_pct=1.5))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([100] + [97] * 11)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+
+    def test_overbought_rsi_is_skipped(self):
+        m, e = self.fresh(filters=dict(max_rsi_1h=85))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([1 + i * 0.01 for i in range(15)])
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("RSI 100" in b for b in bodies(e)))
+
+    # ---- limits
+    def test_max_new_trades_per_day(self):
+        m, e = self.fresh(limits=dict(max_new_trades_per_day=1))
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertFalse(m.open("CCCUSDT", 1.0, 40))
+
+    def test_pause_after_losses(self):
+        m, e = self.fresh(limits=dict(pause_after_losses=2, pause_hours=24))
+        now = time_now()
+        m.note_close(-1.0, now)
+        m.note_close(-1.0, now)
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+        self.assertTrue(any("PAUSED" in b for b in bodies(e)))
+
+    def test_a_win_resets_the_losing_streak(self):
+        m, e = self.fresh(limits=dict(pause_after_losses=2))
+        m.note_close(-1.0); m.note_close(+1.0); m.note_close(-1.0)
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+
+    def test_max_exposure(self):
+        m, e = self.fresh(entry=dict(notional_usdt=6.0), limits=dict(max_exposure_pct=20))
+        e.equity = 50.0                                          # cap $10
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertFalse(m.open("CCCUSDT", 1.0, 40))
+
+    def test_daily_loss_limit(self):
+        m, e = self.fresh(limits=dict(daily_loss_limit_pct=5))
+        e.state.day_start_equity = 50.0
+        m.note_close(-3.0)                                       # 6% of 50
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+
+    def test_drawdown_pause(self):
+        m, e = self.fresh(limits=dict(drawdown_pause_pct=30))
+        m.peak_equity = 100.0
+        e.equity = 60.0
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+        e.equity = 80.0
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+
+    # ---- sizing
+    def test_volatility_sizing(self):
+        m, e = self.fresh(entry=dict(notional_pct_of_equity=10),
+                          sizing=dict(mode="volatility", volatility_target_atr_pct=3, min_pct=5, max_pct=15))
+        e.equity = 100.0
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 6.0})      # twice the target
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 5.0)             # 10% x 3/6 = 5%
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 1.0})
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 15.0)            # capped at 15%
+
+    def test_conviction_sizing(self):
+        m, e = self.fresh(entry=dict(notional_pct_of_equity=10), sizing=dict(mode="conviction"))
+        e.equity = 100.0
+        m._btc_24h = 1.0
+        m._onboard["BBBUSDT"] = 1.0                                          # listed long ago
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 60, "atr": 3.0})
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 15.0)
+        m._btc_24h = -5.0
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 7.5)
+
+    # ---- exits
+    def test_atr_stop(self):
+        m, e = self.fresh(exit=dict(stop_mode="atr", atr_stop_mult=3, atr_stop_min_pct=10, atr_stop_max_pct=40))
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 5.0})
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertAlmostEqual(m.tracks["BBBUSDT"].stop, 0.85)             # 15% below
+
+    def test_trail_ladder_keeps_its_distance(self):
+        self.assertIsNone(ladder_stop(1.0, 1.04, 5, 5, mode="trail", init_stop=0.7))
+        self.assertAlmostEqual(ladder_stop(1.0, 1.05, 5, 5, mode="trail", init_stop=0.7), 0.75)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.23, 5, 5, mode="trail", init_stop=0.7), 0.90)
+
+    def test_time_limit_applies_until_the_stop_reaches_entry(self):
+        m, e = self.fresh(exit=dict(ladder_enabled=True, target_usd=0, stop_pct=30, ladder_mode="trail",
+                                    ladder_first_pct=5, ladder_step_pct=5, unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.75, 0.0, 0, paper=True, peak=1.05, init_stop=0.7)
+        e.api.board = [tick("AAAUSDT", 40, 1.02)]
+        m.tick(now=73 * 3600)
+        self.assertEqual(m.tracks, {})                    # trailed, still below entry, timed out
+
+    def test_paper_partial_take_profit(self):
+        m, e = self.fresh(exit=dict(partial_take_pct=50, partial_fraction=0.5, target_usd=0,
+                                    ladder_enabled=True, ladder_first_pct=90, ladder_step_pct=90))
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        q = m.tracks["AAAUSDT"].qty
+        e.api.board = [tick("AAAUSDT", 60, 1.55)]
+        m.tick(now=time_now() + 60)
+        t = m.tracks.get("AAAUSDT")
+        self.assertIsNotNone(t)
+        self.assertTrue(t.partial_done)
+        self.assertAlmostEqual(t.qty, q / 2)
+
+    def test_live_partial_take_profit_order_is_placed(self):
+        m, e = miner(dry=False, exit=dict(partial_take_pct=50, partial_fraction=0.5))
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        parts = [a for a in e.api.algo if a["clientAlgoId"].startswith("p")]
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["triggerPrice"], "1.500000")
+
+    # ---- money
+    def test_income_waits_for_the_equity_threshold(self):
+        m, e = miner(dry=False, api=Sweep.LiveAPI(),
+                     sweep=dict(enabled=True, pct=25, start_when_equity_usdt=300))
+        e.equity = 120.0
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [])
+        e.equity = 320.0
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(len(e.api.transfers), 1)
+
+    def test_bad_modes_are_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(sizing=dict(mode="bold"))
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(ladder_mode="zigzag"))
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(stop_mode="gut"))

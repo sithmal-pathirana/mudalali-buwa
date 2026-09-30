@@ -2821,6 +2821,7 @@ class Engine:
         if owner is None:
             return
         try:
+            owner.note_close(pnl)
             owner.sweep_profit(pos.symbol, pnl)
             owner.check_principal()
         except Exception:

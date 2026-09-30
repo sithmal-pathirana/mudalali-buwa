@@ -448,6 +448,11 @@ gainer:
     # and the time limit still run on every poll. Every 2-year replay read
     # the board hourly, so this is the tested behaviour (2026-09-25).
     leader_check_minutes: 5     # 2026-09-25: 6-month replay, every 5 min beat hourly for every ladder
+    # change_24h: biggest 24h % (live). climb: biggest rise over
+    # climb_minutes -- replayed 2026-09-30, lost in every variant.
+    rank_by: change_24h
+    climb_minutes: 60
+    climb_volume_surge_x: 0     # 0 = off
 
   entry:
     # true: trade the #1 found at first boot. The last leader is saved in
@@ -529,6 +534,17 @@ gainer:
     ladder_first_pct: 10.0
     ladder_step_pct: 10.0       # lock 10/10: entry at +10%, then 10% steps
     unarmed_max_hours: 72
+    # lock (live): stop to entry at the first step, then a step behind.
+    # trail: the stop rises one step per step gained, keeping its distance.
+    ladder_mode: lock
+    # fixed (live): stop_pct. atr: atr_stop_mult x the coin's 12h ATR %.
+    stop_mode: fixed
+    atr_stop_mult: 3.0
+    atr_stop_min_pct: 10.0
+    atr_stop_max_pct: 40.0
+    # Sell part of the position once it is this % above entry. 0 = off.
+    partial_take_pct: 0
+    partial_fraction: 0.5
 
   alerts:
     milestones_usd: [1.0, 1.5, 2.0]
@@ -551,6 +567,9 @@ gainer:
     enabled: true
     pct: 25.0
     min_transfer_usdt: 1.0     # smaller amounts wait for the next win
+    # Keep profits compounding until equity reaches this, then start the
+    # 25% transfers. 0 = transfer from the first win (live).
+    start_when_equity_usdt: 0
     # Principal recovery, requested 2026-09-24: when the trading balance
     # reaches 2.5x everything deposited, move the deposits to Funding and keep
     # trading the remaining 1.5x. Deposits are transfers INTO the futures
@@ -581,6 +600,40 @@ gainer:
 #   exit      when a position is sold
 #   alerts    what is announced beyond each trade
 #   sweep     25% of each win to the Funding wallet (same rules as gainer)
+
+  # Trader-style checks on a new leader. A skipped leader is not bought
+  # later. All off (0 / null) -- replayed 2026-09-30 on 2 years:
+  # listed >= 3 days + BTC 24h >= -2% beat live in both years.
+  filters:
+    max_rsi_1h: 0               # skip when 1h RSI(14) is above this
+    min_listing_age_days: 0     # skip coins listed fewer days ago
+    btc_min_change_24h_pct: null  # skip while BTC's 24h change is below this
+    btc_max_drop_1h_pct: 0      # skip while BTC fell more than this in 1h
+    min_price: 0                # skip coins priced below this (USDT)
+
+  # How big each trade is. fixed (live) = entry.notional_pct_of_equity.
+  sizing:
+    mode: fixed                 # fixed | volatility | conviction
+    volatility_target_atr_pct: 3.0
+    min_pct: 5.0
+    max_pct: 15.0
+    conviction_high_pct: 15.0
+    conviction_low_pct: 7.5
+    conviction_max_rsi_1h: 85
+    conviction_min_listing_age_days: 3
+    conviction_btc_min_change_24h_pct: -2
+
+  # When no new gainer trade is opened (open trades are never touched).
+  # All off (0).
+  limits:
+    max_new_trades_per_day: 0
+    pause_after_losses: 0
+    pause_hours: 24
+    max_exposure_pct: 0
+    daily_loss_limit_pct: 0
+    drawdown_pause_pct: 0
+
+
 squeeze:
   enabled: false
   dry_run: true
