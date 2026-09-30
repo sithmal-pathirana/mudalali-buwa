@@ -533,7 +533,7 @@ gainer:
     ladder_enabled: true
     ladder_first_pct: 10.0
     ladder_step_pct: 10.0       # lock 10/10: entry at +10%, then 10% steps
-    unarmed_max_hours: 72
+    unarmed_max_hours: 48     # 2026-09-30 setting A (was 72)
     # lock (live): stop to entry at the first step, then a step behind.
     # trail: the stop rises one step per step gained, keeping its distance.
     ladder_mode: lock
@@ -607,9 +607,9 @@ gainer:
   filters:
     max_rsi_1h: 0               # skip when 1h RSI(14) is above this
     min_listing_age_days: 0     # skip coins listed fewer days ago
-    btc_min_change_24h_pct: null  # skip while BTC's 24h change is below this
+    btc_min_change_24h_pct: -2  # skip while BTC 24h < -2%; setting A 2026-09-30
     btc_max_drop_1h_pct: 0      # skip while BTC fell more than this in 1h
-    min_price: 0                # skip coins priced below this (USDT)
+    min_price: 0.001            # skip coins under $0.001; setting A 2026-09-30
 
   # How big each trade is. fixed (live) = entry.notional_pct_of_equity.
   sizing:
@@ -629,9 +629,9 @@ gainer:
     max_new_trades_per_day: 0
     pause_after_losses: 0
     pause_hours: 24
-    max_exposure_pct: 0
+    max_exposure_pct: 20        # at most 2 trades at once; setting A 2026-09-30
     daily_loss_limit_pct: 0
-    drawdown_pause_pct: 0
+    drawdown_pause_pct: 20      # no new trades 20% below the high; setting A 2026-09-30
 
 
 squeeze:

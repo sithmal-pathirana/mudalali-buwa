@@ -1011,7 +1011,7 @@ def write_report(doc: dict, out: Path) -> None:
 
     order = sorted(runs, key=lambda r: -r["results"]["2y"]["real_profit"])
     limit = int(doc.get("report_rows") or 150)
-    rounds = sorted({r.get("round", 1) for r in runs if r["id"] != "live"})
+    rounds = sorted({r.get("round", 1) for r in runs if r["id"] != "live"}) or [1]
     lines = [
         "# Gainer strategy backtest report", "",
         f"- Generated: {doc['generated']} (tool version {doc['version']})",
