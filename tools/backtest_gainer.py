@@ -81,7 +81,7 @@ from bot.gainer import (EXCLUDE_BASES, GainerConfig, atr_pct,       # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = Path(os.environ.get("BACKTEST_DATA", Path.home() / "backtest-data"))
-VERSION = 1                     # bump when a change alters replay results
+VERSION = 2                     # bump when a change alters replay results
 
 #: Ideas the bot does not have yet, tried in the replay only (set as test.*).
 #:   when_full: what a new leader does when every slot is taken.
@@ -90,7 +90,33 @@ VERSION = 1                     # bump when a change alters replay results
 #:     replace_worst   sell the position doing worst right now, buy it
 #:     replace_losing  as replace_worst, but only if that position is losing
 #:   replace_min_hold_hours: a position younger than this is never sold for room.
-TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0}
+#:   Pump-and-dump checks on a new leader (skip it when the check fails; 0 = off):
+#:   max_volume_surge_x       24h volume over its normal day (avg of the 7 days before)
+#:   min_volume_surge_x       ... the opposite: a real move needs real volume
+#:   min_prior_volume_usdt    normal daily volume before today (thin coins are pumped)
+#:   max_rise_share_1h / 4h   share of the 24h rise made in the last 1h / 4h (vertical)
+#:   max_upper_wick           last hour's upper wick, 0-1 of its range (sellers)
+#:   min_volume_trend         last hour's volume over the 6 hours before (exhaustion)
+#:   max_below_high_pct       already this far under its 24h high (dump started)
+#:   max_funding_pct          funding per 8h, % (crowded longs)
+#:   max_prior_pump_pct       biggest 24h rise in the 30 days before (repeat pumps)
+TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
+                 "max_volume_surge_x": 0.0, "min_volume_surge_x": 0.0,
+                 "min_prior_volume_usdt": 0.0, "max_rise_share_1h": 0.0,
+                 "max_rise_share_4h": 0.0, "max_upper_wick": 0.0,
+                 "min_volume_trend": 0.0, "max_below_high_pct": 0.0,
+                 "max_funding_pct": 0.0, "max_prior_pump_pct": 0.0}
+#: test setting -> (feature, skip when the feature is ABOVE the limit?)
+PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
+               ("min_volume_surge_x", "vol_surge", False),
+               ("min_prior_volume_usdt", "prior_vol", False),
+               ("max_rise_share_1h", "share_1h", True),
+               ("max_rise_share_4h", "share_4h", True),
+               ("max_upper_wick", "upper_wick", True),
+               ("min_volume_trend", "vol_trend", False),
+               ("max_below_high_pct", "below_high", True),
+               ("max_funding_pct", "funding", True),
+               ("max_prior_pump_pct", "prior_pump", True)]
 WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing")
 
 B = 300_000                     # one 5-minute bar, ms
@@ -286,6 +312,13 @@ class Market:
     @property
     def t_hi(self) -> int:
         return self.index["t_hi"]
+
+    def funding(self, sym):
+        """(times, % per 8h) of the coin's funding settlements, or None."""
+        if not hasattr(self, "_funding"):
+            p = self.dir.parent / "funding.pkl"
+            self._funding = pickle.load(open(p, "rb")) if p.exists() else {}
+        return self._funding.get(sym)
 
     def btc(self):
         if self._btc is None:
@@ -541,12 +574,43 @@ class Oracle:
         first = self.m.index["first"].get(sym, T[0])
         if first - self.m.index["data_start"] > 7 * D:   # listed after the data starts
             out["age"] = (t - first) / D
+        out.update(self._pump_features(sym, d, i, t))
         bT, _bO, _bH, _bL, bC, _bQ = self.m.btc()
         k = bisect.bisect_left(bT, t) - 1
         if k >= DAY_BARS and bT[k] + B == t:
             out["btc24"] = (bC[k] / bC[k - DAY_BARS] - 1) * 100
             out["btc1"] = (bC[k] / bC[k - 12] - 1) * 100
         return out
+
+    def _pump_features(self, sym, d, i, t) -> dict:
+        """The pump-and-dump measurements behind the test.max_* / min_* checks."""
+        T, O, Hh, L, C, Q = d
+        f = {}
+        if i >= 8 * DAY_BARS:
+            q24 = sum(Q[i - DAY_BARS + 1:i + 1])
+            normal = sum(Q[i - 8 * DAY_BARS + 1:i - DAY_BARS + 1]) / 7
+            f["prior_vol"] = normal
+            f["vol_surge"] = q24 / normal if normal > 0 else None
+        if i >= DAY_BARS and C[i - DAY_BARS] > 0:
+            g24 = C[i] / C[i - DAY_BARS]
+            if g24 > 1.0:
+                f["share_1h"] = math.log(C[i] / C[i - 12]) / math.log(g24)
+                f["share_4h"] = math.log(C[i] / C[i - 48]) / math.log(g24)
+            f["below_high"] = (1 - C[i] / max(Hh[i - DAY_BARS + 1:i + 1])) * 100
+        if i >= 84:
+            hi, lo = max(Hh[i - 11:i + 1]), min(L[i - 11:i + 1])
+            f["upper_wick"] = (hi - C[i]) / (hi - lo) if hi > lo else 0.0
+            before = sum(Q[i - 83:i - 11]) / 6
+            f["vol_trend"] = sum(Q[i - 11:i + 1]) / before if before > 0 else None
+        if i >= 32 * DAY_BARS:
+            f["prior_pump"] = max((C[j] / C[j - DAY_BARS] - 1) * 100
+                                  for j in range(i - 31 * DAY_BARS, i - 2 * DAY_BARS, 12))
+        fu = self.m.funding(sym)
+        if fu:
+            k = bisect.bisect_right(fu[0], t) - 1
+            if k >= 0 and t - fu[0][k] < 9 * H:
+                f["funding"] = fu[1][k]
+        return f
 
     @staticmethod
     def _rising(d, a, b, period, minutes, min_rise):
@@ -754,6 +818,11 @@ class Account:
                 return "filter: btc_max_drop_1h_pct"
             if fl.max_rsi_1h > 0 and f.get("rsi") is not None and f["rsi"] > fl.max_rsi_1h:
                 return "filter: max_rsi_1h"
+            for name, feat, above in PUMP_CHECKS:
+                limit = float(s.test[name] or 0)
+                v = f.get(feat)
+                if limit > 0 and v is not None and (v > limit if above else v < limit):
+                    return f"test: {name}"
             return ""
 
         policy = s.test["when_full"]

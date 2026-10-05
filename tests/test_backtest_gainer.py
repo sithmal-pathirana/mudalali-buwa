@@ -150,6 +150,32 @@ class AccountTest(unittest.TestCase):
         self.assertEqual(res["trades"], 2)       # bought again once the cooldown ended
 
 
+class PumpChecksTest(unittest.TestCase):
+    def run_account(self, feats, overrides):
+        class F(FakeOracle):
+            def feature(self, sym, t):
+                return {**FakeOracle.feature(self, sym, t), **feats}
+        s = bt.Settings(BASE, overrides)
+        return bt.Account(s, F({"A": (0.1, 2 * H, "x")}), [(H, "A", 3 * H)],
+                          0, 40 * D, 0.0, (50.0, 50.0), {}).run()
+
+    def test_skips_above_a_max(self):
+        res = self.run_account({"vol_surge": 20}, {"test.max_volume_surge_x": 10})
+        self.assertEqual(res["skipped"], {"test: max_volume_surge_x": 1})
+
+    def test_skips_below_a_min(self):
+        res = self.run_account({"vol_trend": 0.2}, {"test.min_volume_trend": 0.5})
+        self.assertEqual(res["skipped"], {"test: min_volume_trend": 1})
+
+    def test_unknown_measurement_passes(self):
+        res = self.run_account({}, {"test.max_funding_pct": 0.05})
+        self.assertEqual(res["trades"], 1)
+
+    def test_off_by_default(self):
+        res = self.run_account({"vol_surge": 99, "below_high": 50}, {})
+        self.assertEqual(res["trades"], 1)
+
+
 class WhenFullTest(unittest.TestCase):
     def run_account(self, overrides):
         outs = {s: (0.0, 10 * D, "time limit") for s in "AB"}

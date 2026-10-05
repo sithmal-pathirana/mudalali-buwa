@@ -1,0 +1,21 @@
+# Pump-and-dump checks on setting A (python3 -m tools.backtest_gainer search
+#   --config <setting A config> --space tools/backtest_space_pump.yaml).
+# Each check skips a new leader that looks like a pump about to be dumped.
+deposits: {start: 50, monthly: 50}
+
+round1:
+  single:
+    test.max_volume_surge_x: [3, 5, 8, 12, 20]          # 24h volume vs its normal day
+    test.min_volume_surge_x: [1.5, 2, 3, 5]             # a real move needs real volume
+    test.min_prior_volume_usdt: [3000000, 5000000, 10000000, 20000000]   # thin coins
+    test.max_rise_share_1h: [0.2, 0.3, 0.5, 0.7]        # vertical last hour
+    test.max_rise_share_4h: [0.4, 0.6, 0.8]
+    test.max_upper_wick: [0.3, 0.5, 0.7]                # sellers in the last hour
+    test.min_volume_trend: [0.3, 0.5, 0.8, 1.0]         # buying drying up
+    test.max_below_high_pct: [3, 5, 8, 12, 20]          # dump already started
+    test.max_funding_pct: [0.01, 0.02, 0.05, 0.1]       # crowded longs (%/8h)
+    test.max_prior_pump_pct: [30, 50, 100, 200]         # pumped in the last 30 days
+
+round2:
+  keep_per_setting: 2
+  max_runs: 2000
