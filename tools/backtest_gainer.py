@@ -905,6 +905,9 @@ class Account:
             if fl.btc_max_drop_1h_pct > 0 and f.get("btc1") is not None \
                     and f["btc1"] < -fl.btc_max_drop_1h_pct:
                 return "filter: btc_max_drop_1h_pct"
+            if fl.max_rise_share_4h > 0 and f.get("share_4h") is not None \
+                    and f["share_4h"] > fl.max_rise_share_4h:
+                return "filter: max_rise_share_4h"
             if fl.max_rsi_1h > 0 and f.get("rsi") is not None and f["rsi"] > fl.max_rsi_1h:
                 return "filter: max_rsi_1h"
             if self.ml is not None and float(s.test["min_ml_score"] or 0) > 0:

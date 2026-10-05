@@ -610,6 +610,11 @@ gainer:
     btc_min_change_24h_pct: -2  # skip while BTC 24h < -2%; setting A 2026-09-30
     btc_max_drop_1h_pct: 0      # skip while BTC fell more than this in 1h
     min_price: 0.001            # skip coins under $0.001; setting A 2026-09-30
+    # Skip a vertical pump: more than this share (0-1) of the 24h rise made
+    # in the last 4 hours. 2026-10-05: every value 0.6-0.9 beat setting A in
+    # both years (0.8: +$1,827 vs +$1,416); the only check that held up when
+    # chosen on year 1 and judged on year 2. 0 = off.
+    max_rise_share_4h: 0.8
 
   # How big each trade is. fixed (live) = entry.notional_pct_of_equity.
   sizing:

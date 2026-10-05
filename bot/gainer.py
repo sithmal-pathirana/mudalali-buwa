@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -241,6 +242,12 @@ class GainerFiltersConfig:
     btc_max_drop_1h_pct: float = 0.0
     #: Skip coins priced below this, in USDT. 0 = off.
     min_price: float = 0.0
+    #: Skip a "vertical pump": a leader that made more than this share (0-1)
+    #: of its 24h rise in the last 4 hours. 0 = off. Replayed 2026-10-05 on
+    #: setting A: every value from 0.6 to 0.9 beat A in both years (0.8:
+    #: +$1,827 vs +$1,416), and it was the only check still ahead of A on
+    #: year 2 when chosen on year 1 alone.
+    max_rise_share_4h: float = 0.0
 
 
 @dataclass
@@ -954,6 +961,25 @@ class GainerMiner:
         self._features[symbol] = (time.time(), out)
         return out
 
+    def rise_share_4h(self, lead) -> float | None:
+        """
+        Share (0-1) of the leader's 24h rise made in the last 4 hours, on a log
+        scale: log(now / 4h ago) / log(now / 24h ago), as the backtest
+        measures it. None when the 24h change is not a rise or the 5-minute
+        bars are unavailable.
+        """
+        g24 = 1.0 + lead.change_pct / 100.0
+        if g24 <= 1.0 or lead.price <= 0:
+            return None
+        try:
+            k = self.engine.api.klines(lead.symbol, "5m", limit=50)
+            then = float(k[0][4])           # the close 48 closed bars (4h) back
+        except (BinanceError, IndexError, TypeError, ValueError):
+            return None
+        if then <= 0:
+            return None
+        return math.log(lead.price / then) / math.log(g24)
+
     def btc_change_1h(self) -> float | None:
         try:
             k = self.engine.api.klines("BTCUSDT", "5m", limit=13)[:-1]
@@ -978,6 +1004,11 @@ class GainerMiner:
             b1 = self.btc_change_1h()
             if b1 is not None and b1 < -f.btc_max_drop_1h_pct:
                 return f"BTC fell {b1:.2f}% in the last hour"
+        if f.max_rise_share_4h > 0:
+            share = self.rise_share_4h(lead)
+            if share is not None and share > f.max_rise_share_4h:
+                return (f"{share:.0%} of its 24h rise came in the last 4 hours, a vertical "
+                        f"pump (maximum {f.max_rise_share_4h:.0%})")
         if f.max_rsi_1h > 0:
             r = self.features(lead.symbol)["rsi"]
             if r is not None and r > f.max_rsi_1h:

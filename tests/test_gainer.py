@@ -1001,6 +1001,27 @@ class TraderSettings(unittest.TestCase):
         m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
         self.assertEqual(m.tracks, {})
 
+    def test_vertical_pump_is_skipped(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        # +40% on the day, from 0.75 four hours ago to 1.0 now: 86% in 4h
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([0.75] + [0.9] * 48)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("vertical pump" in b for b in bodies(e)))
+
+    def test_steady_climber_is_bought(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        # +40% on the day, only 0.95 -> 1.0 in the last 4h: 15%
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([0.95] + [0.97] * 48)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_vertical_pump_check_without_bars_lets_it_through(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: []
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
     def test_overbought_rsi_is_skipped(self):
         m, e = self.fresh(filters=dict(max_rsi_1h=85))
         e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([1 + i * 0.01 for i in range(15)])
