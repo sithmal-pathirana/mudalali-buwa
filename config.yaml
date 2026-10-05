@@ -648,7 +648,8 @@ gainer:
 #   resistance): HBAR 0.0995 / 0.1195, MARSCOIN 0.1305 / 0.1545,
 #   CELO 0.0948 / 0.1030, 0G 0.2990 / 0.3580.
 manual_trades:
-  symbols: [HBARUSDT, MARSCOINUSDT, CELOUSDT, 0GUSDT]
+  # 2026-10-05: all four closed (-$3.52 together); list emptied.
+  symbols: []
 
 squeeze:
   enabled: false
