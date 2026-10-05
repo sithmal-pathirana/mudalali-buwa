@@ -1,0 +1,22 @@
+# Rush-order and pump checks on setting A. Run with --select-on year1 so the
+# choice is made on year 1 and year 2 is an unseen test.
+deposits: {start: 50, monthly: 50}
+
+round1:
+  single:
+    # rush orders: aggressive (taker) buying, trade count, trade size
+    test.min_buy_share_1h: [0.45, 0.5, 0.55]
+    test.max_buy_share_1h: [0.55, 0.6, 0.65, 0.7]
+    test.min_trades_surge_x: [2, 3, 5]
+    test.max_trades_surge_x: [5, 10, 20, 40]
+    test.min_trade_size_x: [0.5, 0.8]
+    test.max_trade_size_x: [1.5, 2, 3]
+    # the earlier pump checks, so round 2 can combine them
+    test.max_rise_share_4h: [0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
+    test.max_rise_share_1h: [0.5, 0.7]
+    test.max_below_high_pct: [8, 12, 20]
+    test.max_funding_pct: [0.02, 0.05]
+
+round2:
+  keep_per_setting: 2
+  max_runs: 1500

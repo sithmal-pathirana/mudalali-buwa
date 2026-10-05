@@ -82,6 +82,7 @@ from bot.gainer import (EXCLUDE_BASES, GainerConfig, atr_pct,       # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = Path(os.environ.get("BACKTEST_DATA", Path.home() / "backtest-data"))
 VERSION = 2                     # bump when a change alters replay results
+FEATS_VERSION = 3               # bump when the measurements at a leader change
 
 #: Ideas the bot does not have yet, tried in the replay only (set as test.*).
 #:   when_full: what a new leader does when every slot is taken.
@@ -105,7 +106,13 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  "min_prior_volume_usdt": 0.0, "max_rise_share_1h": 0.0,
                  "max_rise_share_4h": 0.0, "max_upper_wick": 0.0,
                  "min_volume_trend": 0.0, "max_below_high_pct": 0.0,
-                 "max_funding_pct": 0.0, "max_prior_pump_pct": 0.0}
+                 "max_funding_pct": 0.0, "max_prior_pump_pct": 0.0,
+                 # rush orders (data.binance.vision: trades and taker-buy volume)
+                 "min_buy_share_1h": 0.0, "max_buy_share_1h": 0.0,
+                 "min_trades_surge_x": 0.0, "max_trades_surge_x": 0.0,
+                 "min_trade_size_x": 0.0, "max_trade_size_x": 0.0,
+                 # a classifier's score per leader (tools/backtest_ml.py)
+                 "ml_scores": "", "min_ml_score": 0.0}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -116,7 +123,13 @@ PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_trend", "vol_trend", False),
                ("max_below_high_pct", "below_high", True),
                ("max_funding_pct", "funding", True),
-               ("max_prior_pump_pct", "prior_pump", True)]
+               ("max_prior_pump_pct", "prior_pump", True),
+               ("min_buy_share_1h", "buy_share_1h", False),
+               ("max_buy_share_1h", "buy_share_1h", True),
+               ("min_trades_surge_x", "trades_surge", False),
+               ("max_trades_surge_x", "trades_surge", True),
+               ("min_trade_size_x", "trade_size_x", False),
+               ("max_trade_size_x", "trade_size_x", True)]
 WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing")
 
 B = 300_000                     # one 5-minute bar, ms
@@ -313,6 +326,14 @@ class Market:
     def t_hi(self) -> int:
         return self.index["t_hi"]
 
+    def flow(self, sym):
+        """(times, trades, taker-buy quote volume) per 5-minute bar, or None."""
+        p = self.dir.parent / "flow" / f"{sym}.pkl"
+        if not p.exists():
+            return None
+        with open(p, "rb") as f:
+            return pickle.load(f)
+
     def funding(self, sym):
         """(times, % per 8h) of the coin's funding settlements, or None."""
         if not hasattr(self, "_funding"):
@@ -452,7 +473,7 @@ class Oracle:
         self.marks: dict = {}             # (sym, t_entry, t) -> price at t / entry
         self.misses: dict = {}            # sym -> set of requests
         self._dirty = set()
-        self._load("feats", self.feats)
+        self._load("feats", self.feats, f"all-{FEATS_VERSION}")
         self._load("rising", self.rising)
         self._load("marks", self.marks)
 
@@ -472,7 +493,7 @@ class Oracle:
     def save(self):
         for kind in self._dirty:
             if kind == "feats":
-                obj, key = self.feats, "all"
+                obj, key = self.feats, f"all-{FEATS_VERSION}"
             elif kind == "marks":
                 obj, key = self.marks, "all"
             elif kind == "rising":
@@ -605,6 +626,21 @@ class Oracle:
         if i >= 32 * DAY_BARS:
             f["prior_pump"] = max((C[j] / C[j - DAY_BARS] - 1) * 100
                                   for j in range(i - 31 * DAY_BARS, i - 2 * DAY_BARS, 12))
+        fl = self.m.flow(sym)
+        if fl and i >= 8 * DAY_BARS:
+            fT, fN, fB = fl
+            k = bisect.bisect_left(fT, T[i])
+            if k < len(fT) and fT[k] == T[i] and k >= 8 * DAY_BARS:
+                q1 = sum(Q[i - 11:i + 1])
+                if q1 > 0:
+                    f["buy_share_1h"] = sum(fB[k - 11:k + 1]) / q1
+                n1 = sum(fN[k - 11:k + 1])
+                n7 = sum(fN[k - 8 * DAY_BARS + 1:k - DAY_BARS + 1])
+                q7 = sum(Q[i - 8 * DAY_BARS + 1:i - DAY_BARS + 1])
+                if n7 > 0:
+                    f["trades_surge"] = n1 / (n7 / (7 * 24))
+                if n1 > 0 and n7 > 0 and q7 > 0:
+                    f["trade_size_x"] = (q1 / n1) / (q7 / n7)
         fu = self.m.funding(sym)
         if fu:
             k = bisect.bisect_right(fu[0], t) - 1
@@ -681,6 +717,58 @@ class Oracle:
 
 
 # ================================================================= account
+_SCORES: dict = {}
+
+
+def load_scores(path: str) -> dict:
+    """{(symbol, time): score} from a classifier's CSV (symbol,t,score)."""
+    if path not in _SCORES:
+        import csv
+        with open(path) as f:
+            _SCORES[path] = {(r["symbol"], int(r["t"])): float(r["score"])
+                             for r in csv.DictReader(f)}
+    return _SCORES[path]
+
+
+def export_events(s: Settings, market: Market, oracle: Oracle, cost: float, out: Path,
+                  log) -> int:
+    """Every new leader with its measurements and the result of buying it alone
+    with these exits: the training data for tools/backtest_ml.py."""
+    import csv
+    events = market.stream(s)
+    ek = s.exit_key(cost)
+    context = {"changes": {}}
+    if s.g.exit.on_new_leader == "close_if_losing":
+        context["changes"][s.stream_key()] = [(e[0], e[1]) for e in events]
+    while True:
+        missing = 0
+        for t, sym, _ in events:
+            if oracle.feature(sym, t) is None:
+                missing += 1
+            if oracle.outcome(ek, sym, t) is None:
+                missing += 1
+        if not missing:
+            break
+        oracle.fill(context)
+    keys = ["price", "rsi", "atr", "age", "btc24", "btc1", "prior_vol", "vol_surge",
+            "share_1h", "share_4h", "below_high", "upper_wick", "vol_trend", "prior_pump",
+            "funding", "buy_share_1h", "trades_surge", "trade_size_x"]
+    n = 0
+    with open(out, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["symbol", "t", "change_24h"] + keys + ["ret", "exit_t", "why"])
+        for t, sym, _ in events:
+            f = oracle.feature(sym, t)
+            o = oracle.outcome(ek, sym, t)
+            if not f or not f.get("ok") or not o:
+                continue
+            w.writerow([sym, t, ""] + [("" if f.get(k) is None else f.get(k)) for k in keys]
+                       + [o[0], o[1], o[2]])
+            n += 1
+    log(f"exported {n} leader events to {out}")
+    return n
+
+
 def utc_day(ms: int) -> int:
     return ms // D
 
@@ -699,6 +787,7 @@ class Account:
         self.start_dep, self.monthly_dep = deposits
         self.context = context
         self.complete = True
+        self.ml = load_scores(s.test["ml_scores"]) if s.test["ml_scores"] else None
 
     def _feat(self, sym, t):
         f = self.o.feature(sym, t)
@@ -818,6 +907,10 @@ class Account:
                 return "filter: btc_max_drop_1h_pct"
             if fl.max_rsi_1h > 0 and f.get("rsi") is not None and f["rsi"] > fl.max_rsi_1h:
                 return "filter: max_rsi_1h"
+            if self.ml is not None and float(s.test["min_ml_score"] or 0) > 0:
+                sc = self.ml.get((self._sym, self._t))
+                if sc is not None and sc < float(s.test["min_ml_score"]):
+                    return "test: min_ml_score"
             for name, feat, above in PUMP_CHECKS:
                 limit = float(s.test[name] or 0)
                 v = f.get(feat)
@@ -971,6 +1064,7 @@ class Account:
             if not f.get("ok"):
                 skip("no candle data at entry")
                 continue
+            self._sym, self._t = sym, t
             why = filter_reason(f)
             if why:
                 skip(why)
@@ -1110,7 +1204,7 @@ def build_runs(base_raw: dict, specs: list, shard=None, live: dict | None = None
     return out
 
 
-def round2_specs(runs1: list, cfg: dict, log) -> tuple[list, dict]:
+def round2_specs(runs1: list, cfg: dict, log, select: str = "both") -> tuple[list, dict]:
     """Every combination, across settings, of the round-1 values that beat live
     in both years (each setting may also stay at its live value)."""
     keep = int(cfg.get("keep_per_setting", 2))
@@ -1119,7 +1213,12 @@ def round2_specs(runs1: list, cfg: dict, log) -> tuple[list, dict]:
     wins: dict = {}
     for r in runs1[1:]:
         x = r["results"]
-        if (x["year1"]["real_profit"] > L["year1"]["real_profit"]
+        if select == "year1":
+            # choose on year 1 alone, so year 2 stays an unseen test
+            if x["year1"]["real_profit"] > L["year1"]["real_profit"]:
+                wins.setdefault(r["group"], []).append((x["year1"]["real_profit"],
+                                                        r["overrides"]))
+        elif (x["year1"]["real_profit"] > L["year1"]["real_profit"]
                 and x["year2"]["real_profit"] > L["year2"]["real_profit"]):
             wins.setdefault(r["group"], []).append((x["2y"]["real_profit"], r["overrides"]))
     for g in wins:
@@ -1150,7 +1249,7 @@ def round2_specs(runs1: list, cfg: dict, log) -> tuple[list, dict]:
     log(f"round 2: {len(groups)} settings beat live in both years alone "
         f"({', '.join(groups) or 'none'}); {len(specs)} combinations")
     return specs, dict(keep_per_setting=keep, groups=groups, dropped=dropped,
-                       round2_runs=len(specs))
+                       round2_runs=len(specs), select=select)
 
 
 # ================================================================== report
@@ -1205,8 +1304,12 @@ def write_report(doc: dict, out: Path) -> None:
         sr = doc["search"]
         lines += ["", "## Search", "",
                   "- Round 1 changes one setting at a time, over every value in the search space.",
-                  "- Round 2 combines, across settings, the round-1 values that beat live in "
-                  f"both years: up to {sr['keep_per_setting']} best value(s) per setting "
+                  ("- Round 2 combines, across settings, the round-1 values that beat live in "
+                   "YEAR 1 (chosen on year 1 alone: year 2 is an unseen test, judge on it): "
+                   if sr.get("select") == "year1" else
+                   "- Round 2 combines, across settings, the round-1 values that beat live in "
+                   "both years: ")
+                  + f"up to {sr['keep_per_setting']} best value(s) per setting "
                   f"(or the live value), {sr['round2_runs']} combinations.",
                   "- Settings carried into round 2 (best 2y first): "
                   + (", ".join(sr["groups"]) or "none -- no single change beat live in both years")]
@@ -1343,6 +1446,13 @@ def main(argv=None) -> int:
                         help="round 1: every value of every setting alone; "
                              "round 2: every combination of the round-1 winners")
     sr.add_argument("--space", default=str(ROOT / "tools" / "backtest_space.yaml"))
+    sr.add_argument("--select-on", choices=("both", "year1"), default="both",
+                    help="year1: pick round-2 settings on year 1 alone, so year 2 is "
+                         "an unseen test")
+    ex = sub.add_parser("export", parents=[common],
+                        help="every new leader, its measurements and its result (CSV)")
+    ex.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    ex.add_argument("--csv", required=True)
     mg = sub.add_parser("merge", help="join results.json files from several machines")
     mg.add_argument("files", nargs="+")
     mg.add_argument("--out", required=True)
@@ -1378,6 +1488,13 @@ def main(argv=None) -> int:
     started = time.time()
     search_info = None
 
+    if args.cmd == "export":
+        sets = {k.strip(): parse_value(v) for k, v in (x.split("=", 1) for x in args.set)}
+        st = Settings(base_raw, sets)
+        export_events(st, market, oracle, (st.g.exit.fee_pct + args.slippage_pct) / 100,
+                      Path(args.csv), log)
+        return 0
+
     if args.cmd == "run":
         sets = {}
         for item in args.set:
@@ -1405,7 +1522,8 @@ def main(argv=None) -> int:
         cost = check_cost(runs, args.slippage_pct)
         log(f"round 1: {len(runs) - 1} single changes + live")
         replay(runs, market, oracle, cost, deposits, log, args.keep_trades)
-        specs2, search_info = round2_specs(runs, space.get("round2") or {}, log)
+        specs2, search_info = round2_specs(runs, space.get("round2") or {}, log,
+                                           args.select_on)
         runs2 = build_runs(base_raw, specs2, live=runs[0])[1:]
         if runs2:
             check_cost(runs2, args.slippage_pct)
