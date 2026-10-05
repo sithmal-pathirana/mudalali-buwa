@@ -112,6 +112,9 @@ class FakeOracle:
     def first_rising(self, *a):
         return None
 
+    def mark(self, sym, t_entry, t):
+        return 0.9                               # every held position is down 10%
+
 
 class AccountTest(unittest.TestCase):
     def run_account(self, outs, events, overrides=None):
@@ -145,6 +148,45 @@ class AccountTest(unittest.TestCase):
         events = [(H, "A", 2 * H), (3 * H, "A", 8 * H)]
         res = self.run_account(outs, events)
         self.assertEqual(res["trades"], 2)       # bought again once the cooldown ended
+
+
+class WhenFullTest(unittest.TestCase):
+    def run_account(self, overrides):
+        outs = {s: (0.0, 10 * D, "time limit") for s in "AB"}
+        events = [(H, "A", 2 * H), (5 * H, "B", 6 * H)]
+        s = bt.Settings(BASE, {"gainer.entry.max_positions": 1, **overrides})
+        return bt.Account(s, FakeOracle(outs), events, 0, 40 * D, 0.0, (50.0, 50.0), {}).run()
+
+    def test_refuse_is_the_bot(self):
+        res = self.run_account({})
+        self.assertEqual(res["trades"], 1)
+        self.assertEqual(res["skipped"], {"max_positions full": 1})
+
+    def test_replace_sells_the_held_one_at_its_mark(self):
+        res = self.run_account({"test.when_full": "replace_worst"})
+        self.assertEqual(res["trades"], 2)
+        self.assertEqual(res["exit_reasons"]["replaced by a new leader"], 1)
+        self.assertAlmostEqual(res["trading_pnl"], -0.6)      # -10% of $6
+
+    def test_min_hold_protects_young_positions(self):
+        res = self.run_account({"test.when_full": "replace_oldest",
+                                "test.replace_min_hold_hours": 12})
+        self.assertEqual(res["trades"], 1)
+
+    def test_replace_losing_keeps_a_winner(self):
+        class Up(FakeOracle):
+            def mark(self, *a):
+                return 1.2
+        outs = {s: (0.0, 10 * D, "time limit") for s in "AB"}
+        s = bt.Settings(BASE, {"gainer.entry.max_positions": 1,
+                               "test.when_full": "replace_losing"})
+        res = bt.Account(s, Up(outs), [(H, "A", 2 * H), (5 * H, "B", 6 * H)],
+                         0, 40 * D, 0.0, (50.0, 50.0), {}).run()
+        self.assertEqual(res["trades"], 1)
+
+    def test_unknown_test_setting_is_refused(self):
+        with self.assertRaises(SystemExit):
+            bt.Settings(BASE, {"test.when_ful": "refuse"})
 
 
 class Round2Test(unittest.TestCase):

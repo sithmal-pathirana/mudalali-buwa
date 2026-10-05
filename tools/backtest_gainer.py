@@ -83,6 +83,16 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = Path(os.environ.get("BACKTEST_DATA", Path.home() / "backtest-data"))
 VERSION = 1                     # bump when a change alters replay results
 
+#: Ideas the bot does not have yet, tried in the replay only (set as test.*).
+#:   when_full: what a new leader does when every slot is taken.
+#:     refuse          the bot's behaviour: it is not bought
+#:     replace_oldest  sell the position held longest, buy the new leader
+#:     replace_worst   sell the position doing worst right now, buy it
+#:     replace_losing  as replace_worst, but only if that position is losing
+#:   replace_min_hold_hours: a position younger than this is never sold for room.
+TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0}
+WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing")
+
 B = 300_000                     # one 5-minute bar, ms
 DAY_BARS = 288
 H = 3_600_000
@@ -139,10 +149,21 @@ class Settings:
 
     def __init__(self, base_raw: dict, overrides: dict):
         raw = copy.deepcopy(base_raw)
+        self.test = dict(TEST_DEFAULTS)
         for k, v in overrides.items():
+            if k.startswith("test."):
+                name = k[5:]
+                if name not in TEST_DEFAULTS:
+                    raise SystemExit(f"unknown test setting {k}; known: "
+                                     + ", ".join("test." + n for n in TEST_DEFAULTS))
+                self.test[name] = v
+                continue
             if not (k.startswith("gainer.") or k.startswith("risk.")):
-                raise SystemExit(f"--set {k}: only gainer.* and risk.* settings are replayed")
+                raise SystemExit(f"--set {k}: only gainer.*, risk.* and test.* settings "
+                                 f"are replayed")
             set_path(raw, k, v)
+        if self.test["when_full"] not in WHEN_FULL:
+            raise SystemExit(f"test.when_full must be one of {', '.join(WHEN_FULL)}")
         try:
             self.g = GainerConfig(**copy.deepcopy(raw.get("gainer") or {}))
             self.risk = RiskConfig(**copy.deepcopy(raw.get("risk") or {}))
@@ -150,7 +171,8 @@ class Settings:
             raise SystemExit(f"bad setting: {e}") from None
         self.overrides = dict(overrides)
         self.flat = {**flatten(asdict(self.g), "gainer."),
-                     **flatten(asdict(self.risk), "risk.")}
+                     **flatten(asdict(self.risk), "risk."),
+                     **{f"test.{k}": v for k, v in self.test.items()}}
         for k in overrides:
             if k not in self.flat:
                 raise SystemExit(f"unknown setting {k}")
@@ -394,10 +416,12 @@ class Oracle:
         self.feats: dict = {}
         self.outs: dict = {}              # exit key -> {(sym, t): outcome}
         self.rising: dict = {}
+        self.marks: dict = {}             # (sym, t_entry, t) -> price at t / entry
         self.misses: dict = {}            # sym -> set of requests
         self._dirty = set()
         self._load("feats", self.feats)
         self._load("rising", self.rising)
+        self._load("marks", self.marks)
 
     # -------------------------------------------------------------- cache
     def _load(self, kind, into, key="all"):
@@ -416,6 +440,8 @@ class Oracle:
         for kind in self._dirty:
             if kind == "feats":
                 obj, key = self.feats, "all"
+            elif kind == "marks":
+                obj, key = self.marks, "all"
             elif kind == "rising":
                 obj, key = self.rising, "all"
             else:
@@ -445,6 +471,14 @@ class Oracle:
             return None
         return memo[(sym, t)] or False
 
+    def mark(self, sym, t_entry, t):
+        """Price at the close at t over the entry (the open of the bar at t_entry)."""
+        key = (sym, t_entry, t)
+        if key not in self.marks:
+            self._miss(sym, ("m", t_entry, t))
+            return None
+        return self.marks[key]
+
     def first_rising(self, sym, a, b, period, minutes, min_rise):
         key = (sym, a, b, period, minutes, min_rise)
         if key in self.rising:
@@ -473,6 +507,13 @@ class Oracle:
                     self._outs_for(ek)[(sym, req[1])] = self._outcome(
                         sym, d, req[1], ek, f, context)
                     self._dirty.add(("outs", ek))
+                elif req[0] == "m":
+                    T, O, _H, _L, C, _Q = d
+                    j = bisect.bisect_left(T, req[1])
+                    k = bisect.bisect_right(T, req[2] - B) - 1     # last bar closed by t
+                    ok = j < len(T) and 0 <= k and O[j] > 0
+                    self.marks[(sym, req[1], req[2])] = C[max(k, j)] / O[j] if ok else 1.0
+                    self._dirty.add("marks")
                 else:
                     self.rising[(sym,) + req[1:]] = self._rising(d, *req[1:])
                     self._dirty.add("rising")
@@ -715,19 +756,71 @@ class Account:
                 return "filter: max_rsi_1h"
             return ""
 
+        policy = s.test["when_full"]
+        min_hold = float(s.test["replace_min_hold_hours"]) * H
+
+        def full(n):
+            used = sum(p["n"] for p in held.values())
+            eq = equity()
+            return (len(held) >= en.max_positions
+                    or (lm.max_exposure_pct > 0 and used + n > eq * lm.max_exposure_pct / 100 + 1e-9)
+                    or used + n > eq * risk.max_leverage + 1e-9)
+
+        def victim(t):
+            """test.when_full: the position to sell for room, None, or 'miss'."""
+            pool = [k for k, p in held.items() if t - p["t"] >= min_hold]
+            if not pool:
+                return None
+            if policy == "replace_oldest":
+                return min(pool, key=lambda k: held[k]["t"])
+            marks = {}
+            for k in pool:
+                m = self.o.mark(k, held[k]["t"], t)
+                if m is None:
+                    self.complete = False
+                    return "miss"
+                marks[k] = m
+            worst = min(pool, key=lambda k: marks[k])
+            if policy == "replace_losing" and marks[worst] - 1 - self.cost >= 0:
+                return None
+            held[worst]["mark"] = marks[worst]
+            return worst
+
+        def make_room(t, f):
+            """Sell positions until the new leader fits, as test.when_full says."""
+            while held and full(notional_for(f)):
+                v = victim(t)
+                if v is None or v == "miss":
+                    return v
+                p = held[v]
+                m = p.get("mark")
+                if m is None:
+                    m = self.o.mark(v, p["t"], t)
+                    if m is None:
+                        self.complete = False
+                        return "miss"
+                p.update(r=m - 1 - self.cost, x=t, why="replaced by a new leader")
+                close(v)
+            return "ok"
+
         def open_(sym, t):
             nonlocal peak
             eq = equity()
             peak = max(peak, eq)
             day = utc_day(t)
             day_start.setdefault(day, eq)
-            if len(held) >= en.max_positions:
+            if len(held) >= en.max_positions and policy == "refuse":
                 return skip("max_positions full")
             f = self._feat(sym, t)
             if f is None:
                 return
             if not f.get("ok"):
                 return skip("no candle data at entry")
+            if policy != "refuse" and make_room(t, f) == "miss":
+                return
+            if len(held) >= en.max_positions:
+                return skip("max_positions full")
+            eq = equity()
             n = notional_for(f)
             if lm.max_new_trades_per_day > 0 and day_opens.get(day, 0) >= lm.max_new_trades_per_day:
                 return skip("limit: max_new_trades_per_day")
