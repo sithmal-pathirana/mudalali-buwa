@@ -98,6 +98,32 @@ class OutcomeTest(unittest.TestCase):
         self.assertAlmostEqual(r, 0.5 * 0.5 + 0.5 * 0.5)
 
 
+class ShortOutcomeTest(unittest.TestCase):
+    ek = bt.Settings(BASE, {"test.losers_target_pct": 50}).losers_exit_key(0.0)
+
+    def outcome(self, bars):
+        rows = [b if isinstance(b, tuple) else (b, b, b, b) for b in bars]
+        d = ([i * B for i in range(len(rows))], [r[0] for r in rows], [r[1] for r in rows],
+             [r[2] for r in rows], [r[3] for r in rows], [1e6] * len(rows))
+        return bt.Oracle._outcome_short(d, B, self.ek, {"ok": True})
+
+    def test_stop_is_above(self):
+        r, _, why = self.outcome([1, 1, (1.0, 1.35, 1.0, 1.3)])
+        self.assertEqual(why, "stop")
+        self.assertAlmostEqual(r, -0.30)
+
+    def test_take_profit_is_below(self):
+        r, _, why = self.outcome([1, 1, (0.6, 0.6, 0.45, 0.5)])
+        self.assertEqual(why, "take-profit")
+        self.assertAlmostEqual(r, 0.5)
+
+    def test_ladder_follows_the_fall(self):
+        # falls 35%: the stop moves to 20% below entry, then the bounce takes it out there
+        r, _, why = self.outcome([1, 1, (1.0, 1.0, 0.65, 0.7), (0.7, 0.9, 0.7, 0.9)])
+        self.assertEqual(why, "ladder stop in profit")
+        self.assertAlmostEqual(r, 0.2)
+
+
 class FakeOracle:
     def __init__(self, outs):
         self.outs = outs
