@@ -496,7 +496,7 @@ gainer:
     # so the whole book is at most 50% of equity. Replayed over 2 years
     # (hourly board, $50 + $50/month): +37%, above deposits in 20 of 24
     # months, worst drop 27%. notional_usdt is ignored while this is > 0.
-    notional_pct_of_equity: 15.0   # 2026-10-07: 15% per trade (was 10), with squeeze; see below
+    notional_pct_of_equity: 20.0   # 2026-10-07: 20% per trade (was 10, briefly 15), with squeeze
     # Chosen 2026-09-24 for a $50 start (+$50/month): 10% of $50 is under the
     # exchange minimum after rounding, so trades are never smaller than $6.
     # Replay: +39.3% over 2 years, same as without the minimum.
@@ -634,7 +634,7 @@ gainer:
     max_new_trades_per_day: 0
     pause_after_losses: 0
     pause_hours: 24
-    max_exposure_pct: 30        # 2 gainer trades at 15% (2026-10-07; was 20 with 10% trades)
+    max_exposure_pct: 40        # 2 gainer trades at 20% (2026-10-07; was 20 with 10% trades)
     daily_loss_limit_pct: 0
     drawdown_pause_pct: 20      # no new trades 20% below the high; setting A 2026-09-30
 
