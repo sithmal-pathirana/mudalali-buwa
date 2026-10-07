@@ -275,8 +275,9 @@ class TelegramControl:
             # "LIGHTUSDT entry 0.1969 now 0.0860" was DOGEUSDT's price.
             px = p.get("price") or 0.0
             now = f"{px:,.4f}" if px else "waiting for first tick"
+            tag = f"  [{p['strategy']}]" if p.get("strategy") else ""
             lines.append(
-                f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}"
+                f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}{tag}"
                 f"\n  entry {p['entry']:,.4f}  now {now}"
                 f"\n  unrealised {p['unrealized']:+.2f}"
                 f"\n  TP {p['to_tp']*100:.0f}%  SL {p['to_sl']*100:.0f}%")
@@ -612,23 +613,31 @@ class TelegramControl:
             lines += ["", f"regime      {s['regime']}"]
         if s.get("halted"):
             lines += ["", f"HALTED: {s.get('halt_reason', '')}"]
-        p = s.get("position")
-        if p:
+        # EVERY open position. /status printed only the first one, so with the
+        # gainer and squeeze both trading it hid the rest (2026-10-07).
+        book = s.get("positions") or ([s["position"]] if s.get("position") else [])
+        if not book:
+            lines += ["", "flat"]
+        elif len(book) > 1:
+            lines += ["", f"{len(book)} positions open, "
+                          f"{sum(p.get('unrealized', 0.0) for p in book):+.2f} USDT unrealised"]
+        for p in book:
+            tag = f"  [{p['strategy']}]" if p.get("strategy") else ""
+            no_tp = not p.get("take_profit")
             lines += [
                 "",
                 f"{p.get('symbol', s.get('symbol','?'))} "
-                f"{p['side']} {p['qty']:g} @ {p['entry']:,.4f}",
+                f"{p['side']} {p['qty']:g} @ {p['entry']:,.4f}{tag}",
                 # The held coin's OWN price. /status used to print only the
                 # configured symbol's, which in portfolio mode is a market the
                 # bot is not even trading.
                 f"now         " + (f"{p['price']:,.4f}" if p.get('price')
                                    else "no price yet"),
                 f"unrealised  {p['unrealized']:+.2f} USDT",
-                f"to TP       {p['to_tp']*100:5.1f}%  ({p['take_profit']:,.4f})",
+                ("to TP       none (closed by its stop or time limit)" if no_tp else
+                 f"to TP       {p['to_tp']*100:5.1f}%  ({p['take_profit']:,.4f})"),
                 f"to SL       {p['to_sl']*100:5.1f}%  ({p['stop']:,.4f})",
             ]
-        else:
-            lines += ["", "flat"]
         self.send("\n".join(lines))
 
     def _send_pnl(self) -> None:

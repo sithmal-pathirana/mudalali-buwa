@@ -97,6 +97,20 @@ class TestReadOnlyCommands(Base):
         for expected in ("equity", "43.00", "BUY", "to TP", "to SL"):
             self.assertIn(expected, out)
 
+    def test_status_lists_every_position(self):
+        two = [dict(symbol="RLCUSDT", side="BUY", qty=7.2, entry=0.83, stop=0.58,
+                    take_profit=1.62, strategy="gainer", price=0.72, unrealized=-0.8,
+                    to_tp=-0.1, to_sl=0.4),
+               dict(symbol="OMUSDT", side="BUY", qty=30, entry=0.2, stop=0.16,
+                    take_profit=0.0, strategy="squeeze", price=0.21, unrealized=0.3,
+                    to_tp=0.0, to_sl=-0.2)]
+        self.tc.publish(dict(SNAPSHOT, position=two[0], positions=two))
+        self.tc._handle(message("/status"))
+        out = self.last()
+        for expected in ("RLCUSDT", "OMUSDT", "[gainer]", "[squeeze]", "2 positions open",
+                         "to TP       none"):
+            self.assertIn(expected, out)
+
     def test_status_flags_a_halt(self):
         self.tc.publish(dict(SNAPSHOT, halted=True, halt_reason="daily loss limit"))
         self.tc._handle(message("/status"))

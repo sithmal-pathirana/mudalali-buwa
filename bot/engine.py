@@ -823,6 +823,7 @@ class Engine:
             book.append({
                 "symbol": sym, "side": p.side, "qty": p.qty, "entry": p.entry,
                 "stop": p.stop, "take_profit": p.take_profit,
+                "strategy": getattr(p, "strategy", "") or "",
                 # `px`, NOT a fallback to self.last_price: that fallback is the
                 # very cross-symbol leak the comment above describes, and it
                 # survived here after the P&L lines were fixed -- an unpriced
