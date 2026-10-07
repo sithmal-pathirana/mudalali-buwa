@@ -1736,7 +1736,7 @@ class Engine:
         except BinanceError as e:
             log.info("%s entry not cancellable (%s) -- likely filled or gone",
                      symbol, e)
-        self.notify.send(Event.HALT,
+        self.notify.send(Event.STOPPING,
                          f"Stopping with {symbol} still open.\n"
                          f"Its stop and take-profit are LEFT ON THE EXCHANGE so "
                          f"the position stays protected while the bot is down.")

@@ -34,6 +34,9 @@ class Event(Enum):
     TARGET_REACHED = "daily target reached"
     TARGET_RAISED = "daily target raised"
     HALT = "HALTED"
+    #: A normal stop or restart with a position left open and protected. Not
+    #: a halt: titling it HALTED made every restart look like one (2026-10-07).
+    STOPPING = "stopping"
     DAILY_SUMMARY = "daily summary"
     SCAN = "scan"
     GAINER = "gainer mining"
@@ -52,7 +55,7 @@ ICON = {
     Event.TP_HIT: "[ + ]", Event.SL_HIT: "[ - ]",
     Event.TARGET_REACHED: "[ = ]", Event.TARGET_RAISED: "[ ^ ]",
     Event.HALT: "[!!!]", Event.DAILY_SUMMARY: "[ i ]", Event.SCAN: "[ o ]",
-    Event.GAINER: "[ G ]", Event.ERROR: "[ x ]",
+    Event.GAINER: "[ G ]", Event.ERROR: "[ x ]", Event.STOPPING: "[ . ]",
 }
 
 
