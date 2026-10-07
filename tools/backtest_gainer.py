@@ -147,7 +147,11 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  #             24h change is within sector_min_pct..sector_max_pct;
                  #             sector_pick climb1h (fastest last hour) | strongest
                  "sectors_file": "", "sector_min_pct": 0.0, "sector_max_pct": 15.0,
-                 "sector_pick": "climb1h", "sector_skip": ""}
+                 "sector_pick": "climb1h", "sector_skip": "",
+                 # dynamic exits sized by the coin's 12h ATR % (0 = off)
+                 #   atr_tp_mult       take-profit at mult x ATR % (5..300%)
+                 #   atr_ladder_mult   ladder first step and step at mult x ATR % (3..50%)
+                 "atr_tp_mult": 0.0, "atr_ladder_mult": 0.0}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -299,6 +303,9 @@ class Settings:
              float(ex.partial_take_pct), float(ex.partial_fraction), ex.on_new_leader)
         if ex.on_new_leader == "close_if_losing":
             k += (float(ex.min_hold_minutes), float(ex.fee_pct)) + self.stream_key()
+        tp_m, lad_m = float(self.test["atr_tp_mult"]), float(self.test["atr_ladder_mult"])
+        if tp_m or lad_m:
+            k += ("atr_dyn", tp_m, lad_m)
         return k
 
 
@@ -1010,6 +1017,15 @@ class Oracle:
         """(net return, exit time, reason) of a long opened at the open of the bar at t."""
         (cost, stop_pct, target_pct, ladder_on, first, step, mode, max_h, stop_mode,
          atr_mult, atr_min, atr_max, part_pct, part_frac, on_new) = ek[:15]
+        if "atr_dyn" in ek:
+            _tag, tp_m, lad_m = ek[-3:]
+            ek = ek[:-3]
+            a = feat.get("atr")
+            if a:
+                if tp_m:
+                    target_pct = min(300.0, max(5.0, tp_m * a))
+                if lad_m:
+                    first = step = min(50.0, max(3.0, lad_m * a))
         T, O, Hh, L, C, _Q = d
         j = bisect.bisect_left(T, t)
         if j >= len(T) or not feat.get("ok"):
