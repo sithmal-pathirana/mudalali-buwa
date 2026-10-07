@@ -82,7 +82,7 @@ from bot.gainer import (EXCLUDE_BASES, GainerConfig, atr_pct,       # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA = Path(os.environ.get("BACKTEST_DATA", Path.home() / "backtest-data"))
 VERSION = 2                     # bump when a change alters replay results
-FEATS_VERSION = 3               # bump when the measurements at a leader change
+FEATS_VERSION = 4               # bump when the measurements at a leader change
 
 #: Ideas the bot does not have yet, tried in the replay only (set as test.*).
 #:   when_full: what a new leader does when every slot is taken.
@@ -112,7 +112,30 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  "min_trades_surge_x": 0.0, "max_trades_surge_x": 0.0,
                  "min_trade_size_x": 0.0, "max_trade_size_x": 0.0,
                  # a classifier's score per leader (tools/backtest_ml.py)
-                 "ml_scores": "", "min_ml_score": 0.0}
+                 "ml_scores": "", "min_ml_score": 0.0,
+                 # early detection: which coin is "the leader" (replay only)
+                 #   leader    the bot: the 24h #1 (or board.rank_by climb)
+                 #   accum     volume before price: last hour's volume at least
+                 #             accum_surge_x times its normal hour (6 days before
+                 #             today), while that hour's price change is within
+                 #             accum_min_pct..accum_max_pct; biggest surge leads
+                 #   rankjump  outside the top rank_from rank_window_min ago, now
+                 #             inside the top rank_into; biggest 24h change leads
+                 "signal": "leader", "accum_surge_x": 5.0, "accum_min_pct": 3.0,
+                 "accum_max_pct": 10.0, "rank_from": 30, "rank_into": 5,
+                 "rank_window_min": 60,
+                 #   topn      every coin that ENTERS the top top_n gainers is a
+                 #             new leader (hold many at once: set max_positions)
+                 "top_n": 20,
+                 # spot-led vs futures-led (data.binance.vision spot candles)
+                 #   require_spot           1: skip coins with no Binance spot market
+                 #   min/max_spot_share_*   spot volume / (spot + futures volume)
+                 #   min_spot_buy_share_1h  spot taker-buy / spot volume, last hour
+                 #   min/max_spot_lead      spot buy share minus futures buy share
+                 #   min_spot_surge_x       spot 24h volume over its normal day
+                 "require_spot": 0, "min_spot_share_1h": 0.0, "max_spot_share_1h": 0.0,
+                 "min_spot_share_24h": 0.0, "min_spot_buy_share_1h": 0.0,
+                 "min_spot_lead": 0.0, "max_spot_lead": 0.0, "min_spot_surge_x": 0.0}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -129,7 +152,14 @@ PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_trades_surge_x", "trades_surge", False),
                ("max_trades_surge_x", "trades_surge", True),
                ("min_trade_size_x", "trade_size_x", False),
-               ("max_trade_size_x", "trade_size_x", True)]
+               ("max_trade_size_x", "trade_size_x", True),
+               ("require_spot", "has_spot", False),
+               ("min_spot_share_1h", "spot_share_1h", False),
+               ("max_spot_share_1h", "spot_share_1h", True),
+               ("min_spot_share_24h", "spot_share_24h", False),
+               ("min_spot_buy_share_1h", "spot_buy_1h", False),
+               ("max_spot_lead", "spot_lead", True),
+               ("min_spot_surge_x", "spot_surge", False)]
 WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing")
 
 B = 300_000                     # one 5-minute bar, ms
@@ -201,6 +231,8 @@ class Settings:
                 raise SystemExit(f"--set {k}: only gainer.*, risk.* and test.* settings "
                                  f"are replayed")
             set_path(raw, k, v)
+        if self.test["signal"] not in ("leader", "accum", "rankjump", "topn"):
+            raise SystemExit("test.signal must be leader, accum, rankjump or topn")
         if self.test["when_full"] not in WHEN_FULL:
             raise SystemExit(f"test.when_full must be one of {', '.join(WHEN_FULL)}")
         try:
@@ -219,6 +251,15 @@ class Settings:
     # keys for the caches: only what each stage depends on
     def board_key(self) -> tuple:
         b = self.g.board
+        tst = self.test
+        if tst["signal"] == "accum":
+            return ("accum", float(b.min_quote_volume), float(tst["accum_surge_x"]),
+                    float(tst["accum_min_pct"]), float(tst["accum_max_pct"]))
+        if tst["signal"] == "topn":
+            return ("topn", float(b.min_quote_volume), int(tst["top_n"]))
+        if tst["signal"] == "rankjump":
+            return ("rankjump", float(b.min_quote_volume), int(tst["rank_from"]),
+                    int(tst["rank_into"]), max(1, bars_for(tst["rank_window_min"])))
         if b.rank_by == "climb":
             return ("climb", float(b.min_quote_volume), bars_for(b.climb_minutes),
                     float(b.climb_volume_surge_x))
@@ -334,6 +375,14 @@ class Market:
         with open(p, "rb") as f:
             return pickle.load(f)
 
+    def spot(self, sym):
+        """(spot symbol, times, quote volume, taker-buy quote) or None (no spot market)."""
+        p = self.dir.parent / "spot5m" / f"{sym}.pkl"
+        if not p.exists():
+            return "missing"
+        with open(p, "rb") as f:
+            return pickle.load(f)
+
     def funding(self, sym):
         """(times, % per 8h) of the coin's funding settlements, or None."""
         if not hasattr(self, "_funding"):
@@ -359,6 +408,190 @@ class Market:
             with open(path, "rb") as f:
                 self._boards[key] = pickle.load(f)
             return self._boards[key]
+        if key[0] == "accum":
+            out = self._board_accum(key)
+        elif key[0] == "rankjump":
+            out = self._board_rankjump(key)
+        else:
+            out = self._board_change(key)
+        with open(path, "wb") as f:
+            pickle.dump(out, f)
+        self._boards[key] = out
+        return out
+
+    def _steps(self):
+        import array
+        n = (self.t_hi - self.t_lo) // B + 1
+        return (n, array.array("d", [-1e18]) * n, array.array("i", [-1]) * n,
+                array.array("i", [0]) * n)
+
+    def _board_accum(self, key):
+        """Volume before price: see TEST_DEFAULTS 'accum'."""
+        _, min_qv, surge, lo, hi = key
+        n, best, bsym, bidx = self._steps()
+        t_lo = self.t_lo
+        week = 7 * DAY_BARS
+        self.log(f"building the board {key} (once; a few minutes) ...")
+        started = time.time()
+        for si, sym in enumerate(self.symbols):
+            T, _O, _H, _L, C, Q = self.load(sym)
+            acc = acc1 = acc7 = 0.0
+            for i in range(len(T)):
+                q = Q[i]
+                acc += q
+                acc1 += q
+                acc7 += q
+                if i >= DAY_BARS:
+                    acc -= Q[i - DAY_BARS]
+                if i >= 12:
+                    acc1 -= Q[i - 12]
+                if i >= week:
+                    acc7 -= Q[i - week]
+                if i < week or acc < min_qv or T[i] - T[i - week] != week * B:
+                    continue
+                normal = (acc7 - acc) / (6 * 24)          # an hour, in the 6 days before today
+                if normal <= 0:
+                    continue
+                ratio = acc1 / normal
+                if ratio < surge:
+                    continue
+                p1 = (C[i] / C[i - 12] - 1) * 100
+                if p1 < lo or p1 > hi:
+                    continue
+                k = (T[i] + B - t_lo) // B
+                if 0 <= k < n and ratio > best[k]:
+                    best[k], bsym[k], bidx[k] = ratio, si, i
+            if si % 100 == 0:
+                self.log(f"  board {si}/{len(self.symbols)} coins, {time.time() - started:.0f}s")
+        return (bsym, bidx)
+
+    def _rank_thresholds(self, min_qv):
+        """Per step, the 24h change at ranks 1..50 among eligible coins."""
+        key = ("rank_thresholds", min_qv)
+        path = self._cache_path("ranks", key)
+        if path.exists():
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        import array, heapq
+        n = (self.t_hi - self.t_lo) // B + 1
+        heaps = [[] for _ in range(n)]
+        t_lo, span = self.t_lo, DAY_BARS * B
+        self.log("ranking every coin at every 5 minutes (once; several minutes) ...")
+        started = time.time()
+        for si, sym in enumerate(self.symbols):
+            T, _O, _H, _L, C, Q = self.load(sym)
+            acc = 0.0
+            for i in range(len(T)):
+                acc += Q[i]
+                if i >= DAY_BARS:
+                    acc -= Q[i - DAY_BARS]
+                if i < DAY_BARS or acc < min_qv or T[i] - T[i - DAY_BARS] != span:
+                    continue
+                k = (T[i] + B - t_lo) // B
+                if not 0 <= k < n:
+                    continue
+                ch = C[i] / C[i - DAY_BARS]
+                h = heaps[k]
+                if len(h) < 50:
+                    heapq.heappush(h, ch)
+                elif ch > h[0]:
+                    heapq.heapreplace(h, ch)
+            if si % 100 == 0:
+                self.log(f"  ranks {si}/{len(self.symbols)} coins, {time.time() - started:.0f}s")
+        ranks = (3, 5, 10, 20, 30, 50)
+        thr = {r: array.array("d", [0.0]) * n for r in ranks}   # 0: everyone is inside
+        for k, h in enumerate(heaps):
+            h.sort(reverse=True)
+            for r in ranks:
+                if len(h) >= r:
+                    thr[r][k] = h[r - 1]
+            heaps[k] = None
+        with open(path, "wb") as f:
+            pickle.dump(thr, f)
+        return thr
+
+    def _board_rankjump(self, key):
+        """Rank jump: see TEST_DEFAULTS 'rankjump'."""
+        _, min_qv, r_from, r_into, w = key
+        thr = self._rank_thresholds(min_qv)
+        if r_from not in thr or r_into not in thr:
+            raise SystemExit("test.rank_from / rank_into must be one of 3, 5, 10, 20, 30, 50")
+        top_now, top_then = thr[r_into], thr[r_from]
+        n, best, bsym, bidx = self._steps()
+        t_lo, span = self.t_lo, DAY_BARS * B
+        self.log(f"building the board {key} (once; a few minutes) ...")
+        started = time.time()
+        for si, sym in enumerate(self.symbols):
+            T, _O, _H, _L, C, Q = self.load(sym)
+            acc = 0.0
+            for i in range(len(T)):
+                acc += Q[i]
+                if i >= DAY_BARS:
+                    acc -= Q[i - DAY_BARS]
+                if i < DAY_BARS + w or acc < min_qv or T[i] - T[i - DAY_BARS - w] != (DAY_BARS + w) * B:
+                    continue
+                k = (T[i] + B - t_lo) // B
+                if not w <= k < n:
+                    continue
+                ch = C[i] / C[i - DAY_BARS]
+                if ch < top_now[k]:
+                    continue                    # not inside the top r_into now
+                then = C[i - w] / C[i - w - DAY_BARS]
+                if then >= top_then[k - w]:
+                    continue                    # was already inside the top r_from
+                if ch > best[k]:
+                    best[k], bsym[k], bidx[k] = ch, si, i
+            if si % 100 == 0:
+                self.log(f"  board {si}/{len(self.symbols)} coins, {time.time() - started:.0f}s")
+        return (bsym, bidx)
+
+    def _stream_topn(self, key, period):
+        """Every coin entering the top N at a check: [(t, symbol, end)], end =
+        the first later check it is outside the top N again."""
+        path = self._cache_path("stream", key + (period,))
+        if path.exists():
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        _, min_qv, top_n = key
+        thr = self._rank_thresholds(min_qv)
+        if top_n not in thr:
+            raise SystemExit("test.top_n must be one of 3, 5, 10, 20, 30, 50")
+        bar = thr[top_n]
+        t_lo, span = self.t_lo, DAY_BARS * B
+        n = len(bar)
+        self.log(f"finding every entry into the top {top_n} (once; a few minutes) ...")
+        started = time.time()
+        events = []
+        for si, sym in enumerate(self.symbols):
+            T, _O, _H, _L, C, Q = self.load(sym)
+            acc = 0.0
+            inside = False
+            for i in range(len(T)):
+                acc += Q[i]
+                if i >= DAY_BARS:
+                    acc -= Q[i - DAY_BARS]
+                t = T[i] + B
+                if t % period:
+                    continue                            # not a check time
+                k = (t - t_lo) // B
+                now = (i >= DAY_BARS and acc >= min_qv and T[i] - T[i - DAY_BARS] == span
+                       and 0 <= k < n and C[i] / C[i - DAY_BARS] >= bar[k])
+                if now and not inside:
+                    events.append([t, sym, None])
+                elif inside and not now:
+                    events[-1][2] = t
+                inside = now
+            if inside:
+                events[-1][2] = self.t_hi
+            if si % 100 == 0:
+                self.log(f"  top {top_n}: {si}/{len(self.symbols)} coins, "
+                         f"{time.time() - started:.0f}s")
+        out = sorted((tuple(e) for e in events if t_lo <= e[0]), key=lambda e: (e[0], e[1]))
+        with open(path, "wb") as f:
+            pickle.dump(out, f)
+        return out
+
+    def _board_change(self, key):
         import array
         t_lo, t_hi = self.t_lo, self.t_hi
         n = (t_hi - t_lo) // B + 1
@@ -403,11 +636,7 @@ class Market:
                     bidx[k] = i
             if si % 100 == 0:
                 self.log(f"  board {si}/{len(self.symbols)} coins, {time.time() - started:.0f}s")
-        out = (bsym, bidx)
-        with open(path, "wb") as f:
-            pickle.dump(out, f)
-        self._boards[key] = out
-        return out
+        return (bsym, bidx)
 
     def stream(self, s: Settings):
         """
@@ -419,6 +648,10 @@ class Market:
         key = s.stream_key()
         if key in self._streams:
             return self._streams[key]
+        if key[0] == "topn":
+            out = self._stream_topn(s.board_key(), s.check_ms())
+            self._streams[key] = out
+            return out
         bsym, _ = self.board(s.board_key())
         period = s.check_ms()
         confirm = s.g.entry.confirm_minutes * 60_000
@@ -641,6 +874,29 @@ class Oracle:
                     f["trades_surge"] = n1 / (n7 / (7 * 24))
                 if n1 > 0 and n7 > 0 and q7 > 0:
                     f["trade_size_x"] = (q1 / n1) / (q7 / n7)
+        sp = self.m.spot(sym)
+        if sp != "missing" and i >= 8 * DAY_BARS:
+            sq1 = sq24 = sb1 = sq7 = 0.0
+            if sp is not None:
+                _n, sT, sQ, sB = sp
+                k = bisect.bisect_left(sT, T[i])
+                if k < len(sT) and sT[k] == T[i]:
+                    sq1 = sum(sQ[max(0, k - 11):k + 1])
+                    sb1 = sum(sB[max(0, k - 11):k + 1])
+                    sq24 = sum(sQ[max(0, k - DAY_BARS + 1):k + 1])
+                    if k >= 8 * DAY_BARS:
+                        sq7 = sum(sQ[k - 8 * DAY_BARS + 1:k - DAY_BARS + 1]) / 7
+            f["has_spot"] = 1.0 if sq24 > 0 else 0.0
+            fq1 = sum(Q[i - 11:i + 1])
+            fq24 = sum(Q[i - DAY_BARS + 1:i + 1])
+            f["spot_share_1h"] = sq1 / (sq1 + fq1) if sq1 + fq1 > 0 else 0.0
+            f["spot_share_24h"] = sq24 / (sq24 + fq24) if sq24 + fq24 > 0 else 0.0
+            if sq1 > 0:
+                f["spot_buy_1h"] = sb1 / sq1
+                if f.get("buy_share_1h") is not None:
+                    f["spot_lead"] = f["spot_buy_1h"] - f["buy_share_1h"]
+            if sq7 > 0:
+                f["spot_surge"] = sq24 / sq7
         fu = self.m.funding(sym)
         if fu:
             k = bisect.bisect_right(fu[0], t) - 1
@@ -914,6 +1170,10 @@ class Account:
                 sc = self.ml.get((self._sym, self._t))
                 if sc is not None and sc < float(s.test["min_ml_score"]):
                     return "test: min_ml_score"
+            ml = s.test["min_spot_lead"]
+            if ml not in (0, 0.0, None, "") and f.get("spot_lead") is not None \
+                    and f["spot_lead"] < float(ml):
+                return "test: min_spot_lead"
             for name, feat, above in PUMP_CHECKS:
                 limit = float(s.test[name] or 0)
                 v = f.get(feat)

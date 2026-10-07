@@ -175,6 +175,18 @@ class PumpChecksTest(unittest.TestCase):
         res = self.run_account({"vol_surge": 99, "below_high": 50}, {})
         self.assertEqual(res["trades"], 1)
 
+    def test_futures_only_coin_skipped_when_spot_required(self):
+        res = self.run_account({"has_spot": 0.0}, {"test.require_spot": 1})
+        self.assertEqual(res["skipped"], {"test: require_spot": 1})
+        res = self.run_account({"has_spot": 1.0}, {"test.require_spot": 1})
+        self.assertEqual(res["trades"], 1)
+
+    def test_spot_lead(self):
+        res = self.run_account({"spot_lead": -0.1}, {"test.min_spot_lead": 0.0001})
+        self.assertEqual(res["skipped"], {"test: min_spot_lead": 1})
+        res = self.run_account({"spot_lead": -0.1}, {"test.min_spot_lead": -0.2})
+        self.assertEqual(res["trades"], 1)
+
 
 class WhenFullTest(unittest.TestCase):
     def run_account(self, overrides):
