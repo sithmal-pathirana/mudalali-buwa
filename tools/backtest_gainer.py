@@ -135,7 +135,13 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  #   min_spot_surge_x       spot 24h volume over its normal day
                  "require_spot": 0, "min_spot_share_1h": 0.0, "max_spot_share_1h": 0.0,
                  "min_spot_share_24h": 0.0, "min_spot_buy_share_1h": 0.0,
-                 "min_spot_lead": 0.0, "max_spot_lead": 0.0, "min_spot_surge_x": 0.0}
+                 "min_spot_lead": 0.0, "max_spot_lead": 0.0, "min_spot_surge_x": 0.0,
+                 #   futures_only           1: skip coins that DO have a spot market
+                 #   max_spot_share_24h     spot volume share over 24h at most this
+                 "futures_only": 0, "max_spot_share_24h": 0.0,
+                 #   events    buy each (t, symbol) in events_file, events_delay_min
+                 #             after t, at the next check (news: listings ...)
+                 "events_file": "", "events_delay_min": 5}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -157,6 +163,7 @@ PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_spot_share_1h", "spot_share_1h", False),
                ("max_spot_share_1h", "spot_share_1h", True),
                ("min_spot_share_24h", "spot_share_24h", False),
+               ("max_spot_share_24h", "spot_share_24h", True),
                ("min_spot_buy_share_1h", "spot_buy_1h", False),
                ("max_spot_lead", "spot_lead", True),
                ("min_spot_surge_x", "spot_surge", False)]
@@ -231,8 +238,8 @@ class Settings:
                 raise SystemExit(f"--set {k}: only gainer.*, risk.* and test.* settings "
                                  f"are replayed")
             set_path(raw, k, v)
-        if self.test["signal"] not in ("leader", "accum", "rankjump", "topn"):
-            raise SystemExit("test.signal must be leader, accum, rankjump or topn")
+        if self.test["signal"] not in ("leader", "accum", "rankjump", "topn", "events"):
+            raise SystemExit("test.signal must be leader, accum, rankjump, topn or events")
         if self.test["when_full"] not in WHEN_FULL:
             raise SystemExit(f"test.when_full must be one of {', '.join(WHEN_FULL)}")
         try:
@@ -255,6 +262,8 @@ class Settings:
         if tst["signal"] == "accum":
             return ("accum", float(b.min_quote_volume), float(tst["accum_surge_x"]),
                     float(tst["accum_min_pct"]), float(tst["accum_max_pct"]))
+        if tst["signal"] == "events":
+            return ("events", str(tst["events_file"]), float(tst["events_delay_min"]))
         if tst["signal"] == "topn":
             return ("topn", float(b.min_quote_volume), int(tst["top_n"]))
         if tst["signal"] == "rankjump":
@@ -648,6 +657,19 @@ class Market:
         key = s.stream_key()
         if key in self._streams:
             return self._streams[key]
+        if key[0] == "events":
+            import csv
+            _, path, delay = s.board_key()
+            period = s.check_ms()
+            out = []
+            for r in csv.DictReader(open(path)):
+                t = int(r["t"]) + int(delay * 60_000)
+                t = ((t + period - 1) // period) * period          # the next check
+                if self.t_lo <= t < self.t_hi and r["symbol"] in self.index["first"]:
+                    out.append((t, r["symbol"], t + period))
+            out.sort()
+            self._streams[key] = out
+            return out
         if key[0] == "topn":
             out = self._stream_topn(s.board_key(), s.check_ms())
             self._streams[key] = out
@@ -1170,6 +1192,8 @@ class Account:
                 sc = self.ml.get((self._sym, self._t))
                 if sc is not None and sc < float(s.test["min_ml_score"]):
                     return "test: min_ml_score"
+            if s.test["futures_only"] and f.get("has_spot") == 1.0:
+                return "test: futures_only"
             ml = s.test["min_spot_lead"]
             if ml not in (0, 0.0, None, "") and f.get("spot_lead") is not None \
                     and f["spot_lead"] < float(ml):
