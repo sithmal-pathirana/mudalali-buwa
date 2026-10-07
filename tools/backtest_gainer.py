@@ -141,7 +141,13 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  "futures_only": 0, "max_spot_share_24h": 0.0,
                  #   events    buy each (t, symbol) in events_file, events_delay_min
                  #             after t, at the next check (news: listings ...)
-                 "events_file": "", "events_delay_min": 5}
+                 "events_file": "", "events_delay_min": 5,
+                 #   sector    when a coin becomes the 24h #1, buy a peer from its
+                 #             sectors (sectors_file: symbol -> [sectors]) whose
+                 #             24h change is within sector_min_pct..sector_max_pct;
+                 #             sector_pick climb1h (fastest last hour) | strongest
+                 "sectors_file": "", "sector_min_pct": 0.0, "sector_max_pct": 15.0,
+                 "sector_pick": "climb1h", "sector_skip": ""}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -238,8 +244,8 @@ class Settings:
                 raise SystemExit(f"--set {k}: only gainer.*, risk.* and test.* settings "
                                  f"are replayed")
             set_path(raw, k, v)
-        if self.test["signal"] not in ("leader", "accum", "rankjump", "topn", "events"):
-            raise SystemExit("test.signal must be leader, accum, rankjump, topn or events")
+        if self.test["signal"] not in ("leader", "accum", "rankjump", "topn", "events", "sector"):
+            raise SystemExit("test.signal must be leader, accum, rankjump, topn, events or sector")
         if self.test["when_full"] not in WHEN_FULL:
             raise SystemExit(f"test.when_full must be one of {', '.join(WHEN_FULL)}")
         try:
@@ -262,6 +268,10 @@ class Settings:
         if tst["signal"] == "accum":
             return ("accum", float(b.min_quote_volume), float(tst["accum_surge_x"]),
                     float(tst["accum_min_pct"]), float(tst["accum_max_pct"]))
+        if tst["signal"] == "sector":
+            return ("sector", float(b.min_quote_volume), str(tst["sectors_file"]),
+                    float(tst["sector_min_pct"]), float(tst["sector_max_pct"]),
+                    str(tst["sector_pick"]), str(tst["sector_skip"]))
         if tst["signal"] == "events":
             return ("events", str(tst["events_file"]), float(tst["events_delay_min"]))
         if tst["signal"] == "topn":
@@ -674,9 +684,18 @@ class Market:
             out = self._stream_topn(s.board_key(), s.check_ms())
             self._streams[key] = out
             return out
-        bsym, _ = self.board(s.board_key())
-        period = s.check_ms()
-        confirm = s.g.entry.confirm_minutes * 60_000
+        if key[0] == "sector":
+            out = self._stream_sector(s.board_key(), s.check_ms(),
+                                      s.g.entry.confirm_minutes * 60_000)
+            self._streams[key] = out
+            return out
+        out = self._leader_events(self.board(s.board_key())[0], s.check_ms(),
+                                  s.g.entry.confirm_minutes * 60_000)
+        self._streams[key] = out
+        return out
+
+    def _leader_events(self, bsym, period, confirm):
+        """The bot's check_leader over a board: new confirmed leaders."""
         t_lo = self.t_lo
         first = ((t_lo + period - 1) // period) * period
         leader = cand = None
@@ -705,8 +724,53 @@ class Market:
         for e in events:
             if e[2] is None:
                 e[2] = self.t_hi
-        out = [tuple(e) for e in events]
-        self._streams[key] = out
+        return [tuple(e) for e in events]
+
+    def _stream_sector(self, key, period, confirm):
+        """Sector contagion: at each new 24h leader, one peer that has not run yet."""
+        path = self._cache_path("stream", key + (period, confirm))
+        if path.exists():
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        _, min_qv, sfile, lo, hi, pick, skip = key
+        sectors = json.load(open(sfile))
+        skip_set = set(x for x in skip.split(",") if x)
+        members: dict = {}
+        for sym, cats in sectors.items():
+            for c in cats:
+                if c not in skip_set:
+                    members.setdefault(c, set()).add(sym)
+        leaders = self._leader_events(self.board(("change_24h", min_qv))[0], period, confirm)
+        wanted: dict = {}                          # peer -> [(event index, t)]
+        for n, (t, lead, _end) in enumerate(leaders):
+            peers = set()
+            for c in sectors.get(lead, []):
+                peers |= members.get(c, set())
+            peers.discard(lead)
+            for p in peers:
+                wanted.setdefault(p, []).append((n, t))
+        self.log(f"sector peers for {len(leaders)} leaders across {len(wanted)} coins ...")
+        cand: dict = {}                            # event index -> (score, peer)
+        span = DAY_BARS * B
+        for p, evs in wanted.items():
+            if p not in self.index["first"]:
+                continue
+            T, _O, _H, _L, C, Q = self.load(p)
+            for n, t in evs:
+                i = bisect.bisect_left(T, t - B)
+                if i >= len(T) or T[i] + B != t or i < DAY_BARS or T[i] - T[i - DAY_BARS] != span:
+                    continue
+                if sum(Q[i - DAY_BARS + 1:i + 1]) < min_qv:
+                    continue
+                ch = (C[i] / C[i - DAY_BARS] - 1) * 100
+                if ch < lo or ch > hi:
+                    continue
+                score = (C[i] / C[i - 12] - 1) if pick == "climb1h" else ch
+                if n not in cand or score > cand[n][0]:
+                    cand[n] = (score, p)
+        out = sorted((leaders[n][0], p, leaders[n][0] + period) for n, (_sc, p) in cand.items())
+        with open(path, "wb") as f:
+            pickle.dump(out, f)
         return out
 
 
