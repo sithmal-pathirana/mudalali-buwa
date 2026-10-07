@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+
+from .context import ContextConfig
+from .gainer import GainerConfig
+from .squeeze import SqueezeConfig
+from .supervise import SuperviseConfig
 from pathlib import Path
 
 import yaml
@@ -17,7 +22,7 @@ class RiskConfig:
     risk_per_trade_pct: float = 2.0        # % of equity risked between entry and stop
     max_position_pct: float = 100.0        # cap on notional as % of equity * leverage
     daily_loss_limit_pct: float = 5.0      # halt for the day past this drawdown
-    max_trades_per_day: int = 10
+    max_trades_per_day: int = 10            # 0 = no cap
     min_equity_usdt: float = 10.0          # below this the bot stops permanently
     allow_averaging_down: bool = False     # keep False; see README
     entry_expiry_minutes: int = 60         # cancel a limit entry that never fills
@@ -31,6 +36,12 @@ class RiskConfig:
     #: sizing decision unrepresentative of the account you actually intend to
     #: fund -- and hides the minimum-order constraint entirely.
     equity_cap_usdt: float = 0.0
+    #: With a cap set: start at the cap and then follow the account's real
+    #: gains and losses (cap + actual - actual-when-started), instead of
+    #: reading exactly the cap forever. A fixed cap on a 5,000 USDT testnet
+    #: can never fall, so the equity floor and the equity side of the daily
+    #: loss limit could never fire -- the rehearsal did not rehearse them.
+    equity_cap_tracks_pnl: bool = False
     #: Round a too-small position UP to the exchange minimum instead of skipping
     #: it. Off in the safe profile, where refusing is right: the account cannot
     #: afford the trade at the stated risk, so it should not take it. Aggressive
@@ -40,6 +51,15 @@ class RiskConfig:
     #: The leverage cap below still bounds the upsized order -- this raises the
     #: effective risk PERCENTAGE, never the notional past equity*max_leverage.
     take_minimum_order: bool = False
+    #: Multiple of realised volatility (mean true range, as a % of price) used
+    #: as the callbackRate for a Binance-native TRAILING_STOP_MARKET, placed
+    #: instead of the fixed STOP_MARKET the strategy would otherwise get. The
+    #: stop then ratchets in the position's favour on the exchange itself --
+    #: it keeps trailing even if this process is down -- and never gets worse
+    #: than the fixed stop it replaces. 0 keeps the fixed stop. 0 in the safe
+    #: profile on purpose: an exit rule that has not been backtested has no
+    #: business touching money. Aggressive profiles set this (bot/aggressive.py).
+    trailing_atr_mult: float = 0.0
 
 
 @dataclass
@@ -54,6 +74,16 @@ class DashboardConfig:
     enabled: bool = True
     host: str = "127.0.0.1"     # see README before changing; this endpoint closes trades
     port: int = 8080
+
+
+@dataclass
+class ManualTradesConfig:
+    """Positions that belong to the user, not the bot."""
+    #: Symbols the bot keeps its hands off: an open position on one is never
+    #: adopted, protected, supervised or closed, and no strategy opens a new
+    #: one there. Its stop-loss and take-profit are whatever was set on
+    #: Binance by hand. Remove a symbol once its trade has closed.
+    symbols: list = field(default_factory=list)
 
 
 @dataclass
@@ -110,6 +140,11 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
+    supervise: SuperviseConfig = field(default_factory=SuperviseConfig)
+    gainer: GainerConfig = field(default_factory=GainerConfig)
+    squeeze: SqueezeConfig = field(default_factory=SqueezeConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    manual_trades: ManualTradesConfig = field(default_factory=ManualTradesConfig)
     targets: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
@@ -156,7 +191,11 @@ class Config:
         # is precisely how the `telegram:` section broke once.
         sections = {"risk": RiskConfig, "alerts": AlertConfig,
                     "dashboard": DashboardConfig, "telegram": TelegramConfig,
-                    "portfolio": PortfolioConfig, "aggressive": AggressiveConfig}
+                    "portfolio": PortfolioConfig, "aggressive": AggressiveConfig,
+                    "supervise": SuperviseConfig, "gainer": GainerConfig,
+                    "squeeze": SqueezeConfig,
+                    "context": ContextConfig,
+                    "manual_trades": ManualTradesConfig}
         built = {}
         for name, factory in sections.items():
             section = raw.pop(name, {}) or {}

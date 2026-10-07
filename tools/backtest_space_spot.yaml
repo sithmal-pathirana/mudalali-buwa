@@ -1,0 +1,18 @@
+# Spot-led vs futures-led, as filters on the live settings (setting A +
+# vertical-pump filter). Run with --select-on year1 for the fair test.
+deposits: {start: 50, monthly: 50}
+
+round1:
+  single:
+    test.require_spot: [1]                              # skip futures-only coins
+    test.min_spot_share_1h: [0.05, 0.1, 0.2, 0.3]       # real spot money in the last hour
+    test.max_spot_share_1h: [0.1, 0.2]                  # the opposite, as a check
+    test.min_spot_share_24h: [0.05, 0.1, 0.2]
+    test.min_spot_buy_share_1h: [0.5, 0.55, 0.6]        # spot buyers aggressive
+    test.min_spot_lead: [-0.05, 0.0001, 0.03]           # spot buying keener than futures
+    test.max_spot_lead: [0.05]
+    test.min_spot_surge_x: [1.5, 2, 3, 5]               # spot demand above normal
+
+round2:
+  keep_per_setting: 2
+  max_runs: 1000

@@ -1,0 +1,1147 @@
+"""
+Gainer mining: bot/gainer.py.
+
+The board, the arithmetic and the leader-change rules are tested without an
+exchange. The live path is tested for what can lose money: that a filled
+market entry gets its stop and take-profit, that a failed stop flattens the
+position, that an unprofitable old gainer is closed while a profitable one is
+kept, and that the supervisor stands aside for gainer positions.
+"""
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from bot.binanceapi import BinanceError                    # noqa: E402
+from bot.gainer import (GainerBoard, GainerConfig, GainerMiner,  # noqa: E402
+                        Row, Track, ladder_stop, net_pnl, rank_board, rank_by_climb,
+                        stop_price, target_price)
+from bot.notify import Event                               # noqa: E402
+from test_r2_regressions import StubAPI, engine            # noqa: E402
+
+
+def tick(sym, pct, price=1.0, qv=50e6, high=None):
+    return {"symbol": sym, "priceChangePercent": str(pct),
+            "lastPrice": str(price), "quoteVolume": str(qv),
+            "highPrice": str(price if high is None else high)}
+
+
+class Rules:
+    symbol = "X"
+
+    def round_qty(self, q):
+        return f"{float(q):.0f}"
+
+    def round_price(self, p):
+        return f"{float(p):.6f}"
+
+    def size_for_notional(self, notional, price):
+        qty = int(notional / price) + 1
+        return f"{qty}", f"{price:.6f}"
+
+    def min_affordable_notional(self, price):
+        return 5.0
+
+
+class BoardAPI(StubAPI):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.board = []
+        self.orders = []
+        self.algo = []
+        self.fail_algo = False
+        self.filled_amt = 0.0
+
+    def ticker_24hr(self, symbol=None):
+        return self.board
+
+    def exchange_info(self):
+        return {"symbols": [{"symbol": t["symbol"], "status": "TRADING",
+                             "contractType": "PERPETUAL", "quoteAsset": "USDT",
+                             "baseAsset": t["symbol"][:-4]} for t in self.board]}
+
+    def order(self, **p):
+        self.orders.append(p)
+        if p.get("type") == "MARKET" and not p.get("reduceOnly"):
+            self.filled_amt = float(p["quantity"])
+        return {"orderId": 1}
+
+    def algo_order(self, **p):
+        if self.fail_algo:
+            raise BinanceError(-2021, "would trigger immediately", "/fapi/v1/algoOrder")
+        self.algo.append(p)
+        return {"algoId": 1}
+
+    def positions(self, symbol=None):
+        if self.filled_amt:
+            return [{"positionAmt": str(self.filled_amt), "entryPrice": "1.0",
+                     "unRealizedProfit": "0", "liquidationPrice": "0"}]
+        return []
+
+    def cancel_all(self, symbol):
+        self.calls.append(("cancel_all", symbol))
+
+    def set_leverage(self, symbol, leverage):
+        return {}
+
+
+def miner(dry=True, api=None, **kw):
+    e = engine(api=api or BoardAPI())
+    e._book = {}
+    e._seq = 0
+    e._prepared = {"AAAUSDT", "BBBUSDT", "CCCUSDT"}
+    e.equity = 50.0
+    # engine() anchors the day at 5000; at 50 the preflight would read a 99%
+    # daily loss and refuse every open for the wrong reason.
+    e.state.day_start_equity = e.equity
+    e.rules_for = lambda s: Rules()
+    closed = []
+
+    def close_position(reason, symbol=None):
+        closed.append(symbol)
+        e.book.pop(symbol, None)
+        return True
+    e.close_position = close_position
+    e.closed = closed
+    # The swap guards are off here so each older test isolates its own rule;
+    # class SwapGuards turns them on one at a time.
+    base = dict(enabled=True, dry_run=dry,
+                board=dict(poll_seconds=0),
+                entry=dict(confirm_minutes=0, buy_only_if_rising=False,
+                           rebuy_cooldown_minutes=0),
+                exit=dict(min_hold_minutes=0),
+                alerts=dict(milestones_usd=[1.0, 2.0], status_minutes=0))
+    for k, v in kw.items():
+        if isinstance(v, dict):
+            base.setdefault(k, {}).update(v)
+        else:
+            base[k] = v
+    path = Path(tempfile.mkdtemp()) / "gainer.json"
+    m = GainerMiner(e, GainerConfig(**base), path=path)
+    e.gainer = m
+    return m, e
+
+
+def bodies(e):
+    return [b for _, b in e.sent]
+
+
+class Arithmetic(unittest.TestCase):
+    def test_target_nets_the_dollar_amount_after_costs(self):
+        tp = target_price(1.0, 10.0, 2.0, 0.15)
+        self.assertAlmostEqual(net_pnl(1.0, 10.0, tp, 0.15), 2.0)
+
+    def test_stop_is_below_entry(self):
+        self.assertAlmostEqual(stop_price(2.0, 5.0), 1.9)
+
+    def test_rank_board_filters_volume_and_orders_by_change(self):
+        rows = rank_board([tick("AAAUSDT", 10), tick("BBBUSDT", 30),
+                           tick("THINUSDT", 90, qv=1e5)], set(), 10e6)
+        self.assertEqual([r.symbol for r in rows], ["BBBUSDT", "AAAUSDT"])
+        self.assertEqual(rows[0].rank, 1)
+
+
+class Board(unittest.TestCase):
+    def test_forecast_names_the_closing_challenger(self):
+        b = GainerBoard(GainerConfig(forecast=dict(slope_minutes=10, predict_minutes=15)))
+        b.update(rank_board([tick("AAAUSDT", 40), tick("BBBUSDT", 20)], set(), 0), 0)
+        b.update(rank_board([tick("AAAUSDT", 39), tick("BBBUSDT", 35)], set(), 0), 600)
+        fc = b.forecast(600)
+        self.assertEqual(fc.leader, "AAAUSDT")
+        self.assertEqual(fc.leader_trend, "fading")
+        self.assertEqual(fc.challenger, "BBBUSDT")
+        self.assertGreater(fc.eta_minutes, 0)
+
+    def test_no_history_means_unknown_not_a_guess(self):
+        b = GainerBoard(GainerConfig())
+        b.update(rank_board([tick("AAAUSDT", 40), tick("BBBUSDT", 20)], set(), 0), 0)
+        fc = b.forecast(0)
+        self.assertEqual(fc.leader_trend, "unknown")
+        self.assertEqual(fc.challenger, "")
+
+
+class LeaderChange(unittest.TestCase):
+    def test_boot_leader_is_a_baseline_not_a_trade(self):
+        m, e = miner()
+        m.engine.api.board = [tick("AAAUSDT", 40)]
+        m.tick(now=1000)
+        self.assertEqual(m.leader, "AAAUSDT")
+        self.assertEqual(m.tracks, {})
+
+    def test_new_leader_opens_a_paper_position_and_says_so(self):
+        m, e = miner()
+        e.api.board = [tick("AAAUSDT", 40), tick("BBBUSDT", 20)]
+        m.tick(now=1000)
+        e.api.board = [tick("BBBUSDT", 45), tick("AAAUSDT", 40)]
+        m.tick(now=1030)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertTrue(any("NEW TOP GAINER: BBBUSDT" in b for b in bodies(e)))
+        self.assertTrue(any("PAPER OPENED BBBUSDT" in b for b in bodies(e)))
+        self.assertEqual(e.api.orders, [], "paper mode must send nothing")
+
+    def test_confirmation_ignores_a_one_poll_flicker(self):
+        m, e = miner(entry=dict(confirm_minutes=0.5))
+        e.api.board = [tick("AAAUSDT", 40), tick("BBBUSDT", 20)]
+        m.tick(now=1000)
+        e.api.board = [tick("BBBUSDT", 41), tick("AAAUSDT", 40)]
+        m.tick(now=1030)
+        e.api.board = [tick("AAAUSDT", 42), tick("BBBUSDT", 41)]
+        m.tick(now=1060)
+        self.assertEqual(m.tracks, {})
+
+    def test_old_gainer_kept_if_profitable_closed_if_not(self):
+        m, e = miner()
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("AAAUSDT", 40, 1.05),
+                       tick("CCCUSDT", 30, 0.99)]
+        m.cfg.entry.max_positions = 3
+        m.tick(now=1000)
+        self.assertIn("AAAUSDT", m.tracks)
+        self.assertNotIn("CCCUSDT", m.tracks)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertTrue(any("AAAUSDT KEPT" in b for b in bodies(e)))
+        self.assertTrue(any("PAPER CLOSED CCCUSDT" in b for b in bodies(e)))
+
+    def test_milestones_fire_once_each(self):
+        m, e = miner()
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.5, 2.0, 0, paper=True)
+        e.api.board = [tick("AAAUSDT", 40, 1.15)]
+        m.tick(now=1000)
+        m.tick(now=1030)
+        hits = [b for b in bodies(e) if "milestone" in b]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("$1 milestone", hits[0])
+
+    def test_paper_take_profit_closes(self):
+        m, e = miner()
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.9, 1.2, 0, paper=True)
+        e.api.board = [tick("AAAUSDT", 40, 1.25)]
+        m.tick(now=1000)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("take-profit hit" in b for b in bodies(e)))
+
+
+class LiveOrders(unittest.TestCase):
+    def test_filled_entry_gets_stop_and_take_profit(self):
+        m, e = miner(dry=False)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders[0]["type"], "MARKET")
+        kinds = [a["type"] for a in e.api.algo]
+        self.assertEqual(kinds, ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+        self.assertTrue(all(a["reduceOnly"] == "true" for a in e.api.algo))
+        pos = e.book["AAAUSDT"]
+        self.assertEqual(pos.strategy, "gainer")
+        self.assertTrue(pos.filled)
+
+    def test_manual_trade_symbol_is_never_bought(self):
+        m, e = miner(dry=False)
+        e.cfg.manual_trades.symbols = ["AAAUSDT"]
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders, [])
+        self.assertIn("manual trade", bodies(e)[-1])
+
+    def test_manual_trade_symbol_is_not_on_the_board(self):
+        m, e = miner()
+        e.cfg.manual_trades.symbols = ["AAAUSDT"]
+        m._tradable = set()
+        self.assertNotIn("AAAUSDT", m.tradable(1.0))
+
+    def test_failed_stop_flattens_the_position(self):
+        api = BoardAPI()
+        api.fail_algo = True
+        m, e = miner(dry=False, api=api)
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        closes = [o for o in api.orders if o.get("reduceOnly") == "true"]
+        self.assertEqual(len(closes), 1)
+        self.assertNotIn("AAAUSDT", e.book)
+        self.assertNotIn("AAAUSDT", m.tracks)
+
+    def test_halted_bot_does_not_open(self):
+        m, e = miner(dry=False)
+        e.state.halted = True
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders, [])
+
+    def test_leverage_ceiling_counts_the_whole_book(self):
+        m, e = miner(dry=False, entry=dict(notional_usdt=100.0))
+        e.equity = e.state.day_start_equity = 10.0
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertTrue(any("leverage ceiling" in b for b in bodies(e)))
+        self.assertEqual(e.api.orders, [])
+
+    def test_unprofitable_live_gainer_is_closed_through_the_engine(self):
+        m, e = miner(dry=False, entry=dict(max_positions=3))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("AAAUSDT", 40, 0.98)]
+        m.tick(now=1000)
+        self.assertIn("AAAUSDT", e.closed)
+        self.assertNotIn("AAAUSDT", m.tracks)
+
+    def test_supervisor_stands_aside_for_gainer_positions(self):
+        m, e = miner(dry=False)
+        m.open("AAAUSDT", 1.0, 40)
+        from bot.supervise import SuperviseConfig
+        e.cfg.supervise = SuperviseConfig(enabled=True)
+        e.held_bars = lambda s: (_ for _ in ()).throw(AssertionError("supervised"))
+        e.supervise_position(e.book["AAAUSDT"], 0.5)
+
+    def test_restore_remarks_adopted_positions(self):
+        m, e = miner(dry=False)
+        m.open("AAAUSDT", 1.0, 40)
+        e.book["AAAUSDT"].strategy = ""       # as adopt_open_positions leaves it
+        m2 = GainerMiner(e, m.cfg, path=m.path)
+        m2.restore()
+        self.assertEqual(e.book["AAAUSDT"].strategy, "gainer")
+        self.assertIn("AAAUSDT", m2.tracks)
+
+
+class Reentry(unittest.TestCase):
+    def stopped_out(self, **kw):
+        """Live AAAUSDT, still the leader, closed by its stop at 0.95; 24h high 1.3."""
+        m, e = miner(dry=False, **kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.book.pop("AAAUSDT")
+        e.api.filled_amt = 0.0
+        e.api.board = [tick("AAAUSDT", 40, 0.95, high=1.3)]
+        m.tick(now=1000)
+        return m, e
+
+    def test_stop_out_on_the_leader_arms_at_the_24h_high(self):
+        m, e = self.stopped_out()
+        self.assertEqual(m.tracks, {})
+        self.assertEqual(m.rearm, {"AAAUSDT": 1.3})
+        self.assertEqual(len(e.api.orders), 1, "no re-entry below the high")
+
+    def test_buys_again_above_the_high_once(self):
+        m, e = self.stopped_out()
+        e.api.board = [tick("AAAUSDT", 45, 1.25, high=1.3)]
+        m.tick(now=1030)
+        self.assertEqual(len(e.api.orders), 1)
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1060)
+        self.assertIn("AAAUSDT", m.tracks)
+        self.assertEqual(len(e.api.orders), 2)
+        self.assertEqual(m.rearm, {})
+        self.assertTrue(any("RE-ENTRY: AAAUSDT" in b for b in bodies(e)))
+
+    def test_refused_reentry_is_not_retried_every_poll(self):
+        m, e = self.stopped_out()
+        e.state.halted = True
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1030)
+        e.api.board = [tick("AAAUSDT", 55, 1.40, high=1.40)]
+        m.tick(now=1060)
+        self.assertEqual(sum("NOT opened" in b for b in bodies(e)), 1)
+        self.assertEqual(len(e.api.orders), 1)
+
+    def test_new_leader_clears_the_rearm(self):
+        m, e = self.stopped_out()
+        e.api.board = [tick("BBBUSDT", 60, 1.0), tick("AAAUSDT", 40, 1.4, high=1.4)]
+        m._tradable = set()         # the cached symbol list predates BBBUSDT
+        m.tick(now=1030)
+        self.assertNotIn("AAAUSDT", m.rearm)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertNotIn("AAAUSDT", m.tracks)
+
+    def test_disabled_does_not_arm(self):
+        m, e = self.stopped_out(entry=dict(reentry_on_new_high=False))
+        self.assertEqual(m.rearm, {})
+
+    def test_rearm_survives_a_restart(self):
+        m, e = self.stopped_out()
+        m2 = GainerMiner(e, m.cfg, path=m.path)
+        self.assertEqual(m2.rearm, {"AAAUSDT": 1.3})
+
+
+class SwapGuards(unittest.TestCase):
+    """Two fading coins trading first place must not be bought and sold in turn."""
+
+    def led_by_aaa(self, **kw):
+        m, e = miner(**kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    def test_a_new_leader_must_hold_first_place_for_confirm_minutes(self):
+        m, e = self.led_by_aaa(entry=dict(confirm_minutes=5))
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1000)
+        m.tick(now=1240)
+        self.assertEqual(m.leader, "AAAUSDT", "confirmed after 4 minutes")
+        m.tick(now=1300)
+        self.assertEqual(m.leader, "BBBUSDT")
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_a_fading_leader_is_watched_then_bought_when_it_rises(self):
+        m, e = self.led_by_aaa(entry=dict(buy_only_if_rising=True))
+        e.api.board = [tick("AAAUSDT", 60), tick("BBBUSDT", 50)]
+        m.tick(now=1000)
+        e.api.board = [tick("BBBUSDT", 45), tick("AAAUSDT", 40)]
+        m.tick(now=1100)
+        self.assertNotIn("BBBUSDT", m.tracks)
+        self.assertEqual(m.waiting, "BBBUSDT")
+        e.api.board = [tick("BBBUSDT", 49), tick("AAAUSDT", 38)]
+        m.tick(now=1200)
+        self.assertNotIn("BBBUSDT", m.tracks, "bought while still under its start")
+        e.api.board = [tick("BBBUSDT", 60), tick("AAAUSDT", 37)]
+        m.tick(now=1300)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertEqual(sum("not bought yet" in b for b in bodies(e)), 1,
+                         "the wait should be announced once, not every poll")
+
+    def test_unknown_trend_is_not_read_as_rising(self):
+        m, e = self.led_by_aaa(entry=dict(buy_only_if_rising=True))
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1000)
+        self.assertEqual(m.tracks, {})
+
+    def test_a_coin_sold_recently_is_not_bought_back(self):
+        m, e = self.led_by_aaa(entry=dict(rebuy_cooldown_minutes=60))
+        m.closed_at["BBBUSDT"] = 1000
+        e.api.board = [tick("BBBUSDT", 50), tick("AAAUSDT", 40)]
+        m.tick(now=1100)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("rebuy_cooldown_minutes" in b for b in bodies(e)))
+        m.tick(now=1000 + 3600 + 1)
+        self.assertIn("BBBUSDT", m.tracks, "not bought once the cooldown ran out")
+
+    def test_reentry_on_a_new_high_ignores_the_cooldown(self):
+        m, e = miner(dry=False, entry=dict(rebuy_cooldown_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.book.pop("AAAUSDT")
+        e.api.filled_amt = 0.0
+        e.api.board = [tick("AAAUSDT", 40, 0.95, high=1.3)]
+        m.tick(now=1000)
+        e.api.board = [tick("AAAUSDT", 50, 1.31, high=1.31)]
+        m.tick(now=1030)
+        self.assertIn("AAAUSDT", m.tracks)
+
+    def test_a_young_position_is_not_swapped_out(self):
+        m, e = self.led_by_aaa(exit=dict(min_hold_minutes=15))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 900, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.99)]
+        m.tick(now=1000)
+        self.assertIn("CCCUSDT", m.tracks)
+        self.assertTrue(any("CCCUSDT HELD" in b for b in bodies(e)))
+
+    def test_an_old_losing_position_is_still_swapped_out(self):
+        m, e = self.led_by_aaa(exit=dict(min_hold_minutes=15))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.99)]
+        m.tick(now=1000)
+        self.assertNotIn("CCCUSDT", m.tracks)
+        self.assertEqual(m.closed_at["CCCUSDT"], 1000)
+
+    def test_keep_never_sells_on_a_new_leader(self):
+        m, e = self.led_by_aaa(exit=dict(on_new_leader="keep"))
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        e.api.board = [tick("BBBUSDT", 50, 1.0), tick("CCCUSDT", 30, 0.97)]
+        m.tick(now=1000)
+        self.assertIn("CCCUSDT", m.tracks)
+
+    def test_an_unknown_on_new_leader_is_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(on_new_leader="sometimes"))
+
+    def test_an_unknown_key_in_a_group_names_the_group(self):
+        with self.assertRaises(TypeError) as ctx:
+            GainerConfig(entry=dict(confirm_polls=2))
+        self.assertIn("gainer.entry", str(ctx.exception))
+
+    def test_closes_survive_a_restart(self):
+        m, e = self.led_by_aaa()
+        m.tracks["CCCUSDT"] = Track("CCCUSDT", 1.0, 10, 0.95, 1.2, 0, paper=True)
+        m.close("CCCUSDT", 0.99, "test", now=1000)
+        m2 = GainerMiner(e, m.cfg, path=m.path)
+        self.assertEqual(m2.closed_at, {"CCCUSDT": 1000})
+
+    def test_the_2026_09_15_swap_loop_trades_each_coin_once(self):
+        """AAA and BBB swap #1 every 30s for 5 minutes, prices flat."""
+        m, e = miner(entry=dict(rebuy_cooldown_minutes=60))
+        e.api.board = [tick("AAAUSDT", 60), tick("BBBUSDT", 59)]
+        m.tick(now=0)                                   # baseline AAA
+        for i in range(1, 11):
+            first, second = ("BBBUSDT", "AAAUSDT") if i % 2 else ("AAAUSDT", "BBBUSDT")
+            e.api.board = [tick(first, 60 + i), tick(second, 59 + i)]
+            m.tick(now=30 * i)
+        opened = sum("OPENED" in b for b in bodies(e))
+        self.assertEqual(opened, 2, "without the cooldown this opened 10 times")
+
+
+LADDER = dict(exit=dict(ladder_enabled=True, target_usd=0, stop_pct=30,
+                        ladder_first_pct=10, ladder_step_pct=10))
+
+
+class Ladder(unittest.TestCase):
+    """exit.ladder_*: no take-profit, a wide stop, walked up as the coin runs."""
+
+    def held(self, dry=True, api=None, **kw):
+        m, e = miner(dry=dry, api=api, **{**LADDER, **kw})
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    def test_the_three_step_shapes(self):
+        self.assertIsNone(ladder_stop(1.0, 1.099, 10, 10))
+        self.assertAlmostEqual(ladder_stop(1.0, 1.10, 10, 10), 1.0)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.25, 10, 10), 1.10)
+        # first 10, step 20: entry until +40, then one 20% step below
+        self.assertAlmostEqual(ladder_stop(1.0, 1.39, 10, 20), 1.0)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.40, 10, 20), 1.20)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.65, 10, 20), 1.40)
+        # first 20, step 20: nothing until +20
+        self.assertIsNone(ladder_stop(1.0, 1.15, 20, 20))
+
+    def test_opens_with_a_stop_and_no_take_profit(self):
+        m, e = miner(dry=False, **LADDER)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual([a["type"] for a in e.api.algo], ["STOP_MARKET"])
+        pos = e.book["AAAUSDT"]
+        self.assertTrue(pos.no_target)
+        self.assertEqual(pos.take_profit, 0.0)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 0.70)
+
+    def test_without_the_ladder_a_zero_target_is_refused(self):
+        m, e = miner(dry=False, exit=dict(target_usd=0))
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders, [])
+
+    def test_paper_stop_walks_up_and_closes_in_profit(self):
+        m, e = self.held()
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        for i, px in enumerate((1.05, 1.12, 1.26)):
+            e.api.board = [tick("AAAUSDT", 40, px)]
+            m.tick(now=1000 + i)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 1.10)
+        e.api.board = [tick("AAAUSDT", 40, 1.09)]
+        m.tick(now=2000)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("ladder stop hit" in b for b in bodies(e)))
+
+    def test_no_take_profit_means_a_big_move_is_not_sold(self):
+        m, e = self.held()
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        e.api.board = [tick("AAAUSDT", 90, 3.0)]
+        m.tick(now=1000)
+        self.assertIn("AAAUSDT", m.tracks)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 2.9)
+
+    def test_live_stop_is_moved_on_the_exchange(self):
+        m, e = self.held(dry=False)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        moved = []
+        e.replace_protective = lambda pos, leg, level, qty=None: moved.append((leg, level)) or True
+        e.api.board = [tick("AAAUSDT", 45, 1.12)]
+        m.tick(now=time_now() + 60)
+        self.assertEqual(moved, [("stop", 1.0)])
+        self.assertAlmostEqual(e.book["AAAUSDT"].stop, 1.0)
+
+    def test_a_refused_move_keeps_the_old_stop_and_retries(self):
+        m, e = self.held(dry=False)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        e.replace_protective = lambda pos, leg, level, qty=None: False
+        e.api.board = [tick("AAAUSDT", 45, 1.12)]
+        m.tick(now=time_now() + 60)
+        self.assertAlmostEqual(m.tracks["AAAUSDT"].stop, 0.70)
+
+    def test_unarmed_time_limit_closes_a_drifting_coin(self):
+        m, e = self.held(exit=dict(**LADDER["exit"], unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.70, 0.0, 0, paper=True, peak=1.0)
+        e.api.board = [tick("AAAUSDT", 40, 0.95)]
+        m.tick(now=71 * 3600)
+        self.assertIn("AAAUSDT", m.tracks)
+        m.tick(now=72 * 3600)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("time limit" in b for b in bodies(e)))
+
+    def test_armed_positions_ignore_the_time_limit(self):
+        m, e = self.held(exit=dict(**LADDER["exit"], unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 1.0, 0.0, 0, paper=True, peak=1.15)
+        e.api.board = [tick("AAAUSDT", 40, 1.05)]
+        m.tick(now=500 * 3600)
+        self.assertIn("AAAUSDT", m.tracks)
+
+    def test_old_state_files_without_a_peak_still_load(self):
+        t = Track("AAAUSDT", 1.0, 10, 0.7, 0.0, 0)
+        self.assertEqual(t.peak, 0.0)
+
+
+class Sweep(unittest.TestCase):
+    """gainer.sweep: 25% of each winning trade to the Funding wallet."""
+
+    class LiveAPI(BoardAPI):
+        testnet = False
+
+        def __init__(self, fail=None, **kw):
+            super().__init__(**kw)
+            self.transfers = []
+            self.fail = fail
+
+        def universal_transfer(self, asset, amount, type_="UMFUTURE_FUNDING"):
+            if self.fail:
+                raise BinanceError(-1002, self.fail, "/sapi/v1/asset/transfer")
+            self.transfers.append((asset, amount, type_))
+            return {"tranId": 1}
+
+    def live(self, **kw):
+        api = self.LiveAPI(**kw)
+        return miner(dry=False, api=api, sweep=dict(enabled=True, pct=25, min_transfer_usdt=1.0))
+
+    def test_a_winning_trade_moves_a_quarter_of_its_profit(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [("USDT", "2.00", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.swept_total, 2.0)
+
+    def test_losses_move_nothing(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", -5.0)
+        m.sweep_profit("AAAUSDT", 0.0)
+        self.assertEqual(e.api.transfers, [])
+
+    def test_small_amounts_wait_until_they_reach_the_minimum(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 2.0)            # 0.50 pending
+        self.assertEqual(e.api.transfers, [])
+        m.sweep_profit("BBBUSDT", 2.4)            # 0.50 + 0.60 = 1.10
+        self.assertEqual(e.api.transfers, [("USDT", "1.10", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.sweep_pending, 0.0)
+
+    def test_a_failed_transfer_stays_pending_and_says_so_once(self):
+        m, e = self.live(fail="This API key has no permission")
+        m.sweep_profit("AAAUSDT", 8.0)
+        m.sweep_profit("BBBUSDT", 4.0)
+        self.assertAlmostEqual(m.sweep_pending, 3.0)
+        self.assertEqual(m.swept_total, 0.0)
+        self.assertEqual(sum("SWEEP FAILED" in b for b in bodies(e)), 1)
+
+    def test_testnet_simulates_and_sends_nothing(self):
+        api = self.LiveAPI()
+        api.testnet = True
+        m, e = miner(dry=False, api=api, sweep=dict(enabled=True))
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(api.transfers, [])
+        self.assertAlmostEqual(m.swept_total, 2.0)
+        self.assertTrue(any("nothing sent" in b for b in bodies(e)))
+
+    def test_off_by_default(self):
+        m, e = miner(dry=False, api=self.LiveAPI())
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [])
+
+    def test_totals_survive_a_restart(self):
+        m, e = self.live()
+        m.sweep_profit("AAAUSDT", 8.0)
+        m.sweep_profit("BBBUSDT", 1.0)
+        again = GainerMiner(e, m.cfg, path=m.path)
+        self.assertAlmostEqual(again.swept_total, 2.0)
+        self.assertAlmostEqual(again.sweep_pending, 0.25)
+
+    def test_the_engine_sweeps_only_gainer_closes(self):
+        m, e = self.live()
+        from bot.positions import ActivePosition
+        pos = ActivePosition(symbol="AAAUSDT", side="BUY", entry=1.0, stop=0.7,
+                             take_profit=0.0, qty=10, entry_order_id="g-1")
+        e.sweep_gainer_profit(pos, 8.0)
+        self.assertEqual(e.api.transfers, [])
+        pos.strategy = "gainer"
+        e.sweep_gainer_profit(pos, 8.0)
+        self.assertEqual(len(e.api.transfers), 1)
+
+
+class Principal(unittest.TestCase):
+    """sweep.principal_*: deposits out at 2.5x; money waiting to move is not traded."""
+
+    class API(Sweep.LiveAPI):
+        def __init__(self, deposits=(), **kw):
+            super().__init__(**kw)
+            self.rows = [{"incomeType": "TRANSFER", "asset": "USDT", "income": str(d),
+                          "time": 1000 + i, "tranId": i} for i, d in enumerate(deposits)]
+
+        def income(self, income_type=None, start_ms=None, limit=100):
+            return list(self.rows)
+
+    def make(self, equity, deposits=(100.0,), fail=None, **sweep):
+        api = self.API(deposits=deposits, fail=fail)
+        cfg = dict(enabled=True, pct=25, principal_enabled=True,
+                   deposits_since="2026-09-25")
+        cfg.update(sweep)
+        m, e = miner(dry=False, api=api, sweep=cfg)
+        e.equity = equity
+        return m, e
+
+    def test_deposits_count_only_money_coming_in(self):
+        m, e = self.make(100, deposits=(100.0, 50.0, -25.0))
+        self.assertAlmostEqual(m.deposits(), 150.0)
+
+    def test_below_two_and_a_half_times_nothing_moves(self):
+        m, e = self.make(249.0)
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [])
+
+    def test_at_two_and_a_half_times_the_deposits_move_out(self):
+        m, e = self.make(250.0)
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [("USDT", "100.00", "UMFUTURE_FUNDING")])
+        self.assertAlmostEqual(m.principal_withdrawn, 100.0)
+        self.assertTrue(any("PRINCIPAL SAFE" in b for b in bodies(e)))
+
+    def test_deposits_already_moved_out_are_not_moved_twice(self):
+        m, e = self.make(250.0)
+        m.check_principal()
+        e.equity = 400.0
+        m.check_principal()
+        self.assertEqual(len(e.api.transfers), 1)
+
+    def test_a_later_deposit_moves_out_at_the_next_trigger(self):
+        m, e = self.make(250.0)
+        m.check_principal()                              # 100 out
+        e.api.rows.append({"incomeType": "TRANSFER", "asset": "USDT",
+                           "income": "50", "time": 5000, "tranId": 9})
+        e.equity = 374.0                                 # 2.5 x 150 = 375
+        m.check_principal()
+        self.assertEqual(len(e.api.transfers), 1)
+        e.equity = 375.0
+        m.check_principal()
+        self.assertEqual(e.api.transfers[-1][1], "50.00")
+
+    def test_a_failed_move_is_set_aside_and_not_traded(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        self.assertAlmostEqual(m.principal_pending, 100.0)
+        self.assertAlmostEqual(m.reserved_usdt, 100.0)
+        e.effective_equity = lambda actual: actual
+        self.assertAlmostEqual(e.sizing_equity(250.0), 150.0)
+
+    def test_a_failed_profit_sweep_is_also_set_aside(self):
+        m, e = self.make(50.0, fail="no permission")
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertAlmostEqual(m.reserved_usdt, 2.0)
+        e.effective_equity = lambda actual: actual
+        self.assertAlmostEqual(e.sizing_equity(50.0), 48.0)
+
+    def test_the_set_aside_money_moves_on_the_retry(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        e.api.fail = None
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [("USDT", "100.00", "UMFUTURE_FUNDING")])
+        self.assertEqual(m.reserved_usdt, 0.0)
+        self.assertAlmostEqual(m.principal_withdrawn, 100.0)
+
+    def test_without_a_start_date_it_stays_idle_and_says_so_once(self):
+        m, e = self.make(1000.0, deposits_since="")
+        m.check_principal()
+        m.check_principal()
+        self.assertEqual(e.api.transfers, [])
+        self.assertEqual(sum("deposits_since" in b for b in bodies(e)), 1)
+
+    def test_state_survives_a_restart(self):
+        m, e = self.make(250.0, fail="no permission")
+        m.check_principal()
+        again = GainerMiner(e, m.cfg, path=m.path)
+        self.assertAlmostEqual(again.principal_pending, 100.0)
+
+
+class FastestClimber(unittest.TestCase):
+    """board.rank_by climb: the leader is the coin rising fastest now."""
+
+    def rows(self, **px):
+        return [Row(s, pct, price, 50e6) for s, (pct, price) in px.items()]
+
+    def test_ranks_by_the_rise_over_the_window_not_the_24h_change(self):
+        hist = {"OLDUSDT": [(0, 1.00, 50e6)], "NEWUSDT": [(0, 1.00, 50e6)]}
+        rows = self.rows(OLDUSDT=(90.0, 1.02), NEWUSDT=(15.0, 1.12))
+        got = rank_by_climb(rows, hist, 3600, 60)
+        self.assertEqual([r.symbol for r in got], ["NEWUSDT", "OLDUSDT"])
+        self.assertAlmostEqual(got[0].climb_pct, 12.0)
+
+    def test_a_coin_without_enough_history_is_left_out(self):
+        hist = {"AAAUSDT": [(1800, 1.0, 50e6)]}
+        self.assertEqual(rank_by_climb(self.rows(AAAUSDT=(10, 1.5)), hist, 3600, 60), [])
+
+    def test_the_price_at_the_window_start_is_the_base(self):
+        hist = {"AAAUSDT": [(0, 1.0, 50e6), (1000, 1.1, 50e6), (3000, 1.4, 50e6)]}
+        got = rank_by_climb(self.rows(AAAUSDT=(10, 1.5)), hist, 4700, 60)   # window starts at 1100
+        self.assertAlmostEqual(got[0].climb_pct, (1.5 / 1.1 - 1) * 100)
+
+    def test_volume_surge_filter(self):
+        # 24h volume grew from 48M to 50M in an hour: ~4M traded vs a ~2.1M average
+        hist = {"HOTUSDT": [(0, 1.0, 48e6)], "COLDUSDT": [(0, 1.0, 50e6)]}
+        rows = [Row("HOTUSDT", 5, 1.05, 50e6), Row("COLDUSDT", 5, 1.10, 50e6)]
+        got = rank_by_climb(rows, hist, 3600, 60, surge_x=1.5)
+        self.assertEqual([r.symbol for r in got], ["HOTUSDT"])
+
+    def test_warm_up_picks_no_leader_but_stops_still_run(self):
+        m, e = miner(board=dict(rank_by="climb", climb_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.9, 1.2, 0, paper=True)
+        e.api.board = [tick("AAAUSDT", 40, 0.85), tick("BBBUSDT", 60, 1.0)]
+        m.tick(now=1000)
+        self.assertEqual(m.tracks, {})                 # the stop still closed it
+        self.assertNotIn("BBBUSDT", m.tracks)          # nobody picked yet
+
+    def test_after_the_window_the_fastest_climber_is_bought(self):
+        m, e = miner(board=dict(rank_by="climb", climb_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        e.api.board = [tick("AAAUSDT", 90, 1.0), tick("BBBUSDT", 10, 1.0)]
+        m.tick(now=1000)
+        e.api.board = [tick("AAAUSDT", 91, 1.01), tick("BBBUSDT", 25, 1.15)]
+        m.tick(now=1000 + 3700)
+        self.assertIn("BBBUSDT", m.tracks)
+        self.assertTrue(any("climbing +15.00% in 60 min" in b for b in bodies(e)))
+
+    def test_bad_rank_by_is_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(board=dict(rank_by="fastest"))
+
+
+class HourlyLeaderCheck(unittest.TestCase):
+    """board.leader_check_minutes: pick leaders hourly, protect every poll."""
+
+    HOUR = 1790208000.0                      # a round hour, UTC
+
+    def test_a_new_leader_is_bought_only_at_the_top_of_the_hour(self):
+        m, e = miner(board=dict(leader_check_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        e.api.board = [tick("AAAUSDT", 40, 1.0), tick("BBBUSDT", 30, 1.0)]
+        m.tick(now=self.HOUR + 30)                     # first poll of the hour
+        e.api.board = [tick("BBBUSDT", 60, 1.0), tick("AAAUSDT", 40, 1.0)]
+        m.tick(now=self.HOUR + 600)                    # same hour: not checked
+        self.assertNotIn("BBBUSDT", m.tracks)
+        m.tick(now=self.HOUR + 3600 + 30)              # next hour
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_stops_still_run_between_checks(self):
+        m, e = miner(board=dict(leader_check_minutes=60))
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.9, 1.2, 0, paper=True)
+        m.tick(now=self.HOUR + 30)
+        e.api.board = [tick("AAAUSDT", 40, 0.85)]
+        m.tick(now=self.HOUR + 900)
+        self.assertEqual(m.tracks, {})
+
+    def test_zero_checks_every_poll(self):
+        m, e = miner()
+        self.assertTrue(m.leader_due(self.HOUR))
+        self.assertTrue(m.leader_due(self.HOUR + 1))
+
+
+class TakeProfitAtDouble(unittest.TestCase):
+    """exit.target_pct: bank a run that doubles, alongside the ladder."""
+
+    CFG = dict(exit=dict(ladder_enabled=True, target_usd=0, target_pct=100, stop_pct=30,
+                         ladder_first_pct=10, ladder_step_pct=20))
+
+    def test_live_entry_gets_a_take_profit_at_double(self):
+        m, e = miner(dry=False, **self.CFG)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        kinds = {a["type"]: a["triggerPrice"] for a in e.api.algo}
+        self.assertEqual(set(kinds), {"STOP_MARKET", "TAKE_PROFIT_MARKET"})
+        self.assertEqual(kinds["TAKE_PROFIT_MARKET"], "2.000000")
+        self.assertFalse(e.book["AAAUSDT"].no_target)
+
+    def test_paper_take_profit_banks_the_double(self):
+        m, e = miner(**self.CFG)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.api.board = [tick("AAAUSDT", 150, 2.05)]
+        m.tick(now=time_now() + 60)
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("take-profit hit" in b for b in bodies(e)))
+
+    def test_ladder_still_walks_below_the_target(self):
+        m, e = miner(**self.CFG)
+        m._baselined, m.leader = True, "AAAUSDT"
+        m.open("AAAUSDT", 1.0, 40)
+        e.api.board = [tick("AAAUSDT", 80, 1.45)]
+        m.tick(now=time_now() + 60)
+        t = m.tracks["AAAUSDT"]
+        self.assertAlmostEqual(t.stop, 1.20)
+        self.assertAlmostEqual(t.take_profit, 2.0)
+
+
+class PercentSizing(unittest.TestCase):
+    """entry.notional_pct_of_equity: each trade is a share of the equity."""
+
+    def test_trade_is_a_share_of_equity(self):
+        m, e = miner(dry=False, entry=dict(notional_pct_of_equity=10, max_positions=5))
+        e.equity = 200.0
+        self.assertAlmostEqual(m.trade_notional(), 20.0)
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        self.assertEqual(e.api.orders[0]["quantity"], "21")    # Rules rounds 20/1.0 up
+
+    def test_it_grows_and_shrinks_with_equity(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10))
+        e.equity = 500.0
+        self.assertAlmostEqual(m.trade_notional(), 50.0)
+        e.equity = 80.0
+        self.assertAlmostEqual(m.trade_notional(), 8.0)
+
+    def test_money_set_aside_for_funding_is_not_sized_on(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10),
+                     sweep=dict(enabled=True, min_transfer_usdt=1.0))
+        m.sweep_pending = 30.0                  # a failed transfer, waiting
+        e.effective_equity = lambda actual: actual
+        e.equity = e.sizing_equity(130.0)
+        self.assertAlmostEqual(m.trade_notional(), 10.0)
+
+    def test_under_the_exchange_minimum_it_skips_and_says_so(self):
+        class Tiny(Rules):
+            def size_for_notional(self, notional, price):
+                return None
+        m, e = miner(dry=False, entry=dict(notional_pct_of_equity=10))
+        e.rules_for = lambda s: Tiny()
+        e.equity = 40.0
+        self.assertFalse(m.open("AAAUSDT", 1.0, 40))
+        self.assertTrue(any("$4.00 is under the cheapest legal" in b for b in bodies(e)))
+
+    def test_a_small_account_trades_at_the_minimum(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10, min_notional_usdt=6.0))
+        e.equity = 50.0
+        self.assertAlmostEqual(m.trade_notional(), 6.0)      # 10% would be 5.00
+        e.equity = 300.0
+        self.assertAlmostEqual(m.trade_notional(), 30.0)     # the percentage takes over
+
+    def test_zero_equity_still_sizes_nothing(self):
+        m, e = miner(entry=dict(notional_pct_of_equity=10, min_notional_usdt=6.0))
+        e.equity = 0.0
+        self.assertEqual(m.trade_notional(), 0.0)
+
+    def test_zero_keeps_the_fixed_amount(self):
+        m, e = miner(entry=dict(notional_usdt=6.0))
+        e.equity = 1000.0
+        self.assertAlmostEqual(m.trade_notional(), 6.0)
+
+
+def time_now():
+    import time
+    return time.time()
+
+
+class Config(unittest.TestCase):
+    def test_config_yaml_loads_the_gainer_section(self):
+        from bot.config import Config as C
+        cfg = C.load(ROOT / "config.yaml")
+        g = cfg.gainer
+        self.assertIsInstance(g, GainerConfig)
+        # Every trade needs a way out: a take-profit, or the ladder.
+        self.assertTrue(g.exit.target_usd > 0 or g.exit.ladder_enabled)
+        self.assertGreater(g.exit.stop_pct, 0.0)
+        # And a size: a fixed amount over the $5 minimum, or a share of equity.
+        self.assertTrue(g.entry.notional_pct_of_equity > 0 or g.entry.notional_usdt > 5.0)
+        self.assertIn(g.exit.on_new_leader, ("close_if_losing", "keep"))
+
+    def test_event_exists(self):
+        self.assertEqual(Event.GAINER.value, "gainer mining")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+def kl(closes, high_pad=0.0):
+    """Fake klines rows [t, o, h, l, c, v] from closes, plus one forming bar."""
+    rows = [[i, c, c * (1 + high_pad), c * (1 - high_pad), c, 1] for i, c in enumerate(closes)]
+    return rows + [[len(closes), closes[-1], closes[-1], closes[-1], closes[-1], 1]]
+
+
+class TraderSettings(unittest.TestCase):
+    """gainer.filters / sizing / limits and the new exit options. All off by default."""
+
+    def lead(self, sym="BBBUSDT", price=1.0):
+        return Row(sym, 40.0, price, 50e6)
+
+    def fresh(self, **kw):
+        m, e = miner(**kw)
+        m._baselined, m.leader = True, "AAAUSDT"
+        return m, e
+
+    # ---- filters
+    def test_filters_are_off_by_default(self):
+        m, e = self.fresh()
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_min_price(self):
+        m, e = self.fresh(filters=dict(min_price=0.01))
+        m.on_new_leader(self.lead(price=0.001), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("SKIPPED" in b and "price" in b for b in bodies(e)))
+
+    def test_new_listing_is_skipped(self):
+        m, e = self.fresh(filters=dict(min_listing_age_days=3))
+        now = 10 * 86400
+        m._onboard["BBBUSDT"] = (now - 86400) * 1000            # listed 1 day ago
+        m.on_new_leader(self.lead(), "AAAUSDT", now, {})
+        self.assertEqual(m.tracks, {})
+        m._onboard["BBBUSDT"] = (now - 5 * 86400) * 1000
+        m.on_new_leader(self.lead(), "AAAUSDT", now, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_btc_falling_24h_is_skipped(self):
+        m, e = self.fresh(filters=dict(btc_min_change_24h_pct=-2))
+        m._btc_24h = -3.5
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+
+    def test_btc_crash_in_the_last_hour_is_skipped(self):
+        m, e = self.fresh(filters=dict(btc_max_drop_1h_pct=1.5))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([100] + [97] * 11)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+
+    def test_vertical_pump_is_skipped(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        # +40% on the day, from 0.75 four hours ago to 1.0 now: 86% in 4h
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([0.75] + [0.9] * 48)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("vertical pump" in b for b in bodies(e)))
+
+    def test_steady_climber_is_bought(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        # +40% on the day, only 0.95 -> 1.0 in the last 4h: 15%
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([0.95] + [0.97] * 48)
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_vertical_pump_check_without_bars_lets_it_through(self):
+        m, e = self.fresh(filters=dict(max_rise_share_4h=0.8))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: []
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertIn("BBBUSDT", m.tracks)
+
+    def test_overbought_rsi_is_skipped(self):
+        m, e = self.fresh(filters=dict(max_rsi_1h=85))
+        e.api.klines = lambda symbol, interval, limit=200, end_ms=None: kl([1 + i * 0.01 for i in range(15)])
+        m.on_new_leader(self.lead(), "AAAUSDT", 1000, {})
+        self.assertEqual(m.tracks, {})
+        self.assertTrue(any("RSI 100" in b for b in bodies(e)))
+
+    # ---- limits
+    def test_max_new_trades_per_day(self):
+        m, e = self.fresh(limits=dict(max_new_trades_per_day=1))
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertFalse(m.open("CCCUSDT", 1.0, 40))
+
+    def test_pause_after_losses(self):
+        m, e = self.fresh(limits=dict(pause_after_losses=2, pause_hours=24))
+        now = time_now()
+        m.note_close(-1.0, now)
+        m.note_close(-1.0, now)
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+        self.assertTrue(any("PAUSED" in b for b in bodies(e)))
+
+    def test_a_win_resets_the_losing_streak(self):
+        m, e = self.fresh(limits=dict(pause_after_losses=2))
+        m.note_close(-1.0); m.note_close(+1.0); m.note_close(-1.0)
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+
+    def test_max_exposure(self):
+        m, e = self.fresh(entry=dict(notional_usdt=6.0), limits=dict(max_exposure_pct=20))
+        e.equity = 50.0                                          # cap $10
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertFalse(m.open("CCCUSDT", 1.0, 40))
+
+    def test_daily_loss_limit(self):
+        m, e = self.fresh(limits=dict(daily_loss_limit_pct=5))
+        e.state.day_start_equity = 50.0
+        m.note_close(-3.0)                                       # 6% of 50
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+
+    def test_drawdown_pause(self):
+        m, e = self.fresh(limits=dict(drawdown_pause_pct=30))
+        m.peak_equity = 100.0
+        e.equity = 60.0
+        self.assertFalse(m.open("BBBUSDT", 1.0, 40))
+        e.equity = 80.0
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+
+    # ---- sizing
+    def test_volatility_sizing(self):
+        m, e = self.fresh(entry=dict(notional_pct_of_equity=10),
+                          sizing=dict(mode="volatility", volatility_target_atr_pct=3, min_pct=5, max_pct=15))
+        e.equity = 100.0
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 6.0})      # twice the target
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 5.0)             # 10% x 3/6 = 5%
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 1.0})
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 15.0)            # capped at 15%
+
+    def test_conviction_sizing(self):
+        m, e = self.fresh(entry=dict(notional_pct_of_equity=10), sizing=dict(mode="conviction"))
+        e.equity = 100.0
+        m._btc_24h = 1.0
+        m._onboard["BBBUSDT"] = 1.0                                          # listed long ago
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 60, "atr": 3.0})
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 15.0)
+        m._btc_24h = -5.0
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 7.5)
+
+    # ---- exits
+    def test_atr_stop(self):
+        m, e = self.fresh(exit=dict(stop_mode="atr", atr_stop_mult=3, atr_stop_min_pct=10, atr_stop_max_pct=40))
+        m._features["BBBUSDT"] = (time_now(), {"rsi": 50, "atr": 5.0})
+        self.assertTrue(m.open("BBBUSDT", 1.0, 40))
+        self.assertAlmostEqual(m.tracks["BBBUSDT"].stop, 0.85)             # 15% below
+
+    def test_trail_ladder_keeps_its_distance(self):
+        self.assertIsNone(ladder_stop(1.0, 1.04, 5, 5, mode="trail", init_stop=0.7))
+        self.assertAlmostEqual(ladder_stop(1.0, 1.05, 5, 5, mode="trail", init_stop=0.7), 0.75)
+        self.assertAlmostEqual(ladder_stop(1.0, 1.23, 5, 5, mode="trail", init_stop=0.7), 0.90)
+
+    def test_time_limit_applies_until_the_stop_reaches_entry(self):
+        m, e = self.fresh(exit=dict(ladder_enabled=True, target_usd=0, stop_pct=30, ladder_mode="trail",
+                                    ladder_first_pct=5, ladder_step_pct=5, unarmed_max_hours=72))
+        m.tracks["AAAUSDT"] = Track("AAAUSDT", 1.0, 10, 0.75, 0.0, 0, paper=True, peak=1.05, init_stop=0.7)
+        e.api.board = [tick("AAAUSDT", 40, 1.02)]
+        m.tick(now=73 * 3600)
+        self.assertEqual(m.tracks, {})                    # trailed, still below entry, timed out
+
+    def test_paper_partial_take_profit(self):
+        m, e = self.fresh(exit=dict(partial_take_pct=50, partial_fraction=0.5, target_usd=0,
+                                    ladder_enabled=True, ladder_first_pct=90, ladder_step_pct=90))
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        q = m.tracks["AAAUSDT"].qty
+        e.api.board = [tick("AAAUSDT", 60, 1.55)]
+        m.tick(now=time_now() + 60)
+        t = m.tracks.get("AAAUSDT")
+        self.assertIsNotNone(t)
+        self.assertTrue(t.partial_done)
+        self.assertAlmostEqual(t.qty, q / 2)
+
+    def test_live_partial_take_profit_order_is_placed(self):
+        m, e = miner(dry=False, exit=dict(partial_take_pct=50, partial_fraction=0.5))
+        self.assertTrue(m.open("AAAUSDT", 1.0, 40))
+        parts = [a for a in e.api.algo if a["clientAlgoId"].startswith("p")]
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0]["triggerPrice"], "1.500000")
+
+    # ---- money
+    def test_income_waits_for_the_equity_threshold(self):
+        m, e = miner(dry=False, api=Sweep.LiveAPI(),
+                     sweep=dict(enabled=True, pct=25, start_when_equity_usdt=300))
+        e.equity = 120.0
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(e.api.transfers, [])
+        e.equity = 320.0
+        m.sweep_profit("AAAUSDT", 8.0)
+        self.assertEqual(len(e.api.transfers), 1)
+
+    def test_bad_modes_are_refused(self):
+        with self.assertRaises(ValueError):
+            GainerConfig(sizing=dict(mode="bold"))
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(ladder_mode="zigzag"))
+        with self.assertRaises(ValueError):
+            GainerConfig(exit=dict(stop_mode="gut"))

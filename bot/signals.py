@@ -62,6 +62,16 @@ class SignalChannel:
 
     # ------------------------------------------------------------ formats
     @staticmethod
+    def _px(value: float) -> str:
+        """
+        Price at the precision it deserves: a $90,000 coin does not need six
+        decimals and a $0.0000042 one is destroyed by two.
+        """
+        av = abs(value)
+        dp = 2 if av >= 100 else 4 if av >= 1 else 6 if av >= 0.01 else 8
+        return f"{value:,.{dp}f}".rstrip("0").rstrip(".") if dp > 2 else f"{value:,.2f}"
+
+    @staticmethod
     def _mode_banner(mode: str, dry_run: bool) -> str:
         if dry_run:
             return "PAPER / DRY RUN -- no real order was placed"
@@ -69,23 +79,34 @@ class SignalChannel:
             return "TESTNET -- simulated funds, not a live position"
         return "LIVE"
 
+    def _header(self, mode: str, dry_run: bool) -> str:
+        """
+        Mode goes FIRST, above the prices -- see the module docstring. A reader
+        skimming a signal acts on the top of it, so a paper trade has to
+        announce itself before the numbers, not under them.
+        """
+        return f"{self._mode_banner(mode, dry_run)}\n\n"
+
     def entry(self, symbol: str, side: str, entry: float, stop: float,
               take_profit: float, mode: str, dry_run: bool,
               reason: str = "") -> None:
-        rr = ""
+        pair = symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
         risk = abs(entry - stop)
         reward = abs(take_profit - entry)
+        s_pct = (stop / entry - 1) * 100 if entry else 0.0
+        t_pct = (take_profit / entry - 1) * 100 if entry else 0.0
+
+        lines = [f"{pair}  |  {side.upper()}", ""]
+        lines.append(f"Entry     {self._px(entry)}")
+        lines.append(f"Stop      {self._px(stop)}   ({s_pct:+.1f}%)")
+        lines.append(f"Target    {self._px(take_profit)}   ({t_pct:+.1f}%)")
         if risk > 0 and reward > 0:
-            rr = f"\nRisk/reward   1:{reward / risk:.1f}"
-        self.send(
-            f"{self._mode_banner(mode, dry_run)}\n"
-            f"\n{side} {symbol}\n"
-            f"\nEntry         {entry:,.6f}".rstrip("0").rstrip(".")
-            + f"\nStop loss     {stop:,.6f}".rstrip("0").rstrip(".")
-            + f"\nTake profit   {take_profit:,.6f}".rstrip("0").rstrip(".")
-            + rr
-            + (f"\n\nSetup: {reason}" if reason else "")
-            + f"\n\n{self.disclaimer}")
+            lines.append(f"R:R       1:{reward / risk:.1f}")
+        if reason:
+            lines += ["", f"Setup: {reason}"]
+        self.send(self._header(mode, dry_run)
+                  + "\n".join(lines)
+                  + f"\n\n{self.disclaimer}")
 
     def closed(self, symbol: str, exit_price: float, pnl_pct: float,
                outcome: str, mode: str, dry_run: bool) -> None:
@@ -93,9 +114,11 @@ class SignalChannel:
         Percentage only -- never the dollar amount, which would leak position
         size and therefore the account.
         """
-        self.send(
-            f"{self._mode_banner(mode, dry_run)}\n"
-            f"\n{symbol} closed -- {outcome}\n"
-            f"\nExit          {exit_price:,.6f}".rstrip("0").rstrip(".")
-            + f"\nResult        {pnl_pct:+.2f}%"
-            + f"\n\n{self.disclaimer}")
+        pair = symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
+        lines = [f"{pair}  |  CLOSED", "",
+                 f"Exit      {self._px(exit_price)}",
+                 f"Result    {pnl_pct:+.2f}%",
+                 f"Reason    {outcome}"]
+        self.send(self._header(mode, dry_run)
+                  + "\n".join(lines)
+                  + f"\n\n{self.disclaimer}")

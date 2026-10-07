@@ -67,6 +67,28 @@ CONTROL  (each asks for confirmation)
 /halt                 stop opening new trades
 /resume               clear a halt
 
+SETTINGS  (written to config.yaml, applied on restart)
+/set                  every setting you can change, and its value
+/set <key>            one setting: value, range, what it does
+/set <key> <value>    change it
+/aggressive           aggressive mode and profile
+/aggressive on|off    turn it on or off
+/aggressive <profile> moderate | high | maximum
+/supervisor           every supervisor ability and whether it is on
+/supervisor on|off    turn the whole supervisor on or off
+/supervisor <name> on|off  one ability: breakeven, runner, horizon,
+                      cutlosers, bankturn, harvest, breakout, patience,
+                      trendfilter, review
+/supervisor report <minutes>  position report interval (0 = off)
+/supervisor cooldown <minutes>  stay off a coin after it closes (0 = off)
+/gainer               gainer mining settings and their values
+/gainer <name> <value> change one: size, confirm, rising, minrise,
+                      cooldown, target, onleader, hold
+
+PROCESS
+/restart              restart the bot, applying config.yaml
+/stop                 stop the bot  (CANNOT be undone from Telegram)
+
 Every message shows the active mode and strategy on its second line."""
 
 
@@ -208,6 +230,7 @@ class TelegramControl:
         parts = text.split()
         cmd = parts[0].lower().split("@")[0]
         arg = parts[1].lower() if len(parts) > 1 else ""
+        rest = parts[2:]
         handlers = {
             "/start": lambda: self.send(HELP),
             "/help": lambda: self.send(HELP),
@@ -222,6 +245,14 @@ class TelegramControl:
                                         value=arg.upper()),
             "/halt": lambda: self._ask("halt", "Stop opening new trades?"),
             "/resume": lambda: self._ask("resume", "Clear the halt and resume trading?"),
+            "/set": lambda: self._set(arg, rest),
+            "/aggressive": lambda: self._aggressive(arg),
+            "/supervisor": lambda: self._supervisor(arg, rest),
+            "/gainer": lambda: self._gainer(arg, rest),
+            "/restart": lambda: self._ask(
+                "restart", "Restart the bot?"),
+            "/stop": lambda: self._ask(
+                "stop", "Stop the bot?"),
         }
         handler = handlers.get(cmd)
         if handler is None:
@@ -244,8 +275,9 @@ class TelegramControl:
             # "LIGHTUSDT entry 0.1969 now 0.0860" was DOGEUSDT's price.
             px = p.get("price") or 0.0
             now = f"{px:,.4f}" if px else "waiting for first tick"
+            tag = f"  [{p['strategy']}]" if p.get("strategy") else ""
             lines.append(
-                f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}"
+                f"\n{p.get('symbol', s.get('symbol','?'))}  {p['side']} {p['qty']:g}{tag}"
                 f"\n  entry {p['entry']:,.4f}  now {now}"
                 f"\n  unrealised {p['unrealized']:+.2f}"
                 f"\n  TP {p['to_tp']*100:.0f}%  SL {p['to_sl']*100:.0f}%")
@@ -266,6 +298,182 @@ class TelegramControl:
         lines = [s.get("mode_line", ""), ""]
         lines += [f"{k:<22}{v}" for k, v in cfg.items()]
         self.send("\n".join(lines))
+
+    # -------------------------------------------------------------- settings
+    def _fmt_current(self, key: str):
+        """What the running bot currently holds for `key`, or '?' if unknown."""
+        current = (self.read().get("editable") or {})
+        if key not in current:
+            return "?"
+        value = current[key]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return value
+
+    def _set(self, key: str, rest: list[str]) -> None:
+        """
+        `/set` lists, `/set <key>` explains, `/set <key> <value>` changes.
+
+        Validation happens here so a bad value is refused instantly instead of
+        making a round trip through a confirmation button and the engine queue.
+        The registry is pure data -- no exchange call -- so this thread may
+        read it, in keeping with the rule that control surfaces never trade.
+        """
+        from .settings import EDITABLE, parse_value
+
+        if not key:
+            lines = [self.read().get("mode_line", ""), "",
+                     "Editable settings (send /set <key> <value>):", ""]
+            for k in EDITABLE:
+                lines.append(f"{k}\n    {self._fmt_current(k)}")
+            lines += ["", "Changes are written to config.yaml and applied by "
+                          "/restart.", "",
+                      "mode, dry_run and the API keys are deliberately not "
+                      "editable from here -- arming the bot for real money "
+                      "needs a shell."]
+            self.send("\n".join(lines))
+            return
+
+        setting = EDITABLE.get(key)
+        if setting is None:
+            near = [k for k in EDITABLE if key in k]
+            hint = ("\n\nDid you mean:\n  " + "\n  ".join(near)) if near else \
+                   "\n\nSend /set for the full list."
+            self.send(f"{key!r} is not an editable setting.{hint}")
+            return
+
+        if not rest:
+            self.send(f"{setting.key}\n\n"
+                      f"now      {self._fmt_current(setting.key)}\n"
+                      f"allowed  {setting.describe_range()}\n\n"
+                      f"{setting.note}\n\n"
+                      f"Change it with:\n/set {setting.key} <value>")
+            return
+
+        try:
+            value = parse_value(setting, rest[0])
+        except ValueError as e:
+            self.send(f"Refused: {e}")
+            return
+
+        self._ask("set", f"Change {setting.key}?", value=f"{setting.key}={value}")
+
+    def _aggressive(self, arg: str) -> None:
+        """A shorthand over /set for the two keys that get changed most."""
+        from .settings import EDITABLE, parse_value
+
+        if not arg:
+            self.send(f"{self.read().get('mode_line', '')}\n\n"
+                      f"aggressive.enabled   {self._fmt_current('aggressive.enabled')}\n"
+                      f"aggressive.profile   {self._fmt_current('aggressive.profile')}\n\n"
+                      f"/aggressive on | off\n"
+                      f"/aggressive moderate | high | maximum\n\n"
+                      f"Written to config.yaml; /restart applies it.")
+            return
+
+        profiles = EDITABLE["aggressive.profile"].choices
+        if arg in profiles:
+            key = "aggressive.profile"
+        elif arg in ("on", "off", "true", "false", "yes", "no", "1", "0"):
+            key = "aggressive.enabled"
+        else:
+            self.send(f"{arg!r} is neither on/off nor a profile "
+                      f"({' | '.join(profiles)}).")
+            return
+
+        try:
+            value = parse_value(EDITABLE[key], arg)
+        except ValueError as e:
+            self.send(f"Refused: {e}")
+            return
+        self._ask("set", f"Change {key}?", value=f"{key}={value}")
+
+    #: /supervisor's short names, in the order the rules run.
+    SUPERVISOR_KEYS = {
+        "breakeven": "supervise.breakeven.enabled",
+        "runner": "supervise.runner.enabled",
+        "horizon": "supervise.horizon.enabled",
+        "cutlosers": "supervise.horizon.cut_losers",
+        "bankturn": "supervise.horizon.bank_turning_profit",
+        "harvest": "supervise.horizon.harvest",
+        "breakout": "supervise.failed_breakout.enabled",
+        "patience": "supervise.patience.enabled",
+        "trendfilter": "context.entry.block_against_trend",
+        "cooldown": "context.entry.coin_cooldown_minutes",
+        "review": "supervise.monitor.review_exits",
+        "report": "supervise.monitor.report_minutes",
+    }
+
+    def _supervisor(self, arg: str, rest: list[str] | None = None) -> None:
+        """
+        `/supervisor` lists every ability, `/supervisor on|off` is the master
+        switch, `/supervisor <name> <value>` changes one ability. A shorthand
+        over /set, so every change is validated and confirmed the same way.
+        """
+        from .settings import EDITABLE, TRUE, FALSE, parse_value
+
+        master = "supervise.enabled"
+        if not arg:
+            lines = [self.read().get("mode_line", ""), "",
+                     f"  {'on/off':<10}{master}  {self._fmt_current(master)}", ""]
+            for name, key in self.SUPERVISOR_KEYS.items():
+                lines.append(f"  {name:<10}{key}  {self._fmt_current(key)}")
+            lines += ["",
+                      "/supervisor on|off          all four rules",
+                      "/supervisor <name> on|off   one ability",
+                      "/supervisor <name>          explains one",
+                      "",
+                      "The protection watchdog is not switchable from here.",
+                      "Written to config.yaml; /restart applies it."]
+            self.send("\n".join(lines))
+            return
+        if arg in TRUE or arg in FALSE:
+            try:
+                value = parse_value(EDITABLE[master], arg)
+            except ValueError as e:
+                self.send(f"Refused: {e}")
+                return
+            self._ask("set", f"Change {master}?", value=f"{master}={value}")
+            return
+        key = self.SUPERVISOR_KEYS.get(arg)
+        if key is None:
+            self.send(f"Refused: {arg!r} is not a supervisor ability. Use on, "
+                      f"off, or one of: {', '.join(self.SUPERVISOR_KEYS)}.")
+            return
+        self._set(key, rest or [])
+
+    #: /gainer's short names, grouped as config.yaml groups them.
+    GAINER_KEYS = {
+        "size": "gainer.entry.notional_usdt",
+        "confirm": "gainer.entry.confirm_minutes",
+        "rising": "gainer.entry.buy_only_if_rising",
+        "minrise": "gainer.entry.min_rise_pct_per_min",
+        "cooldown": "gainer.entry.rebuy_cooldown_minutes",
+        "target": "gainer.exit.target_usd",
+        "onleader": "gainer.exit.on_new_leader",
+        "hold": "gainer.exit.min_hold_minutes",
+    }
+
+    def _gainer(self, arg: str, rest: list[str]) -> None:
+        """A shorthand over /set for the gainer mining settings."""
+        if not arg:
+            lines = [self.read().get("mode_line", ""), ""]
+            for group in ("entry", "exit"):
+                lines.append(f"{group.upper()}")
+                for name, key in self.GAINER_KEYS.items():
+                    if key.split(".")[1] == group:
+                        lines.append(f"  {name:<9}{key}  {self._fmt_current(key)}")
+            lines += ["", "/gainer <name> <value>",
+                      "/gainer <name>  explains one", "",
+                      "Written to config.yaml; /restart applies it."]
+            self.send("\n".join(lines))
+            return
+        key = self.GAINER_KEYS.get(arg)
+        if key is None:
+            self.send(f"{arg!r} is not a gainer setting. Use one of: "
+                      f"{', '.join(self.GAINER_KEYS)}.")
+            return
+        self._set(key, rest)
 
     def _scan(self, arg: str) -> None:
         """`/scan` reports the last result; `/scan now` asks for a fresh one."""
@@ -316,6 +524,27 @@ class TelegramControl:
                       f"unrealised {p['unrealized']:+.2f} USDT")
         elif action == "resume":
             detail = f"\n\nHalt reason:\n{snap.get('halt_reason', '')}"
+        elif action == "set":
+            key, _, new = value.partition("=")
+            detail = (f"\n\n{key}\n  {self._fmt_current(key)}  ->  {new}"
+                      f"\n\nWritten to config.yaml. Not live until /restart.")
+        elif action == "restart":
+            # systemd rate-limits starts, and the engine holds some back for
+            # crash recovery. Say what is left up front: finding out by being
+            # refused is a worse way to learn it.
+            left = snap.get("restarts_left")
+            budget = ("" if left is None else
+                      f"\n\n{left} restart(s) left in this 5-minute window; "
+                      f"the rest are reserved for crash recovery.")
+            detail = ("\n\nconfig.yaml is re-read on the way up, so this is what "
+                      "applies a /set.\n\nOpen positions and their stops stay on "
+                      "the exchange. Resting entry orders are cancelled." + budget)
+        elif action == "stop":
+            detail = ("\n\nThis CANNOT be undone from Telegram -- once the bot is "
+                      "down nothing is polling for your commands. Restarting it "
+                      "needs a shell:\n  sudo systemctl start trading-bot"
+                      "\n\nOpen positions and their stops stay on the exchange, "
+                      "unmonitored.")
         self.send(f"{question}{detail}\n\nExpires in {CONFIRM_TTL}s.",
                   keyboard=[[{"text": f"Yes, {action}", "callback_data": f"{action}:{nonce}"},
                              {"text": "Cancel", "callback_data": f"cancel:{nonce}"}]])
@@ -367,8 +596,12 @@ class TelegramControl:
             "",
             f"equity      ${s.get('equity', 0):,.2f}",
             f"price       {s.get('price', 0):,.4f}",
-            f"today       {s.get('realized_today', 0):+.2f} USDT",
+            f"today       {s.get('realized_today', 0):+.2f} USDT"
+            + (f" ({s['realized_pct_of_equity']:+.2f}%)"
+               if s.get("day_start_equity") else ""),
+            f"since start {s.get('since_restart', 0.0):+.2f} USDT",
             f"trades      {s.get('trades_today', 0)} today",
+            f"day ends in {s.get('day_ends_in', '?')}",
             f"feed        {s.get('feed') or ('live' if s.get('stream_ok') else 'DOWN')}",
         ]
         off = s.get("clock_offset_ms")
@@ -380,28 +613,51 @@ class TelegramControl:
             lines += ["", f"regime      {s['regime']}"]
         if s.get("halted"):
             lines += ["", f"HALTED: {s.get('halt_reason', '')}"]
-        p = s.get("position")
-        if p:
+        # EVERY open position. /status printed only the first one, so with the
+        # gainer and squeeze both trading it hid the rest (2026-10-07).
+        book = s.get("positions") or ([s["position"]] if s.get("position") else [])
+        if not book:
+            lines += ["", "flat"]
+        elif len(book) > 1:
+            lines += ["", f"{len(book)} positions open, "
+                          f"{sum(p.get('unrealized', 0.0) for p in book):+.2f} USDT unrealised"]
+        for p in book:
+            tag = f"  [{p['strategy']}]" if p.get("strategy") else ""
+            no_tp = not p.get("take_profit")
             lines += [
                 "",
                 f"{p.get('symbol', s.get('symbol','?'))} "
-                f"{p['side']} {p['qty']:g} @ {p['entry']:,.4f}",
+                f"{p['side']} {p['qty']:g} @ {p['entry']:,.4f}{tag}",
                 # The held coin's OWN price. /status used to print only the
                 # configured symbol's, which in portfolio mode is a market the
                 # bot is not even trading.
                 f"now         " + (f"{p['price']:,.4f}" if p.get('price')
                                    else "no price yet"),
                 f"unrealised  {p['unrealized']:+.2f} USDT",
-                f"to TP       {p['to_tp']*100:5.1f}%  ({p['take_profit']:,.4f})",
+                ("to TP       none (closed by its stop or time limit)" if no_tp else
+                 f"to TP       {p['to_tp']*100:5.1f}%  ({p['take_profit']:,.4f})"),
                 f"to SL       {p['to_sl']*100:5.1f}%  ({p['stop']:,.4f})",
             ]
-        else:
-            lines += ["", "flat"]
         self.send("\n".join(lines))
 
     def _send_pnl(self) -> None:
         s = self.read()
         realized = s.get("realized_today", 0.0)
+        since = s.get("since_restart")
+        since_line = ("" if since is None else
+                      f"\nsince restart {since:+.2f} USDT"
+                      + (f" ({s['session_started']})" if s.get("session_started") else ""))
+        if not s.get("stop_when_reached", True):
+            # The daily target is off: a "$x of $2.00" bar reads as a rule the
+            # bot is following. Report against the equity actually at stake.
+            eq = s.get("day_start_equity") or s.get("equity") or 0.0
+            pct = s.get("realized_pct_of_equity", 0.0)
+            self.send(f"day {s.get('day', '?')}\n"
+                      f"today {realized:+.2f} USDT"
+                      + (f" ({pct:+.2f}% of ${eq:,.2f} equity)" if eq else "")
+                      + since_line
+                      + "\n\ndaily target off (targets.stop_when_reached false)")
+            return
         target = s.get("target", 0.0)
         pct = s.get("target_pct", 0.0)
         filled = max(0, min(20, int(pct / 100 * 20)))
@@ -413,7 +669,7 @@ class TelegramControl:
             msg += ("\n\nTarget banked. "
                     + ("No further trades today." if s.get("stop_when_reached")
                        else "Still trading."))
-        self.send(msg)
+        self.send(msg + since_line)
 
     def _strategy(self, arg: str) -> None:
         s = self.read()

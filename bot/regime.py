@@ -142,3 +142,28 @@ class RegimeDetector:
         # Report what is actually being acted on, not the raw reading.
         return RegimeReading(self.current, reading.efficiency,
                              reading.atr_pct, reading.note)
+
+    #: Bars replayed by read(): 12h of 15m bars, far longer than any
+    #: confirm_bars streak, so the adopted regime has settled by the end.
+    READ_LOOKBACK = 48
+
+    def read(self, bars: list["Bar"]) -> RegimeReading:
+        """
+        The adopted regime for THESE bars alone, with no memory of any call.
+
+        update() keeps hysteresis state between calls, which is only right
+        when every call is the next bar of one symbol. The portfolio asks one
+        strategy about up to 100 coins in turn, so a shared update() let each
+        coin inherit the regime of the coins read before it: from 2026-09-22
+        to 09-24, 8 of 17 trades opened on coins whose own 30-bar ER was under
+        trend_above (-1.66R), because an earlier coin had been trending. This
+        replays a fresh detector over the last READ_LOOKBACK bars instead.
+        """
+        fresh = RegimeDetector(self.window, self.trend_above, self.range_below,
+                               self.min_atr_pct, self.confirm_bars)
+        start = max(self.window + 1, len(bars) - self.READ_LOOKBACK)
+        reading = fresh.classify(bars)
+        for end in range(start, len(bars) + 1):
+            reading = fresh.update(bars[:end])
+        self.current = reading.regime
+        return reading

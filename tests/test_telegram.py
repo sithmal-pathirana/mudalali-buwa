@@ -97,6 +97,20 @@ class TestReadOnlyCommands(Base):
         for expected in ("equity", "43.00", "BUY", "to TP", "to SL"):
             self.assertIn(expected, out)
 
+    def test_status_lists_every_position(self):
+        two = [dict(symbol="RLCUSDT", side="BUY", qty=7.2, entry=0.83, stop=0.58,
+                    take_profit=1.62, strategy="gainer", price=0.72, unrealized=-0.8,
+                    to_tp=-0.1, to_sl=0.4),
+               dict(symbol="OMUSDT", side="BUY", qty=30, entry=0.2, stop=0.16,
+                    take_profit=0.0, strategy="squeeze", price=0.21, unrealized=0.3,
+                    to_tp=0.0, to_sl=-0.2)]
+        self.tc.publish(dict(SNAPSHOT, position=two[0], positions=two))
+        self.tc._handle(message("/status"))
+        out = self.last()
+        for expected in ("RLCUSDT", "OMUSDT", "[gainer]", "[squeeze]", "2 positions open",
+                         "to TP       none"):
+            self.assertIn(expected, out)
+
     def test_status_flags_a_halt(self):
         self.tc.publish(dict(SNAPSHOT, halted=True, halt_reason="daily loss limit"))
         self.tc._handle(message("/status"))
@@ -298,3 +312,210 @@ class TestExpandedControl(unittest.TestCase):
         for forbidden in ("cancel_all", "usdt_equity", "set_leverage",
                           "user_trades", "all_orders"):
             self.assertNotIn(forbidden, src)
+
+
+EDITABLE_SNAPSHOT = dict(
+    SNAPSHOT,
+    editable={"risk.max_leverage": 3, "aggressive.enabled": True,
+              "aggressive.profile": "maximum", "strategy": "switcher",
+              "portfolio.enabled": True},
+)
+
+
+class TestSettingsCommands(Base):
+    """`/set` and `/aggressive` write config.yaml -- through a confirmation,
+    and never straight from the polling thread."""
+
+    def setUp(self):
+        super().setUp()
+        self.tc.publish(dict(EDITABLE_SNAPSHOT))
+
+    def test_bare_set_lists_the_editable_keys(self):
+        self.tc._handle(message("/set"))
+        self.assertIn("risk.max_leverage", self.last())
+        self.assertIn("aggressive.profile", self.last())
+        self.assertIsNone(self.keyboards[-1], "listing asked for confirmation")
+
+    def test_the_listing_says_arming_is_not_editable(self):
+        self.tc._handle(message("/set"))
+        self.assertIn("dry_run", self.last())
+        self.assertIn("shell", self.last())
+
+    def test_set_shows_current_value_and_range_for_one_key(self):
+        self.tc._handle(message("/set risk.max_leverage"))
+        self.assertIn("now", self.last())
+        self.assertIn("3", self.last())
+        self.assertIn("1 to 20", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_unknown_key_is_refused_with_a_hint(self):
+        self.tc._handle(message("/set max_leverage 5"))
+        self.assertIn("not an editable setting", self.last())
+        self.assertIn("risk.max_leverage", self.last(), "no near-miss hint")
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_a_bad_value_is_refused_before_any_confirmation(self):
+        self.tc._handle(message("/set risk.max_leverage 500"))
+        self.assertIn("Refused", self.last())
+        self.assertIsNone(self.keyboards[-1])
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_a_valid_change_asks_first(self):
+        self.tc._handle(message("/set risk.max_leverage 5"))
+        self.assertIsNotNone(self.keyboards[-1])
+        self.assertEqual(self.tc.pop_commands(), [], "wrote without confirmation")
+
+    def test_the_prompt_shows_before_and_after(self):
+        self.tc._handle(message("/set risk.max_leverage 5"))
+        self.assertIn("3", self.last())
+        self.assertIn("5", self.last())
+        self.assertIn("restart", self.last().lower())
+
+    def test_a_confirmed_change_is_queued_as_a_key_value_pair(self):
+        self.tc._handle(message("/set risk.max_leverage 5"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        cmds = self.tc.pop_commands()
+        self.assertEqual([c.action for c in cmds], ["set"])
+        self.assertEqual(cmds[0].value, "risk.max_leverage=5")
+
+    def test_aggressive_alone_reports_the_current_state(self):
+        self.tc._handle(message("/aggressive"))
+        self.assertIn("aggressive.enabled", self.last())
+        self.assertIn("maximum", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_aggressive_off_targets_the_enabled_flag(self):
+        self.tc._handle(message("/aggressive off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "aggressive.enabled=False")
+
+    def test_aggressive_profile_targets_the_profile(self):
+        self.tc._handle(message("/aggressive moderate"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "aggressive.profile=moderate")
+
+    def test_an_unknown_aggressive_argument_is_refused(self):
+        self.tc._handle(message("/aggressive insane"))
+        self.assertIn("neither on/off nor a profile", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_supervisor_alone_reports_the_current_state(self):
+        self.tc._handle(message("/supervisor"))
+        self.assertIn("supervise.enabled", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_supervisor_off_targets_the_supervise_flag(self):
+        self.tc._handle(message("/supervisor off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "supervise.enabled=False")
+
+    def test_an_unknown_supervisor_argument_is_refused(self):
+        self.tc._handle(message("/supervisor maybe"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_supervisor_lists_every_ability(self):
+        self.tc._handle(message("/supervisor"))
+        for name in ("breakeven", "runner", "cutlosers", "harvest", "breakout"):
+            self.assertIn(name, self.last())
+
+    def test_supervisor_ability_off_targets_its_own_switch(self):
+        self.tc._handle(message("/supervisor breakout off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "supervise.failed_breakout.enabled=False")
+
+    def test_supervisor_cut_losers_targets_the_horizon_group(self):
+        self.tc._handle(message("/supervisor cutlosers off"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "supervise.horizon.cut_losers=False")
+
+    def test_the_watchdog_cannot_be_switched_from_chat(self):
+        self.tc._handle(message("/set supervise.protect.watch.enabled false"))
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_size_targets_the_notional(self):
+        self.tc._handle(message("/gainer size 7.5"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "gainer.entry.notional_usdt=7.5")
+
+    def test_gainer_target_targets_the_target(self):
+        self.tc._handle(message("/gainer target 0.25"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value, "gainer.exit.target_usd=0.25")
+
+    def test_gainer_cooldown_targets_the_entry_group(self):
+        self.tc._handle(message("/gainer cooldown 90"))
+        self.tc._handle(callback(f"set:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual(self.tc.pop_commands()[0].value,
+                         "gainer.entry.rebuy_cooldown_minutes=90.0")
+
+    def test_gainer_onleader_is_a_choice(self):
+        self.tc._handle(message("/gainer onleader sometimes"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_alone_lists_the_groups(self):
+        self.tc._handle(message("/gainer"))
+        self.assertIn("ENTRY", self.last())
+        self.assertIn("gainer.exit.min_hold_minutes", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_an_unknown_gainer_name_is_refused(self):
+        self.tc._handle(message("/gainer speed 3"))
+        self.assertIn("not a gainer setting", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_gainer_size_under_the_exchange_minimum_is_refused(self):
+        self.tc._handle(message("/gainer size 2"))
+        self.assertIn("Refused", self.last())
+        self.assertEqual(self.tc.pop_commands(), [])
+
+
+class TestProcessCommands(Base):
+    def test_restart_asks_first(self):
+        self.tc._handle(message("/restart"))
+        self.assertIsNotNone(self.keyboards[-1])
+        self.assertEqual(self.tc.pop_commands(), [])
+
+    def test_confirmed_restart_is_queued(self):
+        self.tc._handle(message("/restart"))
+        self.tc._handle(callback(f"restart:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual([c.action for c in self.tc.pop_commands()], ["restart"])
+
+    def test_restart_says_config_is_reread(self):
+        self.tc._handle(message("/restart"))
+        self.assertIn("config.yaml", self.last())
+
+    def test_stop_warns_it_cannot_be_undone_from_telegram(self):
+        """Nothing polls Telegram once the process is down, so /stop is a
+        one-way door. The prompt has to say so before the button is pressed."""
+        self.tc._handle(message("/stop"))
+        self.assertIn("CANNOT be undone", self.last())
+        self.assertIn("systemctl start", self.last())
+
+    def test_confirmed_stop_is_queued(self):
+        self.tc._handle(message("/stop"))
+        self.tc._handle(callback(f"stop:{self.nonce_from_last_keyboard()}"))
+        self.assertEqual([c.action for c in self.tc.pop_commands()], ["stop"])
+
+    def test_the_prompt_says_how_many_restarts_are_left(self):
+        """The budget is finite and running it out needs a shell to undo, so
+        the count belongs in the prompt, not in the refusal afterwards."""
+        self.tc.publish(dict(SNAPSHOT, restarts_left=2))
+        self.tc._handle(message("/restart"))
+        self.assertIn("2 restart(s) left", self.last())
+
+    def test_a_snapshot_without_the_count_still_prompts(self):
+        """An older snapshot (or one published before the first restart) has
+        no count; the prompt must degrade rather than crash or lie."""
+        self.tc._handle(message("/restart"))
+        self.assertIn("config.yaml", self.last())
+        self.assertNotIn("restart(s) left", self.last())
+
+    def test_both_are_listed_in_help(self):
+        self.tc._handle(message("/help"))
+        for expected in ("/restart", "/stop", "/set", "/aggressive"):
+            self.assertIn(expected, self.last())

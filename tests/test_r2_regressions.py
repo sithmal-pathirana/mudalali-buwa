@@ -38,11 +38,14 @@ class StubAPI:
         self.calls.append(("sync_clock", None))
         return 0
 
-    def positions(self, symbol):
+    def positions(self, symbol=None):
+        # symbol=None is the real client's "every position" form, which
+        # reconcile_book uses; this stub only ever holds DOGEUSDT.
         self.calls.append(("positions", symbol))
         if self.position_amt == 0.0:
             return []
-        return [{"positionAmt": str(self.position_amt), "entryPrice": "0.09",
+        return [{"symbol": symbol or "DOGEUSDT",
+                 "positionAmt": str(self.position_amt), "entryPrice": "0.09",
                  "unRealizedProfit": "0", "liquidationPrice": "0"}]
 
     # Since the Binance algo migration a conditional order is NOT returned by
@@ -346,7 +349,9 @@ class TestR6Slippage(unittest.TestCase):
                           realized_pnl=0.0, raw={})
         e.on_order(upd)
         body = " ".join(b for _, b in e.sent)
-        self.assertIn("asked 0.0900", body,
+        # 6 significant digits, not 4 decimals: this account trades coins at
+        # 0.075530, where .4f would round away more than the cost buffer.
+        self.assertIn("asked 0.09", body,
                       "the alert printed the fill price as the asked price")
         self.assertIn("0.0915", body)
 
@@ -468,3 +473,19 @@ class TestStartupAlertStatesCommandAvailability(unittest.TestCase):
         self.assertIn("Commands are OFF", src)
         self.assertIn("telegram.control", src,
                       "the message must name the setting to change")
+
+
+class TestStoppingIsNotAHalt(unittest.TestCase):
+    """A normal stop with a protected position open was titled HALTED, so every
+    restart looked like a halt (2026-10-07). Real halts and kills keep it."""
+
+    def test_open_position_on_stop_is_reported_as_stopping(self):
+        from bot.notify import Event
+        api = StubAPI()
+        api.position_amt = 100.0                 # the position is still open
+        e = engine(api=api)
+        e.book = {"DOGEUSDT": position()}
+        e._cancel_symbol("DOGEUSDT", keep_protective=True)
+        kinds = [ev for ev, _ in e.sent]
+        self.assertIn(Event.STOPPING, kinds)
+        self.assertNotIn(Event.HALT, kinds)

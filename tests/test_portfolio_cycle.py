@@ -60,6 +60,9 @@ class FakeScanner:
     def due(self):
         return False
 
+    def stale(self):
+        return False
+
     def scan(self, **kw):
         self.scans += 1
         return self.last

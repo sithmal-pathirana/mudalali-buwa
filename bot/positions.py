@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: `initial_risk` when the bot KNOWS it cannot know what the trade risked --
+#: distinct from 0.0, which only means "never recorded" and still allows the
+#: fallback to the original stop. Negative-means-unknown is the same idiom
+#: bot/supervise.py's Reading.efficiency uses, and for the same reason: a
+#: missing reading must never be read as a real one.
+RISK_UNKNOWN = -1.0
+
 
 @dataclass
 class ActivePosition:
@@ -27,6 +34,54 @@ class ActivePosition:
     #: that recovers realised P&L for a position closed exchange-side, so an
     #: earlier trade on the same symbol can never be counted a second time.
     opened_ms: int = 0
+    #: Set when the protective stop on the exchange is a TRAILING_STOP_MARKET
+    #: rather than a fixed STOP_MARKET, to the same callbackRate (percent)
+    #: sent to Binance. 0 means the stop is fixed and never moves.
+    trailing_pct: float = 0.0
+    #: Best price seen since entry, in the favourable direction. Maintained
+    #: on every tick by track_peak() whether or not the exchange-side trail is
+    #: in use, because bot/supervise.py measures maximum favourable excursion
+    #: from it and that has to be true on a fixed stop too.
+    high_water: float = 0.0
+    #: The stop and target as first placed. `stop` and `take_profit` above move
+    #: once the supervisor starts managing the position, and 1R has to stay
+    #: measured against the original -- after a move to break even the
+    #: remaining risk is ~0 and every later R reading would divide by it.
+    initial_stop: float = 0.0
+    initial_target: float = 0.0
+    #: The channel level whose break triggered the entry. Price returning
+    #: through it is a failed breakout; 0 means the strategy did not report one
+    #: and that rule stays off for this position.
+    ref_level: float = 0.0
+    #: 1R in PRICE units, as sized at entry, and authoritative when positive.
+    #: 0.0 means "never recorded" and falls back to `initial_stop` above;
+    #: RISK_UNKNOWN means the bot has established that 1R is NOT recoverable
+    #: and bot/supervise.py must stand down rather than guess. See
+    #: Engine.adopted_risk.
+    initial_risk: float = 0.0
+    #: Set once the position has been split: part banked at the original
+    #: target, the remainder left to run on a trail with no ceiling.
+    runner: bool = False
+    #: The strategy deliberately runs this position with no take-profit (the
+    #: gainer ladder exits only on its stop). The protection watchdog must
+    #: then not "repair" the missing target.
+    no_target: bool = False
+    #: Why the bot closed it, when the bot did ("supervisor -- ...",
+    #: "protection watchdog -- ..."). Empty for a stop or take-profit that
+    #: filled on the exchange. Recorded in data/trades.csv.
+    exit_reason: str = ""
+    #: Whether the entry order is known to have FILLED. Entries rest as GTC
+    #: limits, so a position exists in this book from the moment the order is
+    #: placed -- which is not the moment there is anything to manage. Until
+    #: the exchange confirms a non-zero position the supervisor, the peak
+    #: tracker and the proximity alerts all stand down: on 2026-09-13 KAVAUSDT
+    #: was supervised for 34 minutes, had its stop moved 11 times and had its
+    #: take-profit split, on an entry that never filled.
+    filled: bool = False
+    #: Which strategy owns the position when that is not the engine's own
+    #: signal path. "gainer" positions are managed by bot/gainer.py, and the
+    #: supervisor's R-based trend rules stand aside for them.
+    strategy: str = ""
 
     @property
     def is_long(self) -> bool:
@@ -39,6 +94,45 @@ class ActivePosition:
     def unrealized(self, price: float) -> float:
         move = (price - self.entry) if self.is_long else (self.entry - price)
         return move * self.qty
+
+    def track_peak(self, price: float) -> None:
+        """
+        Record the best price seen since entry, in our favour.
+
+        Separate from update_trailing_stop because that one is a mirror of an
+        exchange-side order and returns immediately when there is no such order
+        (trailing_pct == 0, which is the safe profile). Maximum favourable
+        excursion still has to be tracked in that case -- it is what every rule
+        in bot/supervise.py is gated on.
+        """
+        if self.high_water == 0.0:
+            self.high_water = self.entry
+        self.high_water = (max(self.high_water, price) if self.is_long
+                           else min(self.high_water, price))
+
+    def update_trailing_stop(self, price: float) -> None:
+        """
+        Mirror what a TRAILING_STOP_MARKET order is doing on the exchange,
+        purely for display. This never sends anything -- the real stop lives
+        on Binance and moves itself -- but without a local mirror, `stop`
+        would stay frozen at its entry-time value and every proximity alert
+        and status line would quietly go stale the moment price ran in our
+        favour.
+
+        Like the order it mirrors, this only ever tightens: `stop` can move
+        toward price, never away from it, matching Binance's own guarantee
+        that a trailing stop cannot get worse.
+        """
+        if self.trailing_pct <= 0:
+            return
+        if self.high_water == 0.0:
+            self.high_water = self.entry
+        if self.is_long:
+            self.high_water = max(self.high_water, price)
+            self.stop = max(self.stop, self.high_water * (1 - self.trailing_pct / 100))
+        else:
+            self.high_water = min(self.high_water, price)
+            self.stop = min(self.stop, self.high_water * (1 + self.trailing_pct / 100))
 
     # ------------------------------------------------------------- progress
     def progress_to_tp(self, price: float) -> float:

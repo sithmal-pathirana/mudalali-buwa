@@ -16,9 +16,36 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 log = logging.getLogger("targets")
+
+
+def seconds_to_day_end(now: datetime | None = None) -> float:
+    """
+    Seconds until the trading day rolls.
+
+    The day boundary is UTC midnight, because that is where
+    State.roll_day_if_needed puts it -- that is the moment realized_today,
+    trades_today and the daily loss limit all reset, so it is the deadline the
+    daily target is actually running against.
+    """
+    now = now or datetime.now(timezone.utc)
+    end = (datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+           + timedelta(days=1))
+    return max(0.0, (end - now).total_seconds())
+
+
+def format_duration(seconds: float) -> str:
+    """Compact enough for one status line: "4h 12m", "47m", "under a minute"."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m"
+    return "under a minute"
 
 
 @dataclass
@@ -70,15 +97,27 @@ class TargetSchedule:
         return None
 
     # ------------------------------------------------------------- progress
-    def progress(self, realized_today: float, today: date | None = None) -> "Progress":
+    def progress(self, realized_today: float, today: date | None = None,
+                 equity: float = 0.0,
+                 since_restart: float | None = None) -> "Progress":
+        """`equity` is the day's opening equity and `since_restart` the net
+        realised P&L since the process started; both only change how the
+        progress READS, never what it decides."""
         day = self.day_number(today)
         target = self.target_for(day)
         return Progress(day=day, target=target, realized=realized_today,
                         reached=realized_today >= target,
-                        stop_trading=self.stop_when_reached and realized_today >= target)
+                        stop_trading=self.stop_when_reached and realized_today >= target,
+                        enforced=self.stop_when_reached, equity=equity,
+                        since_restart=since_restart)
 
     def describe(self, equity: float) -> str:
         day = self.day_number()
+        if not self.stop_when_reached:
+            # With stop_when_reached off the dollar target decides nothing, and
+            # quoting "$2.00/day required" read as a rule the bot was following.
+            return (f"day {day}: daily target off (targets.stop_when_reached "
+                    f"false); P&L is reported against ${equity:,.2f} equity")
         target = self.target_for(day)
         pct = target / equity * 100 if equity > 0 else float("inf")
         nxt = next((s for s in self.steps if s.from_day > day), None)
@@ -98,6 +137,17 @@ class Progress:
     realized: float
     reached: bool
     stop_trading: bool
+    #: False when targets.stop_when_reached is off: the dollar target decides
+    #: nothing, so the P&L is read against equity instead of against it.
+    enforced: bool = True
+    #: The day's opening equity, for the percent reading. 0 = unknown.
+    equity: float = 0.0
+    #: Net realised P&L since the process last started; None = not tracked.
+    since_restart: float | None = None
+
+    @property
+    def equity_pct(self) -> float:
+        return self.realized / self.equity * 100 if self.equity > 0 else 0.0
 
     @property
     def remaining(self) -> float:
@@ -112,5 +162,14 @@ class Progress:
         return "#" * filled + "." * (width - filled)
 
     def __str__(self) -> str:
-        return (f"day {self.day}  [{self.bar()}]  "
-                f"${self.realized:+.2f} / ${self.target:.2f} ({self.pct:.0f}%)")
+        if self.enforced:
+            line = (f"day {self.day}  [{self.bar()}]  "
+                    f"${self.realized:+.2f} / ${self.target:.2f} ({self.pct:.0f}%)")
+        elif self.equity > 0:
+            line = (f"day {self.day}  today {self.realized:+.2f} USDT "
+                    f"({self.equity_pct:+.2f}% of ${self.equity:,.2f})")
+        else:
+            line = f"day {self.day}  today {self.realized:+.2f} USDT"
+        if self.since_restart is not None:
+            line += f"\nsince restart {self.since_restart:+.2f} USDT"
+        return line

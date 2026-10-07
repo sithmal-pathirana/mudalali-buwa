@@ -14,26 +14,90 @@ position is never opened without its protective stop.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .binanceapi import Binance, BinanceError
 from .dashboard import Dashboard, generate_token
 from .filters import SymbolRules
 from .notify import Event, Notifier
 from .portfolio import allocate
-from .positions import ActivePosition
+from .positions import RISK_UNKNOWN, ActivePosition
+from .regime import efficiency_ratio, realised_vol_pct
 from .risk import KILL_FILE, RiskManager
 from .state import State, client_order_id, reconcile
 from .telegram_control import TelegramControl
 from .stream import BarClosed, Disconnected, MarketStream, OrderUpdate, StreamStale, Tick
 from .strategies import build
 from .strategies.base import Bar
-from .targets import TargetSchedule
+from .strategies.trend_atr import atr as true_range
+from .context import closed_closes, trend_direction
+from .journal import SupervisorReview, TradeJournal, describe as describe_review, position_report
+from .protect import plan_protection, stop_room
+from .supervise import Reading, supervise
+from .targets import TargetSchedule, format_duration, seconds_to_day_end
 
 log = logging.getLogger("engine")
+
+#: RestartSec in the systemd unit. Only used to set expectations in the message
+#: a /restart sends back, so being a few seconds out is harmless.
+RESTART_DELAY_HINT = 15
+
+#: systemd's start rate limit, mirrored from deploy/trading-bot.service
+#: (StartLimitIntervalSec and StartLimitBurst). Unlike RESTART_DELAY_HINT
+#: these are load-bearing, so tests assert the unit file still agrees with
+#: them -- a silent drift here hands out a restart budget that does not exist.
+START_LIMIT_INTERVAL = 300
+START_LIMIT_BURST = 5
+
+#: How many of those starts /restart may spend. The rest are held back for
+#: crash recovery, because systemd counts every start against one budget and
+#: does not care which were deliberate. Spending the last one is not a
+#: throttle you can wait out: the unit enters `failed` and stays down until
+#: someone runs `systemctl reset-failed` -- from a shell, which is exactly
+#: what a Telegram-only operator does not have. Refusing the fourth restart
+#: costs a minute; allowing it can cost the whole session.
+RESTART_BUDGET = START_LIMIT_BURST - 2
+
+#: Timestamps of restarts this bot asked for, kept across the restart itself.
+#: In data/ because ProtectSystem=strict leaves that as one of the few
+#: writable paths.
+RESTART_LEDGER = Path(__file__).resolve().parent.parent / "data" / "restarts.json"
+
+
+def recent_restarts(now: float, path: Path = RESTART_LEDGER) -> list[float]:
+    """Deliberate restarts still inside systemd's rate-limit window.
+
+    A missing or corrupt ledger reads as empty rather than raising: losing the
+    history spends budget the bot did not know it had, which is survivable,
+    while an exception here would take down the command loop.
+    """
+    try:
+        stamps = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(stamps, list):
+        return []
+    # Clock changes can leave stamps in the future; treat them as current
+    # rather than trusting them to expire.
+    return [float(t) for t in stamps
+            if isinstance(t, (int, float)) and now - float(t) < START_LIMIT_INTERVAL]
+
+
+def record_restart(now: float, path: Path = RESTART_LEDGER) -> None:
+    """Charge one start against the budget. Best effort -- a restart that
+    cannot be written down is still better than one that does not happen."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(recent_restarts(now, path) + [now]))
+    except OSError as e:
+        log.warning("could not record the restart in %s: %s", path, e)
 
 
 # The KILL file used to raise a KillSwitch exception from emergency_check().
@@ -44,6 +108,10 @@ log = logging.getLogger("engine")
 # inline and checked by the loop. (QA R2)
 
 RECONCILE_SECONDS = 60
+# How long a manual close waits for its fills to show up in userTrades before
+# booking what is there. A market order is acknowledged before it is listed.
+FILL_WAIT_ATTEMPTS = 4
+FILL_WAIT_SECONDS = 0.5
 CLOCK_RESYNC_SECONDS = 1800   # a long-running process drifts; startup-only was not enough
 
 
@@ -62,6 +130,18 @@ class Engine:
     _last_reconcile = 0.0
     _stopping = False
     _stop_reason = ""
+    #: Exit code run() hands back to systemd. `Restart=on-failure` in the unit
+    #: is what turns this into process control: 0 leaves the bot down, any
+    #: non-zero code brings it back after RestartSec. That is the only lever
+    #: available -- NoNewPrivileges and the @privileged syscall filter mean the
+    #: bot cannot call systemctl on itself.
+    _exit_code = 0
+    #: False when the loop is being left by a request that has NOT already done
+    #: the exchange work, so shutdown() still cancels resting orders.
+    _stop_exchange_done = True
+    #: Where deliberate restarts are counted. An attribute rather than a
+    #: constant so a test can spend the budget without touching the real one.
+    restart_ledger = RESTART_LEDGER
     _seq = 0
     position_amt = 0.0
     last_prices: dict = None
@@ -74,12 +154,30 @@ class Engine:
     _rules_cache: dict = None
     _exchange_info = None
     _prepared: set = None
+    #: bot/gainer.py's GainerMiner when gainer.enabled, else None
+    gainer = None
+    #: bot/squeeze.py's SqueezeTrader when squeeze.enabled, else None
+    squeeze = None
+    #: Net realised P&L booked since this process started, and when it did.
+    #: In memory on purpose: "since the last restart" resets with the process.
+    session_realized = 0.0
+    session_started = 0.0
+    #: bot/journal.py, created in __init__ (None in tests built without it)
+    journal = None
+    review = None
+    _last_review_check = 0.0
+    _last_position_report = 0.0
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.api = Binance(cfg.api_key, cfg.api_secret, testnet=cfg.testnet)
         self.state = State.load()
         self.risk = RiskManager(cfg, self.state)
+        self.session_realized = 0.0
+        self.session_started = time.time()
+        self.journal = TradeJournal()
+        self.review = SupervisorReview()
+        self._last_position_report = time.time()
         self.strategy = build(cfg.strategy, cfg.params)
         self.notify = Notifier.from_config(cfg)
         self.schedule = TargetSchedule.from_config(cfg.targets)
@@ -111,12 +209,22 @@ class Engine:
         self._flat_reconciles = 0
         self._stopping = False
         self._stop_reason = ""
+        self._exit_code = 0
+        self._stop_exchange_done = True
         self.dashboard: Dashboard | None = None
         self.telegram: TelegramControl | None = None
         from .signals import SignalChannel
         self.signals = SignalChannel(cfg.telegram_token, cfg.signal_chat_id)
         self.notify.listener = self._record_event
         self.notify.context = self.mode_line
+        gcfg = getattr(cfg, "gainer", None)
+        if gcfg is not None and gcfg.enabled:
+            from .gainer import GainerMiner
+            self.gainer = GainerMiner(self, gcfg)
+        scfg = getattr(cfg, "squeeze", None)
+        if scfg is not None and scfg.enabled:
+            from .squeeze import SqueezeTrader
+            self.squeeze = SqueezeTrader(self, scfg)
 
     # ------------------------------------------------------------ dashboard
     # ------------------------------------------------------------- the book
@@ -189,6 +297,114 @@ class Engine:
                 opened = 0                      # and that position is closed
         return opened
 
+    #: A stop this close to entry, as a fraction of price, is a stop that has
+    #: already been walked to break even -- not an original. Real stops on this
+    #: account have ranged 0.88% to 12.1%; the round-trip cost buffer the
+    #: supervisor parks a break-even stop at is 0.15%. 0.4% sits clear of both.
+    ADOPTED_BREAKEVEN_PCT = 0.4
+
+    def adopted_risk(self, entry: float, stop: float, symbol: str = "?") -> float:
+        """
+        1R for a position being adopted, or RISK_UNKNOWN when it cannot be.
+
+        The stop resting on the exchange is the only risk figure a restart can
+        see, and it is the ORIGINAL one only if nothing has moved it. Once the
+        supervisor has walked it to break even the gap to entry is ~0, and
+        pinning 1R to it does not preserve the trade's risk, it destroys it:
+        UAIUSDT was re-adopted on 2026-09-12 with a stop 0.1% from entry, so
+        1R read 0.0008 instead of 0.0671 and the supervisor reported a 0.6R
+        trade as "peak reached 19.70R".
+
+        There is no way to reconstruct the real number from the exchange, so
+        this does not invent one. On RISK_UNKNOWN supervise() stands down and
+        the exchange-side stop and take-profit run the position -- which is
+        exactly what was protecting it while the bot was down.
+        """
+        if entry <= 0 or stop <= 0:
+            return RISK_UNKNOWN
+        gap = abs(entry - stop)
+        if gap / entry * 100.0 < self.ADOPTED_BREAKEVEN_PCT:
+            log.warning("%s adopted with a stop %.3f%% from entry: that is a "
+                        "break-even stop, not an original, so 1R is unknown "
+                        "and the supervisor stands down on this position",
+                        symbol, gap / entry * 100.0)
+            return RISK_UNKNOWN
+        return gap
+
+    @staticmethod
+    def protective_legs(orders: list) -> tuple[dict | None, dict | None]:
+        """(stop, take-profit) among one symbol's open orders, None if absent.
+
+        A TRAILING_STOP_MARKET counts as the stop. The entry is a plain LIMIT,
+        so it is never mistaken for either.
+        """
+        stop_o = tp_o = None
+        for o in orders:
+            kind = (o.get("type") or "").upper()
+            if "TAKE_PROFIT" in kind:
+                tp_o = tp_o or o
+            elif "STOP" in kind:
+                stop_o = stop_o or o
+        return stop_o, tp_o
+
+    def is_manual(self, symbol: str) -> bool:
+        """manual_trades.symbols: the user's own positions, never touched."""
+        mt = getattr(self.cfg, "manual_trades", None)
+        return bool(mt and symbol in (mt.symbols or ()))
+
+    def adopt_row(self, row: dict, orders: list) -> ActivePosition:
+        """Track one position the exchange holds, from its row in positions()
+        and that symbol's open orders. See adopt_open_positions."""
+        symbol = row["symbol"]
+        amt = float(row["positionAmt"])
+        stop_o, tp_o = self.protective_legs(orders)
+
+        def price_of(o):
+            try:
+                return float(o.get("stopPrice") or 0.0) if o else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        pos = ActivePosition(
+            symbol=symbol,
+            side="BUY" if amt > 0 else "SELL",
+            entry=float(row.get("entryPrice") or 0.0),
+            stop=price_of(stop_o),
+            take_profit=price_of(tp_o),
+            qty=abs(amt),
+            # Synthetic, and deliberately not empty: reconcile_position
+            # intersects these ids with the open-order list, and a blank
+            # would collide with any order whose id failed to normalise.
+            entry_order_id=f"adopted-{symbol}",
+            stop_order_id=(stop_o or {}).get("clientOrderId", ""),
+            tp_order_id=(tp_o or {}).get("clientOrderId", ""),
+            tag=f"adopted-{symbol}",
+            opened_ms=(self.opened_ms_for(symbol)
+                       or int(row.get("updateTime") or 0)),
+            # 1R, or RISK_UNKNOWN -- see adopted_risk above. The stop as
+            # adopted is pinned too, but it is consulted only when the gap
+            # is still a plausible original.
+            # ref_level stays 0: the strategy that opened this position is
+            # not around to say what it broke, so the failed-breakout rule
+            # stays off for adopted trades.
+            initial_stop=price_of(stop_o),
+            initial_target=price_of(tp_o),
+            initial_risk=self.adopted_risk(
+                float(row.get("entryPrice") or 0.0), price_of(stop_o),
+                symbol),
+            # The exchange says this position is open, so it is.
+            filled=True)
+        self.book[symbol] = pos
+        # Margin type and leverage are already whatever this position was
+        # opened with, and Binance rejects changing either while it is
+        # open. Marking it prepared skips a call that can only fail.
+        if getattr(self, "_prepared", None) is not None:
+            self._prepared.add(symbol)
+        log.warning("adopted %s %s %g @ %.6f (stop %.6f, tp %.6f)",
+                    symbol, pos.side, pos.qty, pos.entry, pos.stop,
+                    pos.take_profit)
+        return pos
+
     def adopt_open_positions(self) -> int:
         """
         Rebuild the book from what the exchange says is actually open.
@@ -210,7 +426,8 @@ class Engine:
             return 0
         try:
             live = [r for r in self.api.positions()
-                    if float(r.get("positionAmt") or 0.0) != 0.0]
+                    if float(r.get("positionAmt") or 0.0) != 0.0
+                    and not self.is_manual(r.get("symbol", ""))]
             orders = list(self.api.open_orders()) + list(self.api.open_algo_orders())
         except BinanceError as e:
             log.error("could not read open positions to adopt: %s", e)
@@ -224,48 +441,9 @@ class Engine:
 
         unprotected = []
         for row in live:
-            symbol = row["symbol"]
-            amt = float(row["positionAmt"])
-            stop_o = tp_o = None
-            for o in by_symbol.get(symbol, []):
-                kind = (o.get("type") or "").upper()
-                if "TAKE_PROFIT" in kind:
-                    tp_o = tp_o or o
-                elif "STOP" in kind:
-                    stop_o = stop_o or o
-
-            def price_of(o):
-                try:
-                    return float(o.get("stopPrice") or 0.0) if o else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
-
-            pos = ActivePosition(
-                symbol=symbol,
-                side="BUY" if amt > 0 else "SELL",
-                entry=float(row.get("entryPrice") or 0.0),
-                stop=price_of(stop_o),
-                take_profit=price_of(tp_o),
-                qty=abs(amt),
-                # Synthetic, and deliberately not empty: reconcile_position
-                # intersects these ids with the open-order list, and a blank
-                # would collide with any order whose id failed to normalise.
-                entry_order_id=f"adopted-{symbol}",
-                stop_order_id=(stop_o or {}).get("clientOrderId", ""),
-                tp_order_id=(tp_o or {}).get("clientOrderId", ""),
-                tag=f"adopted-{symbol}",
-                opened_ms=(self.opened_ms_for(symbol)
-                           or int(row.get("updateTime") or 0)))
-            self.book[symbol] = pos
-            # Margin type and leverage are already whatever this position was
-            # opened with, and Binance rejects changing either while it is
-            # open. Marking it prepared skips a call that can only fail.
-            self._prepared.add(symbol)
+            pos = self.adopt_row(row, by_symbol.get(row["symbol"], []))
             if not pos.stop:
-                unprotected.append(symbol)
-            log.warning("adopted %s %s %g @ %.6f (stop %.6f, tp %.6f)",
-                        symbol, pos.side, pos.qty, pos.entry, pos.stop,
-                        pos.take_profit)
+                unprotected.append(pos.symbol)
 
         lines = "\n".join(
             f"  {p.symbol} {p.side} {p.qty:g} @ {p.entry:,.6f}"
@@ -278,14 +456,18 @@ class Engine:
         if unprotected:
             log.critical("adopted position(s) with NO protective stop: %s",
                          ", ".join(unprotected))
+            fix = ("The protection watchdog will place a stop and take-profit "
+                   "within a minute." if self.cfg.supervise.protect.watch.enabled
+                   else "Close it or set a stop by hand.")
             self.notify.send(
                 Event.ERROR,
                 f"{', '.join(unprotected)} is open with NO stop on the "
                 f"exchange. It is tracked, so nothing new will be stacked on "
-                f"it, but it is not protected. Close it or set a stop by hand.")
+                f"it, but it is not protected. {fix}")
         return len(live)
 
-    def realized_from_exchange(self, pos: ActivePosition) -> float | None:
+    def realized_from_exchange(self, pos: ActivePosition,
+                               expect_order_id=None) -> float | None:
         """
         What this position actually made, read back from the exchange's fills.
 
@@ -303,13 +485,27 @@ class Engine:
         gained: this trade grossed 0.1626 and netted 0.1520 after 0.0106 of
         fees, and the balance moved by the latter. On a $2.45 account against a
         $2/day target that difference is not a rounding detail.
+
+        expect_order_id is the closing order we just sent. Its fills can lag
+        the order acknowledgement by a moment, and booking before they land
+        would credit only the entry commission. Wait briefly for them; after
+        that, book what is there rather than never booking at all.
         """
-        try:
-            fills = self.api.user_trades(pos.symbol, start_ms=pos.opened_ms or None)
-        except BinanceError as e:
-            log.error("could not read %s fills to book realised P&L: %s",
-                      pos.symbol, e)
-            return None
+        for attempt in range(FILL_WAIT_ATTEMPTS):
+            try:
+                fills = self.api.user_trades(pos.symbol, start_ms=pos.opened_ms or None)
+            except BinanceError as e:
+                log.error("could not read %s fills to book realised P&L: %s",
+                          pos.symbol, e)
+                return None
+            if expect_order_id is None or any(
+                    str(f.get("orderId")) == str(expect_order_id) for f in fills):
+                break
+            if attempt + 1 < FILL_WAIT_ATTEMPTS:
+                time.sleep(FILL_WAIT_SECONDS)
+        else:
+            log.warning("%s: close order %s not in the fills yet; booking "
+                        "what is there", pos.symbol, expect_order_id)
 
         total = 0.0
         for f in fills:
@@ -325,6 +521,37 @@ class Engine:
                 continue
         return total
 
+    def book_close(self, pos: ActivePosition, how: str,
+                   expect_order_id=None) -> float | None:
+        """
+        Credit a finished trade's realised P&L and count it. Returns the P&L,
+        or None when the exchange could not be asked.
+
+        Nothing in here may raise: every caller releases the position straight
+        afterwards, and a slot that is never freed is worse than a P&L figure
+        that is never booked.
+
+        total_trades is counted here in polling mode because record_fill is
+        only reached from on_order, i.e. the websocket. With realtime false it
+        never ran, and total_trades read 0 after a week of live trading.
+        """
+        try:
+            pnl = self.realized_from_exchange(pos, expect_order_id=expect_order_id)
+            if pnl is None:
+                return None
+            self.state.realized_today += pnl
+            self.note_realized(pnl)
+            self.after_close(pos, how, pnl)
+            if not self.cfg.realtime:
+                self.state.total_trades += 1
+            self.state.save()
+            log.info("%s closed %s for %+.4f USDT (realised today %+.4f)",
+                     pos.symbol, how, pnl, self.state.realized_today)
+            return pnl
+        except Exception:
+            log.exception("could not book the close of %s", pos.symbol)
+            return None
+
     def book_exchange_close(self, pos: ActivePosition) -> None:
         """
         Record a position that the exchange closed while we were not looking.
@@ -336,15 +563,10 @@ class Engine:
         restarts it. Bookkeeping is best-effort; releasing is not.
         """
         try:
-            pnl = self.realized_from_exchange(pos)
+            pnl = self.book_close(pos, "exchange-side")
             if pnl is None:
                 return
-            self.state.realized_today += pnl
-            self.state.save()
-            prog = self.schedule.progress(self.state.realized_today)
-            log.info("%s closed exchange-side for %+.4f USDT "
-                     "(realised today %+.4f)",
-                     pos.symbol, pnl, self.state.realized_today)
+            prog = self.progress()
             self.notify.send(
                 Event.TP_HIT if pnl >= 0 else Event.SL_HIT,
                 f"{pos.symbol} closed for {pnl:+.2f} USDT\n{prog}\n"
@@ -360,8 +582,31 @@ class Engine:
         p = self.book.pop(symbol, None)
         if p is not None:
             self.notify.clear_position_alerts(p.tag)
+            # Only a trade that happened starts a cooldown: an entry that
+            # rested and was cancelled never took the move being chased.
+            if p.filled and getattr(p, "strategy", "") not in ("gainer", "squeeze"):
+                self.note_exit(symbol)
         if self.stream is not None and symbol != self.cfg.symbol:
             self.stream.remove_symbol(symbol)
+
+    def note_exit(self, symbol: str, now_ms: int | None = None) -> None:
+        """Remember when `symbol` last closed, for the coin cooldown."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        exits = self.state.last_exit_ms
+        # A day covers any sensible cooldown; older entries only grow the file.
+        for s in [s for s, t in exits.items() if now_ms - t > 86_400_000]:
+            del exits[s]
+        exits[symbol] = now_ms
+        self.state.save()
+
+    def cooling_down(self, symbol: str, now_ms: int | None = None) -> float:
+        """Minutes left before `symbol` may be opened again; 0 = free."""
+        minutes = self.cfg.context.entry.coin_cooldown_minutes
+        last = self.state.last_exit_ms.get(symbol)
+        if minutes <= 0 or not last:
+            return 0.0
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        return max(0.0, minutes - (now_ms - last) / 60_000)
 
     def prepare_symbol(self, symbol: str) -> bool:
         """
@@ -407,7 +652,19 @@ class Engine:
         cap = getattr(self.cfg.risk, "equity_cap_usdt", 0.0) or 0.0
         if cap <= 0:
             return actual
-        return min(actual, cap)
+        if not getattr(self.cfg.risk, "equity_cap_tracks_pnl", False):
+            return min(actual, cap)
+        # Tracking: behave like an account funded with `cap` when this began.
+        # The anchor is re-taken whenever the cap itself changes, so moving the
+        # cap starts a fresh rehearsal rather than inheriting the old drift.
+        st = self.state
+        if st.cap_anchor_equity <= 0 or st.cap_anchor_cap != cap:
+            st.cap_anchor_equity = actual
+            st.cap_anchor_cap = cap
+            st.save()
+            log.info("equity cap: rehearsing a $%.2f account from real equity "
+                     "%.2f; gains and losses from here move it", cap, actual)
+        return max(0.0, min(actual, cap + (actual - st.cap_anchor_equity)))
 
     def rebase_day_start_equity(self) -> None:
         """
@@ -422,6 +679,18 @@ class Engine:
         """
         anchor = self.state.day_start_equity
         if anchor <= 0:
+            return
+        cap = getattr(self.cfg.risk, "equity_cap_usdt", 0.0) or 0.0
+        if cap > 0 and getattr(self.cfg.risk, "equity_cap_tracks_pnl", False):
+            # effective_equity() takes a REAL balance, not a day-start figure,
+            # so it cannot be applied to the anchor here. A day anchored on the
+            # real balance shows up as a gap larger than the whole rehearsed
+            # account, which no day's trading on it could produce.
+            if anchor > self.equity + cap:
+                log.warning("day start equity re-based %.2f -> %.2f to match the "
+                            "tracking equity cap", anchor, self.equity)
+                self.state.day_start_equity = self.equity
+                self.state.save()
             return
         capped = self.effective_equity(anchor)
         if capped < anchor:
@@ -453,6 +722,8 @@ class Engine:
             name = f"{name}/{mode.replace('manual/', '')}"
         elif mode == "auto":
             name = f"{name}/auto"
+        if self.gainer is not None:
+            name += "+gainer" + ("(paper)" if self.gainer.paper else "")
         bits = [profile, name, self.cfg.mode]
         if self.cfg.dry_run:
             bits.append("dry-run")
@@ -465,7 +736,7 @@ class Engine:
         })
 
     def snapshot(self) -> dict:
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         # One source of truth. The old duplicate here referenced `sym` and `px`
         # from _position_book's loop, so snapshot() raised NameError the moment
         # any position opened -- freezing the dashboard and /status on the
@@ -480,8 +751,17 @@ class Engine:
             "price": self.last_price,
             "realized_today": self.state.realized_today,
             "day": prog.day, "target": prog.target, "target_pct": prog.pct,
+            # How long today's target has left to run. /status only -- the
+            # alerts carry the progress bar and do not need a clock on it.
+            "day_ends_in": format_duration(seconds_to_day_end()),
             "target_reached": prog.reached,
             "stop_when_reached": self.schedule.stop_when_reached,
+            "day_start_equity": prog.equity,
+            "realized_pct_of_equity": prog.equity_pct,
+            "since_restart": self.session_realized,
+            "session_started": (datetime.fromtimestamp(self.session_started, timezone.utc)
+                                .strftime("%Y-%m-%d %H:%M UTC")
+                                if self.session_started else ""),
             "target_note": self.schedule.describe(self.equity),
             "halted": self.state.halted, "halt_reason": self.state.halt_reason,
             "trades_today": self.state.trades_today,
@@ -500,6 +780,8 @@ class Engine:
             "positions": book,
             "pending": self._pending_book(),
             "config": self._config_summary(),
+            "editable": self._editable_summary(),
+            "restarts_left": self.restarts_left(),
             "scan": self._scan_summary(),
         }
 
@@ -541,6 +823,7 @@ class Engine:
             book.append({
                 "symbol": sym, "side": p.side, "qty": p.qty, "entry": p.entry,
                 "stop": p.stop, "take_profit": p.take_profit,
+                "strategy": getattr(p, "strategy", "") or "",
                 # `px`, NOT a fallback to self.last_price: that fallback is the
                 # very cross-symbol leak the comment above describes, and it
                 # survived here after the P&L lines were fixed -- an unpriced
@@ -582,6 +865,27 @@ class Engine:
             "target": (f"${self.schedule.today_target():.2f}/day"
                        if self.schedule.stop_when_reached else "not enforced"),
         }
+
+    def restarts_left(self) -> int:
+        """How many more /restart requests the budget allows right now, so
+        the confirmation can say so before the button is pressed rather than
+        refusing afterwards."""
+        return max(0, RESTART_BUDGET - len(recent_restarts(time.time(),
+                                                           self.restart_ledger)))
+
+    def _editable_summary(self) -> dict:
+        """
+        Current value of every allowlisted setting, for /set to display.
+
+        These come from the RUNNING config, which for the risk block is what
+        aggressive.apply() left behind rather than what config.yaml says. That
+        is the honest number to show next to a proposed edit -- it is what the
+        bot is actually using -- and /set's reply is explicit that the write
+        goes to the file and needs a restart.
+        """
+        from . import settings as settings_mod
+        return {key: settings_mod.current_value(self.cfg, key)
+                for key in settings_mod.EDITABLE}
 
     def _scan_summary(self) -> dict:
         """
@@ -669,6 +973,99 @@ class Engine:
                     self.state.save()
                     self.notify.send(Event.STARTUP,
                                      f"Resumed ({origin}).\nCleared halt: {previous}")
+                elif cmd.action == "set":
+                    self.apply_setting(cmd.value, origin)
+                elif cmd.action == "restart":
+                    self.request_restart(origin)
+                elif cmd.action == "stop":
+                    self.notify.send(Event.HALT,
+                                     f"Stopping ({origin}). The bot will NOT come "
+                                     f"back on its own -- nothing will be polling "
+                                     f"Telegram, so this cannot be undone from here. "
+                                     f"Start it from a shell:\n"
+                                     f"  sudo systemctl start trading-bot\n\n"
+                                     f"Open positions and their stops stay on the "
+                                     f"exchange, unmonitored.")
+                    self.request_stop(f"stop requested ({origin})", 0)
+
+    def request_restart(self, origin: str = "") -> None:
+        """
+        Restart the process, unless doing so would spend systemd's last start.
+
+        There is no way to restart from inside the unit: NoNewPrivileges and
+        the @privileged syscall filter mean the bot cannot call systemctl on
+        itself, so the only lever is exiting non-zero and letting
+        `Restart=on-failure` bring it back. That lever is rate limited, and
+        running it out does not merely delay the next restart -- the unit
+        enters `failed` and needs `systemctl reset-failed` from a shell. So a
+        restart that would exhaust the budget is refused with the time to
+        wait, which is recoverable, instead of taken, which is not.
+        """
+        now = time.time()
+        spent = recent_restarts(now, self.restart_ledger)
+        if len(spent) >= RESTART_BUDGET:
+            wait = int(START_LIMIT_INTERVAL - (now - min(spent))) + 1
+            self.notify.send(
+                Event.ERROR,
+                f"Restart refused ({origin}): {len(spent)} already in the last "
+                f"{START_LIMIT_INTERVAL // 60} minutes.\n\nsystemd allows "
+                f"{START_LIMIT_BURST} starts per {START_LIMIT_INTERVAL // 60} "
+                f"minutes and stops the service for good once that runs out -- "
+                f"which would need a shell to undo, not Telegram. The remaining "
+                f"starts are kept for crash recovery.\n\nTry again in about "
+                f"{wait}s. The bot is still running and trading normally.")
+            return
+        record_restart(now, self.restart_ledger)
+        self.notify.send(Event.STARTUP,
+                         f"Restarting ({origin}). Back in about "
+                         f"{RESTART_DELAY_HINT}s; config.yaml is re-read "
+                         f"on the way up.\nOpen positions and their stops "
+                         f"stay on the exchange.")
+        self.request_stop(f"restart requested ({origin})",
+                          self.RESTART_EXIT_CODE)
+
+    def apply_setting(self, spec: str, origin: str = "") -> None:
+        """
+        Write one allowlisted setting to config.yaml.
+
+        Runs on the engine thread like every other command, but unlike the
+        others it does NOT change the running bot: most of these are read once
+        during startup, and aggressive.apply() overwrites the risk block
+        wholesale, so there is no honest way to un-apply a profile in place.
+        The write lands in the file and the next restart picks it up -- which
+        is what the reply says, rather than implying a change that has not
+        happened.
+        """
+        from . import settings as settings_mod
+
+        key, _, raw = (spec or "").partition("=")
+        key, raw = key.strip(), raw.strip()
+        setting = settings_mod.EDITABLE.get(key)
+        if setting is None:
+            self.notify.send(Event.ERROR, f"{key!r} is not an editable setting.")
+            return
+        try:
+            value = settings_mod.parse_value(setting, raw)
+            target = (self.cfg.config_path or "").split(" + ")[0]
+            old, new = settings_mod.write_setting(key, value, target)
+        except (ValueError, KeyError) as e:
+            self.notify.send(Event.ERROR, f"Refused: {e}")
+            return
+        except OSError as e:
+            # ProtectSystem=strict makes config.yaml read-only unless the unit
+            # lists it in ReadWritePaths. Say which, rather than "permission
+            # denied" against a path the operator cannot place.
+            self.notify.send(Event.ERROR,
+                             f"Could not write {target}: {e}\n\n"
+                             f"If this is a permission error, the systemd unit "
+                             f"needs config.yaml in ReadWritePaths.")
+            return
+        log.warning("config edit (%s): %s %s -> %s", origin, key, old, new)
+        self.notify.send(Event.STARTUP,
+                         f"config.yaml updated ({origin})\n\n"
+                         f"{key}\n  {old}  ->  {new}\n\n"
+                         f"Not live yet -- this is read at startup. "
+                         f"Send /restart to apply it.")
 
     #: A scan is ~101 REST calls and 40-60s of work. Cheap enough to ask for,
     #: expensive enough that it should not be spammable.
@@ -749,6 +1146,17 @@ class Engine:
                          + (f"\n\nCurrent market reading: {reading}" if reading else ""))
         return result
 
+    def _booked_line(self, pos: ActivePosition | None, how: str,
+                     expect_order_id=None) -> str:
+        """Book a close this engine made or found, as a line for its alert."""
+        if pos is None:
+            return ""
+        pnl = self.book_close(pos, how, expect_order_id=expect_order_id)
+        if pnl is None:
+            return "\nP&L could not be read from the exchange; not booked."
+        return (f"\nresult {pnl:+.2f} USDT\n"
+                f"{self.progress()}")
+
     def close_all(self, reason: str) -> int:
         """
         Flatten every open position, one at a time.
@@ -803,9 +1211,33 @@ class Engine:
             self.notify.send(Event.ERROR, f"Close failed reading position: {e}")
             return False
 
+        pos = self.book.get(symbol)
+        if pos is not None:
+            pos.exit_reason = reason
         if not live:
             log.info("close requested but %s is already flat", symbol)
-            self.notify.send(Event.DAILY_SUMMARY, f"Close requested; {symbol} already flat.")
+            # Flat does not mean nothing is resting. On 2026-09-13 a /close
+            # found KAVAUSDT flat because its limit entry had never filled,
+            # released tracking, and left that entry on the book: it filled
+            # two hours later into an untracked 529.4 long with no stop, which
+            # tripped the daily loss limit and held the margin every later
+            # signal was refused for. Clear the symbol before letting go of it.
+            try:
+                self.api.cancel_all(symbol)
+                log.info("cancelled anything still resting on %s", symbol)
+            except BinanceError as e:
+                log.error("%s is flat but its resting orders could not be "
+                          "cancelled: %s", symbol, e)
+                self.notify.send(Event.ERROR,
+                                 f"{symbol} is flat but its resting orders could "
+                                 f"not be cancelled: {e}\nCancel them on Binance "
+                                 f"by hand -- an entry left there can still fill.",
+                                 symbol=symbol)
+            # Closed on Binance by hand before the next reconcile noticed:
+            # releasing here without booking lost the trade's P&L entirely.
+            booked = self._booked_line(pos, "exchange-side")
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"Close requested; {symbol} already flat.{booked}")
             self.release(symbol)
             return True
 
@@ -826,9 +1258,9 @@ class Engine:
         # cannot conflict with a stop that fires concurrently. (QA R2)
         try:
             self._seq += 1
-            self.api.order(symbol=symbol, side=side, type="MARKET",
-                           quantity=qty, reduceOnly="true",
-                           newClientOrderId=client_order_id("x", self._seq))
+            resp = self.api.order(symbol=symbol, side=side, type="MARKET",
+                                  quantity=qty, reduceOnly="true",
+                                  newClientOrderId=client_order_id("x", self._seq))
             log.info("flattened %s %s (%s)", side, qty, reason)
         except BinanceError as e:
             log.error("close failed: %s", e)
@@ -841,8 +1273,13 @@ class Engine:
             self.api.cancel_all(symbol)
         except BinanceError as e:
             log.error("close succeeded but cancelling leftovers failed: %s", e)
+        # A close from Telegram or the dashboard released the position without
+        # booking it: realized_today, /pnl and the daily target never saw the
+        # AKEUSDT +3.09 of 2026-09-11. Book it from the exchange's fills.
+        close_id = resp.get("orderId") if isinstance(resp, dict) else None
+        booked = self._booked_line(pos, "manually", expect_order_id=close_id)
         self.notify.send(Event.DAILY_SUMMARY,
-                         f"{symbol} closed: {side} {qty} at market.\n{reason}",
+                         f"{symbol} closed: {side} {qty} at market.\n{reason}{booked}",
                          symbol=symbol)
         # release(symbol), NEVER `self.active = None`. The latter goes through
         # the property setter, which replaces the whole book -- so closing one
@@ -870,6 +1307,18 @@ class Engine:
                           self.cfg.aggressive.profile)
                 return False
             apply_aggressive(self.cfg, profile)
+            # config.yaml's max_leverage is a ceiling the profile cannot raise,
+            # so the leverage actually in force may be lower than the one the
+            # profile names. Report the effective figure: the banner, the
+            # P(ruin) model and the dashboard all read this, and a banner
+            # advertising 50x while the bot places 3x orders is the same class
+            # of misreporting that hid the 2026-09-08 liquidations.
+            if self.cfg.risk.max_leverage != profile.leverage:
+                log.warning("aggressive %s asks for %dx; config.yaml caps "
+                            "leverage at %dx, which is what will be used",
+                            profile.name, profile.leverage,
+                            self.cfg.risk.max_leverage)
+                profile = replace(profile, leverage=self.cfg.risk.max_leverage)
             self.aggressive_profile = profile
             if not self.cfg.aggressive.keep_daily_loss_limit:
                 self.cfg.risk.daily_loss_limit_pct = 100.0
@@ -892,7 +1341,7 @@ class Engine:
 
         snap = reconcile(self.api, self.cfg.symbol)
         self.actual_equity = snap["equity"]
-        self.equity = self.effective_equity(snap["equity"])
+        self.equity = self.sizing_equity(snap["equity"])
         if self.equity != self.actual_equity:
             log.warning("equity capped at %.2f USDT for sizing "
                         "(account actually holds %.2f)",
@@ -944,6 +1393,29 @@ class Engine:
         adopted = self.adopt_open_positions()
         if adopted:
             log.info("resumed %d position(s) from the exchange", adopted)
+        if self.squeeze is not None:
+            self.squeeze.restore()
+            q = self.squeeze.squeeze_cfg
+            log.info("squeeze mode ON%s: funding <= %.3f%%/8h, %d per round, up to %d "
+                     "positions at %.0f%% of equity (min $%.2f), stop %.0f%%, closed after %gh",
+                     " (PAPER)" if self.squeeze.paper else " (LIVE ORDERS)",
+                     q.entry.funding_at_most_pct, q.entry.max_new_per_round,
+                     q.entry.max_positions, q.entry.notional_pct_of_equity,
+                     q.entry.min_notional_usdt, q.exit.stop_pct, q.exit.max_hold_hours)
+        if self.gainer is not None:
+            self.gainer.restore()
+            g = self.gainer.cfg
+            log.info("gainer mining ON%s: top %d every %ds, $%.2f notional, "
+                     "target $%.2f, stop %.1f%%, up to %d positions",
+                     " (PAPER)" if self.gainer.paper else " (LIVE ORDERS)",
+                     g.board.top_n, g.board.poll_seconds, g.entry.notional_usdt,
+                     g.exit.target_usd, g.exit.stop_pct, g.entry.max_positions)
+            log.info("gainer swap guards: confirm %gmin, buy only if rising %s "
+                     "(>= %g %%/min), rebuy cooldown %gmin, on new leader %s, "
+                     "min hold %gmin",
+                     g.entry.confirm_minutes, g.entry.buy_only_if_rising,
+                     g.entry.min_rise_pct_per_min, g.entry.rebuy_cooldown_minutes,
+                     g.exit.on_new_leader, g.exit.min_hold_minutes)
 
         if not self.cfg.dry_run and self.cfg.symbol not in self.book:
             # Skipped when the configured symbol is itself an adopted position:
@@ -960,6 +1432,7 @@ class Engine:
         if self.cfg.portfolio.enabled:
             from .scanner import ScanConfig, Scanner
             self.scanner = Scanner(self.api, ScanConfig(**(self.cfg.universe or {})))
+            self.scanner.history_bars = self.strategy.warmup + 2
             log.info("portfolio mode ON: scanning up to %d symbols every %ds",
                      self.scanner.cfg.max_symbols, self.scanner.cfg.rescan_seconds)
             # Scan once now. Waiting for the first bar close meant /scan and the
@@ -1083,6 +1556,10 @@ class Engine:
                     self.process_commands()
                     self.publish()
                     self.periodic()
+                    if self.gainer is not None:
+                        self.gainer.tick()
+                    if self.squeeze is not None:
+                        self.squeeze.tick()
                 except BinanceError as e:
                     log.error("exchange error: %s", e)
                     if e.code in (-1021, -1022):
@@ -1092,10 +1569,33 @@ class Engine:
         except KeyboardInterrupt:
             self.shutdown(reason="interrupted")
             return 0
-        # Left the loop because trigger_kill() set the flag: the exchange work
-        # is already done, so shutdown only tears down threads.
-        self.shutdown(reason=self._stop_reason or "stopped", exchange_done=True)
-        return 0
+        # Left the loop because a stop was requested. trigger_kill() has
+        # already done the exchange work; a /stop or /restart has not, so it
+        # still needs its resting orders cancelled.
+        self.shutdown(reason=self._stop_reason or "stopped",
+                      exchange_done=self._stop_exchange_done)
+        return self._exit_code
+
+    #: Exit code that means "bring me back". Any non-zero value works with
+    #: Restart=on-failure; a distinct one makes the journal say why the process
+    #: went away rather than looking like a crash.
+    RESTART_EXIT_CODE = 75
+
+    def request_stop(self, reason: str, exit_code: int) -> None:
+        """
+        Leave the run loop cleanly and tell systemd whether to come back.
+
+        Used by /stop (exit 0, stays down) and /restart (exit 75, comes back
+        after RestartSec). Open positions and their protective stops are left
+        on the exchange either way -- only resting entry orders are cancelled,
+        by the shutdown path, exactly as `systemctl stop` already does.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        self._stop_reason = reason
+        self._exit_code = exit_code
+        self._stop_exchange_done = False
 
     def trigger_kill(self, reason: str) -> None:
         """
@@ -1236,7 +1736,7 @@ class Engine:
         except BinanceError as e:
             log.info("%s entry not cancellable (%s) -- likely filled or gone",
                      symbol, e)
-        self.notify.send(Event.HALT,
+        self.notify.send(Event.STOPPING,
                          f"Stopping with {symbol} still open.\n"
                          f"Its stop and take-profit are LEFT ON THE EXCHANGE so "
                          f"the position stays protected while the bot is down.")
@@ -1279,6 +1779,25 @@ class Engine:
         threshold = self.cfg.alerts.approach_pct / 100.0
         price = tick.mark_price
 
+        # An entry still resting as a limit order is not a position. Peak
+        # tracking, the supervisor and the proximity alerts all measure from a
+        # fill that has not happened, so they wait for one: reconcile_position
+        # sets `filled` the moment the exchange reports a size. Without this
+        # gate KAVAUSDT was trailed, split and alerted on for 34 minutes on
+        # 2026-09-13 against an order that never filled.
+        if not pos.filled:
+            return
+
+        # Mirrors a TRAILING_STOP_MARKET's own math locally; a no-op for any
+        # position without one (trailing_pct == 0). Must run before the
+        # progress checks below so "% of the way to the stop" reflects where
+        # the stop actually is right now, not where it was at entry.
+        pos.update_trailing_stop(price)
+        # Maximum favourable excursion, which every supervisor rule is gated
+        # on. Tracked whether or not an exchange-side trail exists.
+        pos.track_peak(price)
+        self.supervise_position(pos, price)
+
         to_tp = pos.progress_to_tp(price)
         if to_tp >= threshold:
             self.notify.send(
@@ -1295,6 +1814,228 @@ class Engine:
 
         if self.cfg.dry_run:
             self.simulate_exit(price, tick.symbol)
+
+    # ----------------------------------------------------------- supervision
+    #: How stale the held symbol's bars may get before they are refetched. ATR
+    #: and the efficiency ratio are computed from 15-minute bars and barely
+    #: move inside one minute, so refreshing on every 20-second tick would be
+    #: three requests to learn the same number.
+    HELD_BARS_MAX_AGE = 60.0
+
+    #: Do not cancel and replace a protective order for a move smaller than
+    #: this fraction of price. A trail recomputed every tick would otherwise
+    #: churn two API calls a tick for a stop moving by a tick size.
+    MIN_STOP_MOVE_PCT = 0.10
+
+    def interval_seconds(self) -> float:
+        """cfg.interval ("15m", "1h", "4h") as seconds."""
+        raw = str(self.cfg.interval).strip().lower()
+        unit = raw[-1]
+        try:
+            n = float(raw[:-1])
+        except ValueError:
+            return 900.0
+        return n * {"m": 60.0, "h": 3600.0, "d": 86400.0}.get(unit, 60.0)
+
+    def held_bars(self, symbol: str) -> list:
+        """
+        Recent bars for a symbol we are HOLDING, cached and refreshed slowly.
+
+        poll_once fetches klines for cfg.symbol only, and in portfolio mode
+        that symbol is not the one being traded -- its bars exist to notice
+        when a bar has closed. Repointing that request at the held symbol
+        would move the bar-close clock around as positions open and close, so
+        this is a second, cached one instead.
+        """
+        cache = getattr(self, "_held_bars", None)
+        if cache is None:
+            cache = self._held_bars = {}
+        hit = cache.get(symbol)
+        if hit and time.time() - hit[0] < self.HELD_BARS_MAX_AGE:
+            return hit[1]
+        try:
+            raw = self.api.klines(symbol, self.cfg.interval,
+                                  limit=self.strategy.warmup + 10)
+        except BinanceError as e:
+            log.debug("held bars for %s unavailable: %s", symbol, e)
+            return hit[1] if hit else []
+        bars = [Bar.from_kline(k) for k in raw[:-1]]
+        cache[symbol] = (time.time(), bars)
+        return bars
+
+    #: How long a slower-chart trend reading is reused. A 4h bar closes six
+    #: times a day; re-reading it every 20-second tick would be ~700 requests
+    #: to learn the same number.
+    HIGHER_TREND_MAX_AGE = 300.0
+
+    def higher_trend(self, symbol: str) -> int:
+        """
+        The slower chart's trend for `symbol` (bot/context.py): +1 up, -1
+        down, 0 flat -- and 0 when it cannot be read, so a failed request
+        never blocks a trade or changes how one is supervised.
+        """
+        cache = getattr(self, "_higher_trend", None)
+        if cache is None:
+            cache = self._higher_trend = {}
+        hit = cache.get(symbol)
+        if hit and time.time() - hit[0] < self.HIGHER_TREND_MAX_AGE:
+            return hit[1]
+        tc = self.cfg.context.trend
+        try:
+            raw = self.api.klines(symbol, tc.interval,
+                                  limit=tc.sma_bars + tc.slope_bars + 2)
+            closes = closed_closes(raw, int(time.time() * 1000))
+            trend = trend_direction(closes, tc.sma_bars, tc.slope_bars)
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError,
+                IndexError) as e:
+            log.debug("%s %s trend unavailable: %s", symbol, tc.interval, e)
+            return hit[1] if hit else 0
+        cache[symbol] = (time.time(), trend)
+        return trend
+
+    def scale_out_qty(self, pos) -> float:
+        """
+        The quantity to leave on the take-profit when splitting the position,
+        or 0.0 when this account cannot legally split it.
+
+        BOTH halves have to clear the exchange minimum -- the half being banked
+        and the half left running -- so this returns 0 until the position is
+        worth at least twice the minimum notional. That is the whole enable
+        switch for the runner rule: no flag to remember to turn on later, it
+        starts working by itself once the account can afford it.
+        """
+        rules = self.rules_for(pos.symbol)
+        if rules is None or pos.qty <= 0 or pos.entry <= 0:
+            return 0.0
+        try:
+            floor = float(rules.min_notional)
+        except (TypeError, ValueError):
+            return 0.0
+        half = pos.qty / 2.0
+        try:
+            half = float(rules.round_qty(half))
+        except Exception:
+            return 0.0
+        if half <= 0:
+            return 0.0
+        # Both sides, priced at entry: the banked half and what remains.
+        if half * pos.entry < floor or (pos.qty - half) * pos.entry < floor:
+            return 0.0
+        return half
+
+    def supervise_position(self, pos, price: float) -> None:
+        """Run bot/supervise.py against one open position and act on the plan."""
+        cfg = getattr(self.cfg, "supervise", None)
+        if cfg is None or not cfg.enabled or self.cfg.dry_run:
+            return
+        if not pos.filled:
+            return          # a resting entry has nothing to supervise
+        if getattr(pos, "strategy", "") in ("gainer", "squeeze"):
+            return          # their own modules own their exits; the R rules do not apply
+        bars = self.held_bars(pos.symbol)
+        params = self.cfg.params or {}
+        atr_period = int((params.get("trend") or {}).get("atr_period", 14))
+        er_window = int((params.get("regime") or {}).get("window", 30))
+        # -1 means "unknown", and the supervisor treats it as such. Passing
+        # efficiency_ratio's 0.0-for-too-few-bars straight through would read
+        # as a dead market and trip the horizon rule on a cold start.
+        a = true_range(bars, atr_period) if len(bars) > atr_period else 0.0
+        er = efficiency_ratio(bars, er_window) if len(bars) > er_window else -1.0
+        # Signed, in market terms: the supervisor applies the position's own
+        # direction. Measured to the LIVE price rather than the last closed
+        # bar, so a turn inside the forming bar is not invisible for 15 minutes.
+        w = int(cfg.horizon.drift_window_bars)
+        drift = ((price - bars[-w].close) / w) if len(bars) >= w and w > 0 else 0.0
+        age = (time.time() * 1000 - pos.opened_ms) / 1000.0 if pos.opened_ms else 0.0
+        # Read only when patience can use it: one cached request per symbol.
+        higher = self.higher_trend(pos.symbol) if cfg.patience.enabled else 0
+        reading = Reading(price=price, atr=a, efficiency=er, age_seconds=age,
+                          net_move_per_bar=drift,
+                          bar_seconds=self.interval_seconds(),
+                          higher_trend=higher)
+        plan = supervise(pos, reading, cfg, scale_out_qty=self.scale_out_qty(pos))
+        if plan:
+            self.apply_plan(pos, plan, price)
+
+    def apply_plan(self, pos, plan, price: float) -> None:
+        """
+        Execute a supervisor Plan. The only place in this module that spends
+        money on the strength of one.
+        """
+        if plan.exit_now:
+            log.info("%s supervisor exit: %s", pos.symbol, plan.why)
+            self.close_position(f"supervisor -- {plan.why}", symbol=pos.symbol)
+            self.notify.send(Event.DAILY_SUMMARY,
+                             f"{pos.symbol} closed by the supervisor.\n{plan.why}",
+                             symbol=pos.symbol)
+            return
+
+        if plan.stop is not None:
+            move = abs(plan.stop - pos.stop) / price * 100 if price else 0.0
+            if move >= self.MIN_STOP_MOVE_PCT:
+                if self.replace_protective(pos, "stop", plan.stop):
+                    log.info("%s stop -> %.8g: %s", pos.symbol, plan.stop, plan.why)
+                    pos.stop = plan.stop
+
+        if plan.target is not None or plan.target_qty is not None:
+            level = plan.target if plan.target is not None else pos.take_profit
+            qty = plan.target_qty if plan.target_qty is not None else pos.qty
+            if self.replace_protective(pos, "tp", level, qty=qty):
+                log.info("%s take-profit -> %.8g x %g: %s",
+                         pos.symbol, level, qty, plan.why)
+                pos.take_profit = level
+                if plan.target_qty is not None:
+                    pos.runner = True
+                    self.notify.send(
+                        Event.DAILY_SUMMARY,
+                        f"{pos.symbol}: banking {qty:g} at {level:,.6g} and "
+                        f"letting the rest run.\n{plan.why}", symbol=pos.symbol)
+
+    def replace_protective(self, pos, leg: str, level: float,
+                           qty: float | None = None) -> bool:
+        """
+        Move one protective order. Returns True only if the new one is live.
+
+        PLACE FIRST, CANCEL SECOND, for the same reason close_position closes
+        before it cancels. Cancelling first opens a window where the position
+        has no protection, and if the replacement then fails the account sits
+        naked. Both legs are reduceOnly, so a brief overlap is harmless: the
+        one that triggers second can only close what is already gone, and
+        Binance clamps it to nothing.
+        """
+        old_id = pos.stop_order_id if leg == "stop" else pos.tp_order_id
+        exit_side = "SELL" if pos.is_long else "BUY"
+        rules = self.rules_for(pos.symbol)
+        price_s = rules.round_price(level) if rules else f"{level}"
+        qty_s = rules.round_qty(qty if qty is not None else pos.qty) if rules \
+            else f"{qty if qty is not None else pos.qty}"
+        self._seq += 1
+        new_id = client_order_id("s" if leg == "stop" else "t", self._seq)
+        kind = "STOP_MARKET" if leg == "stop" else "TAKE_PROFIT_MARKET"
+        try:
+            self.api.algo_order(symbol=pos.symbol, side=exit_side, type=kind,
+                                triggerPrice=price_s, quantity=qty_s,
+                                reduceOnly="true", workingType="MARK_PRICE",
+                                clientAlgoId=new_id)
+        except BinanceError as e:
+            # The old order is still on the book. Nothing is unprotected.
+            log.warning("%s: could not move the %s to %s (%s); leaving it where "
+                        "it is", pos.symbol, leg, price_s, e)
+            return False
+        if old_id:
+            try:
+                self.api.cancel_algo_order(old_id)
+            except BinanceError as e:
+                log.error("%s: new %s %s is live but cancelling the old one (%s) "
+                          "failed: %s. Both are reduceOnly, so the tighter one "
+                          "wins and the other closes nothing.",
+                          pos.symbol, leg, new_id, old_id, e)
+        if leg == "stop":
+            pos.stop_order_id = new_id
+            self.state.stop_order_id = new_id
+        else:
+            pos.tp_order_id = new_id
+        return True
 
     def simulate_entry(self, price: float, symbol: str | None = None) -> None:
         """
@@ -1337,6 +2078,10 @@ class Engine:
                 continue
 
             del self._dry_pending[sym]
+            # The simulated fill is this path's fill confirmation: without it
+            # on_tick would stand the position down as an unfilled entry and
+            # dry-run mode would never manage or close anything.
+            pending.filled = True
             self.book[sym] = pending
             self.risk.record_fill()
             log.info("dry_run: %s entry filled at %.6f", sym, px)
@@ -1367,10 +2112,11 @@ class Engine:
         pnl = gross - fees
 
         self.state.realized_today += pnl
+        self.note_realized(pnl)
         self.risk.record_fill()
         self.equity += pnl
         event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         self.notify.send(event,
                          f"DRY RUN -- simulated close at {exit_px:,.4f} "
                          f"for {pnl:+.2f} USDT\n{prog}", symbol=pos.symbol)
@@ -1423,13 +2169,16 @@ class Engine:
             return
 
         # A stop or take-profit filling means the position is closed.
-        closing = (upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET")
+        closing = (upd.order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET",
+                                       "TRAILING_STOP_MARKET")
                    or upd.client_order_id == pos.stop_order_id)
 
         if closing:
             pnl = upd.realized_pnl
             self.state.realized_today += pnl
+            self.note_realized(pnl)
             self.state.save()
+            self.sweep_gainer_profit(pos, pnl)
             event = Event.TP_HIT if pnl >= 0 else Event.SL_HIT
             if self.signals is not None and pos.entry:
                 move = (upd.avg_price - pos.entry) / pos.entry * 100
@@ -1438,7 +2187,7 @@ class Engine:
                     move if pos.is_long else -move,
                     "take-profit" if pnl >= 0 else "stop-loss",
                     mode=self.cfg.mode, dry_run=self.cfg.dry_run)
-            prog = self.schedule.progress(self.state.realized_today)
+            prog = self.progress()
             self.notify.send(
                 event,
                 f"{upd.symbol} closed at {upd.avg_price:,.4f} for "
@@ -1452,18 +2201,14 @@ class Engine:
             # both progress bars, the 80% proximity thresholds -- was being
             # computed against the limit price we asked for rather than the
             # price we got. (QA F9)
-            asked = pos.entry                  # capture BEFORE overwriting (QA R6)
-            if upd.avg_price:
-                pos.entry = upd.avg_price
-            if upd.cumulative_qty:
-                pos.qty = upd.cumulative_qty
-            self.risk.record_fill()
-            slip = (upd.avg_price - asked) if upd.avg_price else 0.0
-            self.notify.send(
-                Event.TRADE_OPEN,
-                f"{upd.symbol} entry filled at {upd.avg_price:,.4f} "
-                f"(asked {asked:,.4f}, slippage {slip:+.4f})\n"
-                f"{pos.status_line(upd.avg_price)}", symbol=upd.symbol)
+            #
+            # Guarded because reconcile_position reaches the same handler off
+            # the polling path, and whichever of the two observes the fill
+            # first must be the only one to count it: record_fill increments
+            # total_trades, so a race between them would book the trade twice.
+            if not pos.filled:
+                pos.filled = True
+                self.on_entry_filled(pos, upd.cumulative_qty, upd.avg_price)
 
     # -------------------------------------------------------------- periodic
     def periodic(self) -> None:
@@ -1477,13 +2222,13 @@ class Engine:
 
         snap = reconcile(self.api, self.cfg.symbol)
         self.actual_equity = snap["equity"]
-        self.equity = self.effective_equity(snap["equity"])
+        self.equity = self.sizing_equity(snap["equity"])
 
         self.rebase_day_start_equity()
         if self.state.roll_day_if_needed(self.equity):
             self.schedule.start_date = self.state.schedule_start_date
             step = self.schedule.escalates_today()
-            if step:
+            if step and self.schedule.stop_when_reached:
                 self.notify.send(Event.TARGET_RAISED,
                                  f"Day {self.schedule.day_number()}: target raised to "
                                  f"${step.usd_per_day:.2f}/day.\n"
@@ -1494,18 +2239,55 @@ class Engine:
 
         self.position_amt = snap["position_amt"]
         self.reconcile_position(snap)
-        if self.cfg.portfolio.enabled and self.book:
+        # Even with an empty book: an empty book is exactly when a position the
+        # bot lost track of goes unnoticed (see reconcile_book).
+        if (self.cfg.portfolio.enabled or self.gainer is not None
+                or self.cfg.supervise.protect.watch.enabled):
             self.reconcile_book()
+        try:
+            self.monitor_positions(now)
+        except Exception:
+            log.exception("position monitor failed -- continuing")
 
-        hb = self.cfg.alerts.heartbeat_minutes
+        hb =self.cfg.alerts.heartbeat_minutes
         if hb and now - self._last_heartbeat > hb * 60:
             self._last_heartbeat = now
-            prog = self.schedule.progress(self.state.realized_today)
+            prog = self.progress()
             self.notify.send(Event.DAILY_SUMMARY,
                              f"{prog}\nequity ${self.equity:,.2f}  "
                              f"price {self.last_price:,.4f}\n"
                              f"position: {'yes' if self.active else 'flat'}  "
                              f"trades today {self.state.trades_today}")
+
+    def on_entry_filled(self, pos, qty: float, entry_price: float = 0.0) -> None:
+        """
+        A resting entry has become a real position. Correct the book to what
+        was actually bought and tell the user once, here, rather than when the
+        order was merely placed.
+
+        With realtime false there is no user-data stream, so this is reached
+        from reconcile_position -- the only thing on that path that ever sees
+        a fill. Before it existed `pos.entry` kept the LIMIT price the bot
+        asked for for the life of the trade, and every reading measured
+        against it was off by the slippage: UAIUSDT logged "the trade is not
+        in profit" on 2026-09-12 and then booked +0.0319.
+        """
+        asked = pos.entry
+        if entry_price > 0:
+            pos.entry = entry_price
+        if qty > 0:
+            pos.qty = qty
+        self.risk.record_fill()
+        slip = (pos.entry - asked) if entry_price > 0 else 0.0
+        log.info("%s entry filled: %g @ %.8g (asked %.8g, slippage %+.8g)",
+                 pos.symbol, pos.qty, pos.entry, asked, slip)
+        self.notify.send(
+            Event.TRADE_OPEN,
+            f"{pos.symbol} entry filled: {pos.side} {pos.qty:g} @ "
+            f"{pos.entry:,.6g}\n"
+            f"asked {asked:,.6g}, slippage {slip:+.6g}\n"
+            f"SL {pos.stop:,.6g}   TP {pos.take_profit:,.6g}",
+            symbol=pos.symbol)
 
     def reconcile_position(self, snap: dict, symbol: str | None = None) -> None:
         """
@@ -1524,6 +2306,13 @@ class Engine:
             return                      # dry-run positions are simulated locally
 
         if snap["position_amt"] != 0.0:
+            # The exchange reporting a size IS the fill confirmation on the
+            # polling path, where there is no user-data stream to deliver one.
+            # Everything gated on `filled` starts here.
+            if not pos.filled:
+                pos.filled = True
+                self.on_entry_filled(pos, abs(float(snap["position_amt"])),
+                                     float(snap.get("entry_price") or 0.0))
             self._entry_placed_at = self._entry_placed_at or time.time()
             self._flat_reconciles = 0
             return
@@ -1536,6 +2325,33 @@ class Engine:
         if pos.entry_order_id in still_open:
             self.expire_stale_entry(snap, symbol)
             return
+
+        # Flat with the entry gone is ambiguous until the fill is confirmed.
+        # reconcile_book reads positions BEFORE open orders, so an entry that
+        # fills between the two reads looks exactly like a finished trade:
+        # no size, no entry, a stop still listed. On 2026-09-14 that cancelled
+        # LITUSDT's stop and take-profit one second after its entry filled and
+        # left a live 3.7 long unprotected and untracked. Ask again, for this
+        # symbol alone, before letting go of anything.
+        if not pos.filled:
+            try:
+                rows = self.api.positions(symbol)
+            except BinanceError as e:
+                log.error("%s reads flat with its entry gone and the position "
+                          "could not be re-checked (%s); keeping it for the "
+                          "next reconcile", symbol, e)
+                return
+            row = next((r for r in rows or []
+                        if float(r.get("positionAmt") or 0.0) != 0.0), None)
+            if row is not None:
+                log.warning("%s entry filled between reconcile reads; keeping "
+                            "its protective orders", symbol)
+                self.reconcile_position(
+                    {"position_amt": float(row["positionAmt"]),
+                     "entry_price": float(row.get("entryPrice") or 0.0),
+                     "open_order_ids": snap.get("open_order_ids", set())},
+                    symbol=symbol)
+                return
 
         # Anything else still listed is a leftover STOP or TAKE_PROFIT, which
         # carry closePosition:true -- with the account flat the trade is over
@@ -1598,7 +2414,8 @@ class Engine:
         get noticed for a scanner symbol.
         """
         try:
-            live = {r["symbol"]: r for r in self.api.positions()}
+            live = {r["symbol"]: r for r in self.api.positions()
+                    if not self.is_manual(r["symbol"])}
             # Stops are algo orders now and are absent from open_orders(), so
             # both lists are needed -- on the first alone every protected
             # position looks like it lost its stop. (Binance algo migration)
@@ -1615,9 +2432,236 @@ class Engine:
             row = live.get(symbol)
             self.reconcile_position(
                 {"position_amt": float(row["positionAmt"]) if row else 0.0,
+                 # The average price actually paid. On the polling path this is
+                 # the only place the real fill price is ever seen.
+                 "entry_price": float(row.get("entryPrice") or 0.0) if row else 0.0,
                  "open_order_ids": by_symbol.get(symbol, set())},
                 symbol=symbol)
+        self.protect_positions(live, orders)
+        self.warn_untracked(live)
         return live
+
+    def protect_positions(self, live: dict, orders: list) -> None:
+        """
+        The protection watchdog. Every open position gets a stop-loss and a
+        take-profit on the exchange; any that is missing one is repaired here,
+        and one the bot is not tracking at all is adopted first.
+
+        Runs on every reconcile, halted or not: a halt stops NEW trades, and
+        the STGUSDT long of 2026-09-19 sat naked for four hours precisely
+        because the halt was the only thing that happened. See bot/protect.py
+        for how the levels are chosen.
+        """
+        pcfg = self.cfg.supervise.protect
+        if not pcfg.watch.enabled or self.cfg.dry_run:
+            return
+        by_symbol: dict[str, list] = {}
+        for o in orders:
+            by_symbol.setdefault(o.get("symbol", ""), []).append(o)
+        for symbol, row in live.items():
+            try:
+                amt = float(row.get("positionAmt") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amt == 0.0:
+                continue
+            if symbol not in self.book:
+                if not pcfg.watch.adopt_untracked:
+                    continue            # warn_untracked reports it
+                pos = self.adopt_row({**row, "symbol": symbol},
+                                     by_symbol.get(symbol, []))
+                self.notify.send(
+                    Event.ERROR,
+                    f"{symbol}: found {amt:g} open (entry {pos.entry:,.6g}) "
+                    f"that the bot was not tracking. It is tracked now and "
+                    f"will be protected and supervised.", symbol=symbol)
+            try:
+                self.ensure_protected(symbol, by_symbol.get(symbol, []))
+            except Exception:
+                # One symbol's surprise must not stop the others being checked.
+                log.exception("%s: protection check failed", symbol)
+
+    def ensure_protected(self, symbol: str, orders: list) -> str:
+        """
+        Put back whatever protection one tracked position is missing.
+
+        Returns "ok" (both orders were there), "protected" (repaired),
+        "closed" (closed at market instead), "failed" (still unprotected) or
+        "skipped" (not a filled position, or nothing could be read).
+        """
+        pos = self.book.get(symbol)
+        if pos is None or not pos.filled:
+            return "skipped"
+        failures = getattr(self, "_protect_failures", None)
+        if failures is None:
+            failures = self._protect_failures = {}
+        stop_o, tp_o = self.protective_legs(orders)
+        # A position run with no take-profit on purpose (gainer ladder) is
+        # complete with its stop alone.
+        wants_tp = not pos.no_target
+        if stop_o and (tp_o or not wants_tp):
+            failures.pop(symbol, None)
+            return "ok"
+
+        # Something looks missing. Read again, for this symbol alone, before
+        # acting: reconcile reads positions BEFORE orders, so a stop that
+        # triggered in between reads as "open with no stop", and a new stop on
+        # a position that no longer exists is the last thing wanted.
+        try:
+            rows = self.api.positions(symbol)
+            fresh = (list(self.api.open_orders(symbol))
+                     + list(self.api.open_algo_orders(symbol)))
+            mark = float(self.api.mark_price(symbol)["markPrice"])
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError) as e:
+            log.error("%s looks unprotected but could not be re-read (%s); "
+                      "retrying next reconcile", symbol, e)
+            return "skipped"
+        row = next((r for r in rows or []
+                    if float(r.get("positionAmt") or 0.0) != 0.0), None)
+        if row is None:
+            return "skipped"            # closed meanwhile; reconcile books it
+        stop_o, tp_o = self.protective_legs(fresh)
+        if stop_o and (tp_o or not wants_tp):
+            failures.pop(symbol, None)
+            return "ok"
+        pos.qty = abs(float(row["positionAmt"]))
+
+        a, er = self.market_reading(symbol)
+        plan = plan_protection(
+            long=pos.is_long, mark=mark, atr=a, efficiency=er,
+            has_stop=stop_o is not None,
+            has_target=tp_o is not None or not wants_tp,
+            planned_stop=pos.stop, planned_target=pos.take_profit,
+            cfg=self.cfg.supervise.protect)
+        missing = " and ".join(n for n, o in (("stop-loss", stop_o),
+                                               ("take-profit", tp_o or not wants_tp))
+                               if not o)
+        log.critical("%s is open with no %s: %s", symbol, missing, plan.why)
+
+        if plan.close_now:
+            closed = self.close_position(f"protection watchdog -- {plan.why}",
+                                         symbol=symbol)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} had no {missing}, and the market is already past "
+                f"its planned stop. " + ("Closed at market." if closed else
+                "Closing it FAILED -- close it on Binance."), symbol=symbol)
+            failures.pop(symbol, None)
+            return "closed" if closed else "failed"
+
+        placed = []
+        stop_ok = True
+        if plan.stop is not None:
+            # The recorded id names an order that is gone; cancelling it after
+            # the replacement lands would only log a spurious failure.
+            pos.stop_order_id = ""
+            stop_ok = self.replace_protective(pos, "stop", plan.stop)
+            if stop_ok:
+                pos.stop = plan.stop
+                if pos.initial_risk <= 0:
+                    # An adopted position whose 1R was unknown: the stop just
+                    # placed IS the risk being carried now, so the supervisor
+                    # measures from it rather than standing down.
+                    pos.initial_stop = plan.stop
+                    pos.initial_risk = abs(mark - plan.stop)
+                placed.append(f"SL {plan.stop:,.6g}")
+        if plan.target is not None:
+            pos.tp_order_id = ""
+            if self.replace_protective(pos, "tp", plan.target):
+                pos.take_profit = plan.target
+                if not pos.initial_target:
+                    pos.initial_target = plan.target
+                placed.append(f"TP {plan.target:,.6g}")
+
+        if stop_ok and not placed:
+            # Only a take-profit was missing and it was refused. The stop is
+            # on the book, so the position is protected; say so once, retry.
+            failures.pop(symbol, None)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} has no take-profit and placing one failed. Its "
+                f"stop-loss is in place. Retrying every minute.",
+                dedupe_key=f"protect-tp:{symbol}", symbol=symbol)
+            return "failed"
+        if stop_ok:
+            failures.pop(symbol, None)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol} was open with no {missing}. The watchdog placed "
+                f"{', '.join(placed) or 'nothing'} (mark {mark:,.6g}).\n"
+                f"{plan.why}", symbol=symbol)
+            return "protected"
+
+        n = failures[symbol] = failures.get(symbol, 0) + 1
+        limit = int(self.cfg.supervise.protect.failure.close_after_attempts)
+        if limit and n >= limit:
+            closed = self.close_position(
+                f"protection watchdog -- no stop could be placed after {n} "
+                f"attempts", symbol=symbol)
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol}: no stop could be placed after {n} attempts. "
+                + ("Closed at market." if closed else
+                   "Closing it FAILED too -- close it on Binance."),
+                symbol=symbol)
+            if closed:
+                failures.pop(symbol, None)
+            return "closed" if closed else "failed"
+        self.notify.send(
+            Event.ERROR,
+            f"{symbol} has no stop-loss and placing one failed "
+            f"(attempt {n}" + (f" of {limit}" if limit else "") + "). "
+            "Retrying next minute" + ("; it is closed at market if that "
+            "keeps failing." if limit else "."),
+            dedupe_key=f"protect:{symbol}:{n}", symbol=symbol)
+        return "failed"
+
+    def market_reading(self, symbol: str) -> tuple[float, float]:
+        """(ATR in price units, efficiency ratio) of a symbol's recent bars,
+        with 0.0 / -1.0 standing for unknown -- the same reading the
+        supervisor takes."""
+        try:
+            bars = self.held_bars(symbol)
+        except Exception as e:          # no strategy warmup, no bars: unknown
+            log.debug("%s: no bars for a market reading (%s)", symbol, e)
+            bars = []
+        params = self.cfg.params or {}
+        atr_period = int((params.get("trend") or {}).get("atr_period", 14))
+        er_window = int((params.get("regime") or {}).get("window", 30))
+        a = true_range(bars, atr_period) if len(bars) > atr_period else 0.0
+        er = efficiency_ratio(bars, er_window) if len(bars) > er_window else -1.0
+        return a, er
+
+    def warn_untracked(self, live: dict) -> None:
+        """
+        Say so, loudly, when the exchange holds a position the book does not.
+
+        Nothing else would. The per-minute "reconciled:" line only ever read
+        cfg.symbol, so on 2026-09-13 it logged "position=0.0" for four hours
+        while an untracked KAVAUSDT long sat open with no stop, holding the
+        margin that every new signal was then refused for. Report only; the
+        bot does not trade a position it did not size.
+        """
+        for symbol, row in live.items():
+            try:
+                amt = float(row.get("positionAmt") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if amt == 0.0 or symbol in self.book:
+                continue
+            log.warning("%s: exchange holds %s that the bot is NOT tracking "
+                        "(entry %s, unrealised %s); no stop is managed for it",
+                        symbol, amt, row.get("entryPrice"),
+                        row.get("unRealizedProfit"))
+            self.notify.send(
+                Event.ERROR,
+                f"{symbol}: the exchange holds {amt:g} (entry "
+                f"{row.get('entryPrice')}) that the bot is NOT tracking. It has "
+                f"no managed stop and is using margin. Set a stop-loss on "
+                f"Binance or close it there, or turn on "
+                f"supervise.protect.watch.adopt_untracked to have the bot take "
+                f"it over and protect it.",
+                dedupe_key=f"untracked:{symbol}:{amt}", symbol=symbol)
 
     def expire_stale_entry(self, snap: dict, symbol: str | None = None) -> None:
         """
@@ -1755,11 +2799,88 @@ class Engine:
             self.decide()
 
     # -------------------------------------------------------------- decision
+    def progress(self):
+        """Today's progress as every alert prints it: against the dollar
+        target when targets.stop_when_reached is on, against the day's
+        opening equity when it is off, plus the net since the last restart."""
+        equity = self.state.day_start_equity or self.equity
+        return self.schedule.progress(self.state.realized_today, equity=equity,
+                                      since_restart=self.session_realized)
+
+    def note_realized(self, pnl: float) -> None:
+        """Every booked close passes through here, on every path."""
+        self.session_realized += pnl
+
+    def after_close(self, pos: ActivePosition, how: str, pnl: float) -> None:
+        """Journal a booked close, and queue a supervisor exit for review."""
+        self.sweep_gainer_profit(pos, pnl)
+        if self.journal is not None:
+            self.journal.record(pos, pnl, closed_by=how, mode=self.cfg.mode)
+        reason = pos.exit_reason or ""
+        if (self.review is not None and reason.startswith("supervisor")
+                and self.cfg.supervise.monitor.review_exits):
+            self.review.add(pos, pnl, reason)
+
+    def sweep_gainer_profit(self, pos: ActivePosition, pnl: float) -> None:
+        """gainer.sweep: bank part of a winning gainer trade, then check the
+        principal rule. Never raises."""
+        owner = {"gainer": self.gainer, "squeeze": self.squeeze}.get(
+            getattr(pos, "strategy", ""))
+        if owner is None:
+            return
+        try:
+            owner.note_close(pnl)
+            owner.sweep_profit(pos.symbol, pnl)
+            owner.check_principal()
+        except Exception:
+            log.exception("gainer sweep after %s failed", pos.symbol)
+
+    def sizing_equity(self, actual: float) -> float:
+        """effective_equity, less money set aside for the Funding wallet: a
+        transfer that failed must not be traded and lost meanwhile."""
+        reserved = sum(m.reserved_usdt for m in (self.gainer, self.squeeze) if m is not None)
+        return max(0.0, self.effective_equity(actual) - reserved)
+
+    def monitor_positions(self, now: float | None = None) -> None:
+        """
+        The supervisor's report card, run from periodic():
+          - resolve supervisor-exit reviews (every 15 minutes)
+          - the open-positions report (every monitor.report_minutes)
+        """
+        now = time.time() if now is None else now
+        mcfg = self.cfg.supervise.monitor
+        if self.review is not None and self.review.pending \
+                and now - self._last_review_check >= 900:
+            self._last_review_check = now
+
+            def bars(symbol):
+                return [Bar.from_kline(k)
+                        for k in self.api.klines(symbol, "15m", limit=120)]
+            for r in self.review.resolve(bars, expire_hours=mcfg.review_hours):
+                text = describe_review(r, self.review.totals)
+                log.info("%s", text.replace("\n", " "))
+                self.notify.send(Event.DAILY_SUMMARY, text, symbol=r.symbol)
+
+        if (mcfg.report_minutes > 0 and self.book
+                and now - self._last_position_report >= mcfg.report_minutes * 60):
+            self._last_position_report = now
+            rows = [(p, (self.last_prices or {}).get(sym, 0.0),
+                     bool(p.stop_order_id) and bool(p.tp_order_id or not p.take_profit))
+                    for sym, p in self.book.items() if p.filled]
+            text = position_report(rows)
+            if text:
+                self.notify.send(Event.DAILY_SUMMARY,
+                                 f"{text}\n{self.progress()}")
+
     def check_target_reached(self) -> bool:
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
         if prog.reached and not self.state.target_reached_today:
             self.state.target_reached_today = True
             self.state.save()
+            if not prog.enforced:
+                # The target decides nothing when it is off; announcing it
+                # "banked" made a $2 figure look like a rule being followed.
+                return False
             self.notify.send(
                 Event.TARGET_REACHED,
                 f"Day {prog.day} target of ${prog.target:.2f} banked "
@@ -1787,7 +2908,9 @@ class Engine:
         if not pf.enabled or self.scanner is None:
             return 0
 
-        if self.scanner.due() or self.scanner.last is None:
+        # stale(): a bar closed after the cached scan, so its bars would price
+        # the signal off a market that has moved on. (AKEUSDT, 2026-09-11)
+        if self.scanner.due() or self.scanner.last is None or self.scanner.stale():
             self.scanner.scan(risk_budget_notional=self._scan_budget(),
                               rules_for=self.rules_for)
 
@@ -1847,7 +2970,8 @@ class Engine:
                 log.info("portfolio: %s refused -- %s", cand.symbol, gate.reason)
                 continue
 
-            self.place(signal, sized.qty_notional, sized.reason, symbol=cand.symbol)
+            self.place(signal, sized.qty_notional, sized.reason,
+                      symbol=cand.symbol, atr_pct=cand.atr_pct)
             # Subscribe for a RESTING entry too, not only a filled position --
             # in dry run the entry sits in _dry_pending and would otherwise
             # never receive a tick of its own.
@@ -1860,7 +2984,7 @@ class Engine:
             opened += 1
 
         if opened:
-            log.info("portfolio: opened %d position(s), %d held",
+            log.info("portfolio: placed %d entry order(s), %d tracked",
                      opened, len(self.book))
         return opened
 
@@ -1902,12 +3026,168 @@ class Engine:
             log.warning("signal rejected by risk: %s", sized.reason)
             return
 
-        self.place(signal, sized.qty_notional, sized.reason)
+        self.place(signal, sized.qty_notional, sized.reason,
+                  atr_pct=realised_vol_pct(self.bars, 14))
 
     # ---------------------------------------------------------------- orders
+    def protective_levels_crossed(self, symbol: str, side: str,
+                                  stop: float, tp: float,
+                                  entry: float = 0.0) -> str:
+        """
+        Why this trade's stop or take-profit is already on the wrong side of
+        the market, or "" when both are placeable.
+
+        Binance rejects a trigger the mark price has already passed (-2021),
+        and place() halts on any protective-order failure -- correctly, since
+        it cannot tell a transient refusal from a real one. A signal priced
+        off stale bars is not a fault to halt over, it is a trade that no
+        longer exists, so it is caught here, before anything is sent.
+
+        An unreadable mark price returns "" and leaves the halt as the
+        backstop, rather than skipping a trade on a guess.
+
+        With `entry`, it also refuses a stop that is merely TOO CLOSE. A long
+        limit priced above the market fills at the market, so the stop ends up
+        nearer than planned: STGUSDT's 0.1566 buy filled at 0.1523 on
+        2026-09-19 with its stop at 0.1513, 0.66% away, and the mark was
+        through it a second later. See protect.stop_room.
+        """
+        try:
+            mark = float(self.api.mark_price(symbol)["markPrice"])
+        except (BinanceError, AttributeError, KeyError, TypeError, ValueError) as e:
+            log.warning("%s: no mark price to check the stop against (%s)", symbol, e)
+            return ""
+        if mark <= 0:
+            return ""
+        long = side == "BUY"
+        if stop and (mark <= stop if long else mark >= stop):
+            return f"mark {mark} is already through the stop {stop}"
+        if tp and (mark >= tp if long else mark <= tp):
+            return f"mark {mark} is already through the take-profit {tp}"
+        ecfg = self.cfg.supervise.protect.entry
+        need = ecfg.min_stop_room_frac
+        if ecfg.enabled and entry > 0 and stop and need > 0:
+            room = stop_room(long=long, entry=entry, stop=stop, mark=mark)
+            if room < need:
+                return (f"price moved from {entry} to mark {mark} since the "
+                        f"signal: only {room:.0%} of the planned distance to "
+                        f"the stop {stop} is left (need {need:.0%})")
+        return ""
+
+    def recover_failed_protection(self, signal, symbol: str, leg: str,
+                                  err: BinanceError, entry_id: str,
+                                  stop: float, tp: float) -> None:
+        """
+        A stop or take-profit was refused right after the entry was sent.
+
+        This used to cancel everything, halt, and announce "Nothing is open"
+        without looking. cancel_all() cancels ORDERS: an entry that had already
+        filled -- a limit priced above the market fills at once -- stays open,
+        and on 2026-09-19 that left 71 STGUSDT long with no stop for hours
+        while the halt blocked everything else.
+
+        Now the position is read back after the cancel:
+
+          flat, refusal was -2021   the market simply moved; the trade no
+                                    longer exists. Skip it; no halt.
+          flat, any other refusal   halt, as before -- it may not be
+                                    transient. "Nothing is open" is now true.
+          filled                    track it and hand it to the protection
+                                    watchdog at once. If it cannot be
+                                    protected, close it; halt only if even
+                                    that fails.
+          unreadable                halt, and say it is unknown.
+        """
+        try:
+            self.api.cancel_all(symbol)
+        except BinanceError as ce:
+            log.error("%s: cancelling after the failed %s also failed: %s",
+                      symbol, leg, ce)
+        try:
+            rows = self.api.positions(symbol)
+            row = next((r for r in rows or []
+                        if float(r.get("positionAmt") or 0.0) != 0.0), None)
+        except (BinanceError, TypeError, ValueError) as re:
+            self.state.halt(f"could not place protective {leg} on {symbol}: "
+                            f"{err}; and whether the entry filled is unknown ({re})")
+            self.notify.send(Event.HALT,
+                             f"Could not place the {leg} on {symbol}: {err}\n"
+                             f"Entry cancelled, but the position could not be "
+                             f"read back. Check Binance for an open {symbol} "
+                             f"position.", symbol=symbol)
+            return
+
+        if row is None:
+            if err.code == -2021:
+                log.warning("%s: the %s would have triggered at once; the entry "
+                            "was cancelled before it filled. Trade skipped.",
+                            symbol, leg)
+                self.notify.send(
+                    Event.DAILY_SUMMARY,
+                    f"{symbol}: trade skipped. The market moved past the {leg} "
+                    f"({err}) before it could be placed. The entry was "
+                    f"cancelled before filling; nothing is open.", symbol=symbol)
+                return
+            self.state.halt(f"could not place protective {leg} on {symbol}: {err}")
+            self.notify.send(Event.HALT, f"Could not place the {leg}: {err}\n"
+                                         "Entry cancelled, bot halted. Nothing is open.")
+            return
+
+        # The entry filled. Track it with the levels it was planned with; the
+        # watchdog restores those if the market still allows, rebuilds them
+        # from the market if not, and closes it if the planned stop is gone.
+        amt = float(row["positionAmt"])
+        fill = float(row.get("entryPrice") or 0.0) or float(signal.entry)
+        pos = ActivePosition(
+            symbol=symbol, side=signal.side, entry=fill, stop=stop,
+            take_profit=tp, qty=abs(amt), entry_order_id=entry_id, tag=entry_id,
+            opened_ms=int(time.time() * 1000),
+            initial_stop=stop, initial_target=tp,
+            initial_risk=abs(fill - stop),
+            ref_level=float(getattr(signal, "ref_level", 0.0) or 0.0),
+            filled=True)
+        self.book[symbol] = pos
+        self.risk.record_attempt()
+        self.risk.record_fill()
+        log.critical("%s: the entry had already FILLED (%g @ %.8g); handing it "
+                     "to the protection watchdog", symbol, abs(amt), fill)
+        outcome = self.ensure_protected(symbol, [])
+        if outcome in ("protected", "ok", "closed"):
+            if outcome != "closed":
+                self._entry_placed_at = time.time()
+            return
+        if symbol in self.book and self.close_position(
+                f"entry filled but no stop could be placed ({err})", symbol=symbol):
+            self.notify.send(Event.ERROR,
+                             f"{symbol}: the entry filled but no stop could be "
+                             f"placed, so it was closed at market.", symbol=symbol)
+            return
+        self.state.halt(f"{symbol} filled with no stop, and closing it failed "
+                        f"({err})")
+        self.notify.send(Event.HALT,
+                         f"{symbol} is OPEN WITH NO STOP: the {leg} was refused "
+                         f"({err}) and closing it failed. Close it on Binance.",
+                         symbol=symbol)
+
     def place(self, signal, notional: float, risk_note: str,
-              symbol: str | None = None) -> None:
+              symbol: str | None = None, atr_pct: float = 0.0) -> None:
         symbol = symbol or self.cfg.symbol
+        left = self.cooling_down(symbol)
+        if left > 0:
+            log.info("%s %s skipped: closed %.0f min ago, cooldown has %.0f "
+                     "min left (context.entry.coin_cooldown_minutes)", symbol,
+                     signal.side, self.cfg.context.entry.coin_cooldown_minutes - left,
+                     left)
+            return
+        if self.cfg.context.entry.block_against_trend:
+            trend = self.higher_trend(symbol)
+            side = 1 if signal.side == "BUY" else -1
+            if trend == -side:
+                log.info("%s %s skipped: the %s trend is %s (context.entry."
+                         "block_against_trend)", symbol, signal.side,
+                         self.cfg.context.trend.interval,
+                         "down" if trend < 0 else "up")
+                return
         rules = self.rules if symbol == self.cfg.symbol else self.rules_for(symbol)
         sized = rules.size_for_notional(notional, signal.entry)
         if sized is None:
@@ -1917,6 +3197,36 @@ class Engine:
         stop_price = rules.round_price(signal.stop)
         tp_price = rules.round_price(signal.take_profit) if signal.take_profit else "0"
         exit_side = "SELL" if signal.side == "BUY" else "BUY"
+
+        # A trailing stop needs a callbackRate in whatever range Binance
+        # accepts; a signal with no volatility reading (atr_pct == 0, e.g. the
+        # scanner not being involved) or the safe profile (trailing_atr_mult
+        # == 0) falls straight back to the fixed stop below.
+        #
+        # The callback can never sit CLOSER to entry than the stop the strategy
+        # asked for. This order replaces the fixed stop rather than joining it,
+        # and Binance trails from the best price since the order lands -- which
+        # on a position that never goes into profit is the entry itself. So a
+        # callbackRate under the stop distance is not a tighter trail, it is a
+        # narrower stop: both JUPUSDT trades on 2026-09-08 were cut at 0.68%
+        # and 0.93% adverse against a planned 1.72% stop, well inside the noise
+        # the ATR-derived stop was sized to sit outside of.
+        callback_pct = 0.0
+        if self.cfg.risk.trailing_atr_mult > 0 and atr_pct > 0:
+            stop_pct = 0.0
+            if float(price) > 0:
+                stop_pct = abs(float(price) - float(stop_price)) / float(price) * 100
+            wanted = max(self.cfg.risk.trailing_atr_mult * atr_pct, stop_pct, 0.1)
+            # Round UP, so rounding to Binance's one decimal can only ever
+            # widen the stop, never shave it back inside stop_pct.
+            callback_pct = math.ceil(wanted * 10) / 10
+            if callback_pct > 5.0:
+                # Binance caps callbackRate at 5%. A stop wider than that
+                # cannot be expressed as a trailing stop at all, so keep the
+                # fixed STOP_MARKET instead of silently tightening the exit.
+                log.info("%s: %.2f%% stop is wider than the 5%% trailing cap; "
+                         "using a fixed stop", symbol, stop_pct)
+                callback_pct = 0.0
 
         log.info("SIGNAL %s %s %s @ %s stop %s tp %s | %s | %s",
                  signal.side, qty, symbol, price, stop_price, tp_price,
@@ -1939,7 +3249,8 @@ class Engine:
             self._dry_pending[symbol] = ActivePosition(
                 symbol=symbol, side=signal.side, entry=float(price),
                 stop=float(stop_price), take_profit=float(tp_price),
-                qty=float(qty), entry_order_id=tag, tag=tag)
+                qty=float(qty), entry_order_id=tag, tag=tag,
+                trailing_pct=callback_pct)
             self._entry_placed_at = time.time()
             self.risk.record_attempt()
             log.info("dry_run: entry resting at %s; waiting for the market to "
@@ -1949,6 +3260,13 @@ class Engine:
                              f"{signal.side} {qty} {symbol} @ {price}\n"
                              f"SL {stop_price}  TP {tp_price}\n"
                              f"{risk_note}", symbol=symbol)
+            return
+
+        crossed = self.protective_levels_crossed(symbol, signal.side,
+                                                 float(stop_price), float(tp_price),
+                                                 entry=float(price))
+        if crossed:
+            log.warning("%s signal skipped: %s", symbol, crossed)
             return
 
         if not self.prepare_symbol(symbol):
@@ -1964,6 +3282,7 @@ class Engine:
                                newClientOrderId=entry_id)
         log.info("entry placed %s status=%s", entry_id, entry.get("status"))
 
+        leg = "stop"
         try:
             # Conditional orders live on the algo endpoint since 2025-12-09;
             # the classic one answers -4120. stopPrice is triggerPrice here and
@@ -1976,28 +3295,53 @@ class Engine:
             # quantity + reduceOnly is the equivalent that works from flat, and
             # it cannot over-close -- Binance clamps a reduceOnly order to the
             # position that actually exists when it triggers.
-            self.api.algo_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
-                                triggerPrice=stop_price, quantity=qty,
-                                reduceOnly="true", workingType="MARK_PRICE",
-                                clientAlgoId=stop_id)
+            if callback_pct > 0:
+                # activationPrice is left unset on purpose: Binance then
+                # trails from the price prevailing when the order lands,
+                # which is effectively the entry price, so the worst case is
+                # unchanged from the fixed stop it replaces -- it only ever
+                # improves from there as the market moves in our favour.
+                self.api.algo_order(symbol=symbol, side=exit_side,
+                                    type="TRAILING_STOP_MARKET",
+                                    callbackRate=f"{callback_pct:.1f}",
+                                    quantity=qty, reduceOnly="true",
+                                    workingType="MARK_PRICE", clientAlgoId=stop_id)
+            else:
+                self.api.algo_order(symbol=symbol, side=exit_side, type="STOP_MARKET",
+                                    triggerPrice=stop_price, quantity=qty,
+                                    reduceOnly="true", workingType="MARK_PRICE",
+                                    clientAlgoId=stop_id)
             if signal.take_profit:
+                leg = "take-profit"
                 self.api.algo_order(symbol=symbol, side=exit_side,
                                     type="TAKE_PROFIT_MARKET", triggerPrice=tp_price,
                                     quantity=qty, reduceOnly="true",
                                     workingType="MARK_PRICE", clientAlgoId=tp_id)
         except BinanceError as e:
-            log.critical("PROTECTIVE ORDER FAILED (%s) -- cancelling entry", e)
-            self.api.cancel_all(symbol)
-            self.state.halt(f"could not place protective stop on {symbol}: {e}")
-            self.notify.send(Event.HALT, f"Could not place a stop: {e}\n"
-                                         "Entry cancelled, bot halted. Nothing is open.")
+            # Name the leg. Both used to be reported as "protective stop", so
+            # the AKEUSDT halt of 2026-09-11 -- a take-profit already crossed
+            # -- read as a stop failure and sent the diagnosis the wrong way.
+            log.critical("PROTECTIVE ORDER FAILED on the %s (%s) -- cancelling entry",
+                         leg, e)
+            self.recover_failed_protection(signal, symbol, leg, e, entry_id,
+                                           float(stop_price), float(tp_price))
             return
 
         self.book[symbol] = ActivePosition(
             symbol=symbol, side=signal.side, entry=float(price),
             stop=float(stop_price), take_profit=float(tp_price), qty=float(qty),
             entry_order_id=entry_id, stop_order_id=stop_id, tp_order_id=tp_id,
-            tag=entry_id, opened_ms=int(time.time() * 1000))
+            tag=entry_id, opened_ms=int(time.time() * 1000),
+            trailing_pct=callback_pct,
+            # The supervisor measures 1R against these for the life of the
+            # trade. `stop` and `take_profit` above are the LIVE levels and
+            # start moving the moment it takes over.
+            initial_stop=float(stop_price),
+            initial_target=float(tp_price) if signal.take_profit else 0.0,
+            # 1R straight from the sizing decision, so it survives every later
+            # move of `stop` without having to be inferred back out of it.
+            initial_risk=abs(float(price) - float(stop_price)),
+            ref_level=float(getattr(signal, "ref_level", 0.0) or 0.0))
         self.state.entry_order_id = entry_id
         self.state.stop_order_id = stop_id
         self.risk.record_attempt()
@@ -2009,9 +3353,14 @@ class Engine:
                                mode=self.cfg.mode, dry_run=self.cfg.dry_run,
                                reason=signal.reason)
 
-        prog = self.schedule.progress(self.state.realized_today)
+        prog = self.progress()
+        # "resting", not "opened". The entry is a GTC limit and may never fill
+        # -- saying it had opened was how a phantom KAVAUSDT position came to
+        # be reported, supervised and alerted on for 34 minutes on 2026-09-13.
+        # on_entry_filled sends TRADE_OPEN when the exchange confirms a size.
         self.notify.send(
-            Event.TRADE_OPEN,
+            Event.DAILY_SUMMARY,
+            f"entry resting (not filled yet):\n"
             f"{signal.side} {qty} {symbol} @ {price}\n"
             f"SL {stop_price}   TP {tp_price}\n{risk_note}\n"
             f"{signal.reason}\n{prog}", symbol=symbol)

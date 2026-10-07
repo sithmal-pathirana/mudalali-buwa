@@ -91,6 +91,17 @@ class TestSwitcher(unittest.TestCase):
         self.assertIsNone(s.routes["ranging"])
         self.assertIsNone(s.routes["unclear"])
 
+    def test_one_coin_does_not_inherit_the_previous_coins_regime(self):
+        """The portfolio asks one switcher about many coins in turn.
+        2026-09-22 to 09-24: choppy coins traded as "trending" because the
+        coins read before them were."""
+        s = RegimeSwitcher(regime={"min_atr_pct": 0.0})
+        for _ in range(5):
+            s.on_bars(straight_line(80), 0.0)
+        self.assertEqual(s.last_reading.regime, Regime.TRENDING)
+        s.on_bars(sawtooth(80), 0.0)
+        self.assertEqual(s.last_reading.regime, Regime.RANGING)
+
     def test_stands_down_when_no_route_applies(self):
         s = RegimeSwitcher(regime={"min_atr_pct": 0.0, "confirm_bars": 1})
         bars = sawtooth(80)

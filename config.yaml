@@ -10,12 +10,16 @@
 # rather than a safe default. tools/qa.py's "committed config is not armed"
 # blocker reports exactly this, and it is now telling the truth.
 #
-# Real balance at cutover: 2.4478 USDT. Most numbers here are derived from that
-# figure and from the exchange's $5 minimum order -- re-derive them if the
-# balance changes materially, they do not scale on their own.
+# Sizing basis: a 100.00 USDT balance, re-derived 2026-09-19 for going live
+# with $100 on 2026-09-25: 0.5% ($0.50) per trade, at most 4 positions (2.0%
+# combined), a 3% daily loss limit and an $80 equity floor. Until then this
+# file runs the testnet rehearsal (mode: testnet, risk.equity_cap_usdt 100
+# tracking real P&L). Going live: mode: live, equity_cap_usdt: 0.0, and $100
+# in the live futures wallet. Older comments below still quote the earlier
+# $12 basis where they explain history.
 # ############################################################################
 
-mode: live             # testnet | live   (testnet uses fake money on real markets)
+mode: live              # LIVE from 2026-09-25: gainer, $50 start. testnet | live   (testnet uses fake money on real markets)
 dry_run: false         # true = log intended orders, send nothing. Your first run.
 
 # Live futures WEBSOCKETS ARE SILENT FROM THIS HOST -- `run.py netcheck` reports
@@ -39,24 +43,101 @@ strategy: switcher     # switcher | trend_atr | mean_reversion | funding_arb
 poll_seconds: 20       # only used when realtime: false
 
 risk:
-  max_leverage: 3            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
-  # Raised from the stock 2.0. Same $5-exchange-floor reasoning as
-  # portfolio.single_position_cap_pct below: at $2.45 a 2% risk budget funds an
-  # order far under the exchange minimum, so every signal was refused.
-  # NOTE: aggressive mode REPLACES this at runtime with the profile's own
-  # figure (moderate 2%), and then rounds up to the $5 floor via
-  # risk.take_minimum_order. See the aggressive block.
-  risk_per_trade_pct: 20.0
+  # 2 from 2026-09-24, the user's go-ahead for the gainer go-live: at 2x
+  # isolated a position is liquidated near -49%, well past the gainer's 30%
+  # stop (at 3x liquidation sat near -32%, barely beyond it).
+  max_leverage: 2            # projection.py: 1-year ruin is 62% at 2x, 93% at 10x
+  # 3.5% of $12 = $0.42 risked between entry and stop, down from 20.0.
+  # MUST STAY EQUAL to portfolio.single_position_cap_pct below. Portfolio mode
+  # sizes from that cap, but engine._scan_budget filters the universe from
+  # THIS number ($12 x 3.5% / 7% stop = $6.00 affordable). If this one is the
+  # larger, the scanner admits symbols the allocator then refuses and signals
+  # disappear with no visible reason.
+  #
+  # 2.92% is the arithmetic FLOOR at $12, not a preference: any lower and the
+  # budget cannot fund the exchange's $5 minimum over a 7% stop, so every
+  # signal is skipped. 3.5% is that floor plus a working margin -- it keeps
+  # the account tradable down to $10.00.
+  #
+  # Raised to 3.75 on 2026-09-14 by request. At $10.00, 3.5% funds exactly
+  # $5.00, and per-lot rounding puts most symbols' minimum order at
+  # $5.01-$5.33, so the scanner rejected every trending symbol by cents.
+  # $10 x 3.75% / 7% = $5.36 clears them; about $0.37 risked per trade.
+  #
+  # $100 BASIS, 2026-09-19, for the go-live on 2026-09-25 (applied to the
+  # testnet rehearsal first, by request). 0.5% of $100 = $0.50 risked per
+  # trade. Still equal to portfolio.single_position_cap_pct below.
+  #
+  # RAISED TO 2.0 on 2026-09-20 at the user's explicit request, after being
+  # shown what it does. $2.00 risked per trade. This is a deliberate bet on
+  # upside, not a measured improvement -- the strategy has no edge
+  # out-of-sample, so bigger size buys variance, not return. Simulated over
+  # 20,000 months on the measured trade distribution, blended across three
+  # market windows:
+  #
+  #   risk    median   5th    95th   halts <$70   P(>=$140)
+  #   0.5%    106.68   88     129        1.2%         0.9%
+  #   1.0%    112.32   75     163        4.2%        16.5%
+  #   2.0%    116.20   69     251       28.6%        35.2%   <- here
+  #
+  # In a flat or falling market specifically, 2.0% halts 85.8% of the time,
+  # and the best median available at ANY risk level is $93 at 0.25%. The user
+  # accepted that to raise the chance of a $140 month from ~1% to ~35%.
+  #
+  # BACK TO 0.5 on 2026-09-20 at the user's request, after the entry signal was
+  # measured. Over a year of hourly data on 53 perpetuals, the breakout wins
+  # 41.2% against a coin flip's 40.0%: an edge of +0.030R a trade against a
+  # round-trip cost of 0.147R. Sixteen replacement entry signals were screened
+  # in and out of sample and none survived. Size cannot fix a negative
+  # expectancy, so this goes back to the level that bleeds slowest while the
+  # strategy is still unproven. 0.5% of $84 = about $0.42 risked per trade.
+  risk_per_trade_pct: 0.5
   max_position_pct: 100.0
-  # One stop-out costs ~6.2% here, so the stock 5.0 halted on the first loss.
-  # 30% still halts the day after roughly four consecutive losers -- or after
-  # only TWO in aggressive mode, where each trade risks ~14.3%.
-  daily_loss_limit_pct: 30.0
-  max_trades_per_day: 10
-  # $5 minimum / 3x leverage = $1.67 is the equity below which no legal order
-  # exists at all. The floor sits just above it: past this point the account
-  # is not small, it is untradable.
-  min_equity_usdt: 1.70
+  # 10% of $12 = $1.20: roughly three consecutive stop-outs at 3.5% each ends
+  # the day. Was 30.0, which was sized for aggressive mode's ~14.3% trades.
+  #
+  # $100 basis: 3% = $3.00, six full $0.50 stop-outs. The supervisor cut the
+  # average 2026-09-18 loss to ~0.4R, so about fourteen ordinary losers. 10%
+  # would have let one bad day take $10.
+  #
+  # OFF (0) from 2026-09-20 at the user's request -- "i dont care about the
+  # daily losses i need monthly income". 0 means no limit; risk.py guards the
+  # zero explicitly, because >= 0 would otherwise halt on the first tick the
+  # account is not up, permanently, and engine.py will not boot past a halt.
+  # With this off, min_equity_usdt below is the ONLY remaining circuit
+  # breaker: nothing stops a single bad day short of a 30% drawdown.
+  daily_loss_limit_pct: 0
+  # Entries sent per day, filled or not; 0 = no cap. OFF (0) for the demo from
+  # 2026-09-19 at the user's request, to gather more trades on the new
+  # settings. What still limits activity: the daily loss limit above, the
+  # portfolio's 2% total risk (4 slots), and the 2h coin cooldown. Was 12.
+  max_trades_per_day: 0
+  # Raised from 1.70 to match this risk profile rather than the exchange's
+  # hard limit. At 3.5% over a 7% stop the order size is equity x 0.5, so
+  # below $10.00 it no longer reaches the $5 exchange minimum and every signal
+  # would be skipped in silence. Halting here says so out loud instead, and it
+  # preserves $10 of the $12 -- the point of "do not take high risks".
+  # Clear it with /resume in Telegram once you have decided what to do.
+  # Lowered to 8.00 on 2026-09-14 by request, while LIT's open loss had
+  # equity at $9.70 and the $10.00 floor halted the bot. Below about $9.33,
+  # 3.75% over the 7% stop no longer funds the $5 exchange minimum, so
+  # signals are skipped (logged) well before this floor is reached.
+  #
+  # $100 basis: 80.00, a 20% drawdown. Below $70.00, 0.5% over the 7%
+  # representative stop no longer funds the $5 minimum and allocate() would
+  # skip every signal in silence; halting at $80 says so first and leaves the
+  # decision to you.
+  #
+  # LOWERED TO 70.00 on 2026-09-20, the drawdown the user said they accept.
+  # The silent-skip reasoning above was written for 0.5% risk; at 2.0% the
+  # budget clears the $5 minimum down to about $17.50 of equity, so $70 is
+  # a policy floor now, not an arithmetic one. With the daily loss limit off
+  # this is the only thing that stops a losing run.
+  #
+  # LOWERED TO 25.00 on 2026-09-24 at the user's go-ahead, for the gainer
+  # go-live with $50 (+$50/month): half the first deposit. At $70 a $50
+  # account could not start at all.
+  min_equity_usdt: 25.00
   allow_averaging_down: false
   entry_expiry_minutes: 60     # cancel a limit entry that never fills
   # What `touch KILL` means:
@@ -68,7 +149,13 @@ risk:
   # Trade as if the account held this much, whatever the real balance is.
   # 0 = use the real balance. MUST NOT be left at a testnet rehearsal value:
   # at 100.0 the bot sizes for $100 it does not have.
-  equity_cap_usdt: 0.0
+  equity_cap_usdt: 0.0      # live: size on the real balance
+  # true: the capped equity starts at the cap and then moves with every real
+  # gain and loss, like a funded account. false: it reads exactly the cap
+  # forever, so on the 5,000 USDT testnet the equity floor and the daily loss
+  # limit could never trigger. Rehearsing the 2026-09-25 $100 go-live needs
+  # true. Has no effect when equity_cap_usdt is 0 (live).
+  equity_cap_tracks_pnl: false
 
 # Daily profit targets. stop_when_reached is the real mechanism behind
 # "guarantee the profit": once the day's target is banked the bot stops
@@ -90,65 +177,598 @@ targets:
 #
 #   run.py risk        shows the modelled probability of ruin per profile
 #
-# ON by request 2026-09-07: risk of ruin explicitly accepted. Every profile
-# models 100% ruin at this equity.
+# OFF by request 2026-09-10. It was on from 2026-09-07 with risk of ruin
+# explicitly accepted; the $12 reset asks for the opposite, so it stays off.
 #
-# At $2.45 the PROFILE CHOICE BARELY MATTERS. Every profile's per-trade risk
-# (moderate 2%, high 4%, maximum 8%) sizes below Binance's $5 minimum, so all
-# three land on the same upsized $5.00 order -- about 14.3% of equity over a
-# 7% stop, and ~2.04x actual leverage. The profile's leverage number is a CAP,
-# not the size used; it only stops binding once the account is much larger.
-# What does differ: trades_per_day (6 / 12 / 20) and how tight the trailing
-# stop is. moderate is the least trigger-happy of the three.
+# Turning it back on does NOT just raise leverage. It overwrites
+# risk.risk_per_trade_pct and portfolio.single_position_cap_pct with the
+# profile's own figures and sets risk.take_minimum_order = True, which lets
+# the bot round an order UP to the $5 exchange minimum and wear whatever
+# percentage of equity that turns out to be. With it off, an order that would
+# land under $5 is refused instead -- that refusal is the main reason the
+# numbers below can stay conservative.
 #
-# Two losers at ~14.3% each is ~28.6%, which trips daily_loss_limit_pct: 30.0
-# above and halts the day. Equity would then be ~$1.79, just over the
-# min_equity_usdt: 1.70 permanent floor. This account is roughly two bad
-# trades from being untradable -- that is the accepted bargain, not a bug.
+# The CONFIRM_AGGRESSIVE=AGGRESSIVE line in the systemd drop-in is left in
+# place, so /aggressive in Telegram can still arm it without a root edit.
+# Delete that line if you want the gate closed at the host level too.
 #
-# Still enforced in every profile: an exchange-side stop on every position,
-# the KILL file, and the equity floor.
+# Still enforced either way: an exchange-side stop on every position, the KILL
+# file, and the equity floor.
 aggressive:
-  enabled: true
-  profile: moderate        # moderate (10x) | high (20x) | maximum (50x)
+  enabled: false
+  profile: maximum         # moderate (10x) | high (20x) | maximum (50x)
   keep_daily_loss_limit: true
   confirm_live: true       # type AGGRESSIVE before the first live order
                            # (under systemd: Environment=CONFIRM_AGGRESSIVE=AGGRESSIVE)
+
+# THE POSITION SUPERVISOR. What happens to a trade AFTER it is open.
+#
+# Before this existed the bot could not change its mind: the stop and the
+# take-profit went to the exchange in the same second as the entry and were
+# never revisited, so every trade was a coin flip between two numbers chosen
+# before the market had shown anything. Over the first 15 self-managed closes
+# that was a 27% win rate at a 1.73 payoff -- expectancy -$0.10 a trade --
+# while the three positions closed BY HAND, at prices the bot had no
+# instrument to reach, all made money.
+#
+# Four rules. Every threshold is in R (the money between entry and the
+# ORIGINAL stop), never in percent: measured stop distances on this account
+# run from 1.0% to 12.1% across symbols, so a percent rule is hair-trigger on
+# NEARUSDT and inert on the 6-9%-ATR microcaps the scanner keeps picking.
+#
+#   run.py trade      the supervisor logs every level it moves and why
+#
+# EVERY ABILITY HAS ITS OWN SWITCH (2026-09-19, by request), so each can be
+# measured on its own. `enabled` directly under supervise: is the master
+# switch for the four exit rules; protect: and monitor: further down are NOT
+# under it -- the watchdog guards positions whether or not the rules run.
+# From Telegram: /supervisor lists every switch, /supervisor <name> on|off.
+#
+# Replayed on all 53 past strategy trades (2026-09-07 to 09-19, report
+# "Supervisor Replay Review"): the four rules as below +4.5R, no rules at all
+# +5.9R, failed_breakout off +6.5R, horizon off +0.5R. The rules roughly halve
+# the average loss (-0.47R vs -0.96R) and the worst day (-2.4R vs -4.6R).
+supervise:
+  # OFF from 2026-09-20 at the user's request, and the measurement agrees.
+  # Re-running the strategy over 62 days with the horizon rule on took the
+  # win rate from 41.2% to 19.4% and profit per trade from -0.117R to
+  # -0.164R: it halves the losses and still loses more, because it releases
+  # trades that had not turned profitable YET. In the live rehearsal it
+  # closed all six shorts before any of them reached a stop or a target,
+  # five at exactly the 20-minute grace mark.
+  #
+  # This switch is the whole module, so break-even and the runner trail go
+  # off with the horizon rule. That matches what was measured: -0.117R is
+  # the supervisor-off number.
+  enabled: true
+
+  # Round-trip cost as a percent of notional, and the margin above entry that
+  # "break even" actually means. Fees are only ~0.07% of it (0.02% maker in,
+  # 0.05% taker out = about $0.006 on an $8 order); the rest is slippage,
+  # which on a thin microcap is the larger half. Do NOT cut this to the fee
+  # figure -- a break-even stop that does not clear slippage is a losing stop.
+  # Shared by every rule that moves a stop to break even.
+  cost_buffer_pct: 0.15
+
+  # RULE 1 -- break even. Once the trade has been at_r ahead at any point,
+  # the stop moves to entry + cost_buffer and the trade can no longer lose.
+  # Measured on the peak, not the current price, so giving back an advance
+  # still banks the protection.
+  breakeven:
+    enabled: true
+    at_r: 1.0
+
+  # RULE 2 -- the runner. Approaching the target with the trend intact, bank
+  # half at the original target and let the rest run on a trail with no
+  # ceiling. Arms at this FRACTION of the way to the target, never at the
+  # target itself: params.trend below sets atr_stop_mult 3.0 and
+  # atr_target_mult 3.0, so the take-profit already sits at exactly 1.0R, and
+  # a rule that fired there would cancel an order about to fill and gamble a
+  # booked win on a trail. 0.8 of 1.0R = 0.8R, comfortably before the fill.
+  #
+  # IT STAYS DORMANT ON ITS OWN until a position is worth twice the $5
+  # exchange minimum (engine.scale_out_qty returns 0 below that). A position
+  # already split keeps its trail even if this is switched off later.
+  runner:
+    enabled: true
+    at_target_frac: 0.8
+    trail_atr_mult: 1.5
+    # Below this efficiency ratio the trend is not intact and the runner does
+    # not arm. Keep at or above params.regime.trend_above below, or the
+    # supervisor calls a trend healthy that the router would not enter on.
+    min_trend_efficiency: 0.25
+
+  # RULE 3 -- the horizon. Not a timeout: nothing is force-closed for being
+  # old. On every tick the bot asks whether the target can still arrive inside
+  # `hours` at the pace of the last drift_window_bars --
+  #     distance to target  /  pace per bar  =  bars needed
+  # -- and if it cannot, it stops reaching for it. What it does then depends
+  # on the trade, and each outcome has its own switch:
+  #   cut_losers           not in profit: close at market, free the slot
+  #   bank_turning_profit  in profit, market turned away: bank it
+  #   harvest              in profit, just slow: pull the target in to what is
+  #                        reachable, trail harvest_trail_atr_mult behind peak
+  # Replay: cut_losers was right 16 times of 23 (+10.0R saved, -13.0R given up
+  # on the 7 that recovered), but the rule as a whole is worth keeping --
+  # horizon off drops the replay from +4.5R to +0.5R.
+  #
+  # The forecast is an EXTRAPOLATION of the velocity the symbol has just had,
+  # not a prediction, and it is wrong exactly when the regime turns. It is
+  # used only to stop reaching for a target, never to justify holding one.
+  horizon:
+    enabled: true
+    hours: 5.0
+    # Left alone for this long first. Without it a position that ticks adverse
+    # in its first seconds is closed before the setup has had one bar to
+    # work -- 龙虾USDT was 95% of the way to its stop 103 seconds after entry
+    # on 2026-09-12, and cutting there would have been noise, not judgement.
+    grace_minutes: 20
+    drift_window_bars: 8       # 2 hours of 15m bars
+    cut_losers: true
+    bank_turning_profit: true
+    harvest: true
+    harvest_trail_atr_mult: 0.5
+
+  # RULE 4 -- a breakout that gives back its own trigger level is over. The
+  # level comes from the strategy (Signal.ref_level, the channel high or low
+  # it broke). Only ever banks a PROFIT: underwater, the resting stop is a
+  # better price than a market exit, so this rule stands aside. Adopted
+  # positions have no recorded level, so it is off for them. The one rule that
+  # replays worse than no supervisor (+6.5R with it off vs +4.5R), on few
+  # trades -- a candidate to test off, not yet a verdict.
+  failed_breakout:
+    enabled: true
+
+  # PATIENCE -- while the 4h trend (context.trend below) is behind the trade,
+  # skip the early exits named here and leave the trade to its stop, its
+  # take-profit, break-even and the runner. No clear 4h trend, or one against
+  # the trade: every rule runs as usual. Why: replayed on the 53 past trades,
+  # the supervisor cut good trades early when the 4h trend was behind them
+  # (+0.6R supervised vs +9.7R held) but protected well without one (+4.1R
+  # vs +0.2R). With context.entry.block_against_trend, the replay goes from
+  # +4.5R to +9.3R; 9 other 4h trend definitions all land between +6.9R and
+  # +11.2R. The cost: losers it would have cut are held to their stop, so the
+  # average loss rises from -0.47R to -0.74R. ON for the demo from 2026-09-19
+  # to test it on fresh trades before the 2026-09-25 go-live.
+  patience:
+    enabled: true
+    skip_cut_losers: true
+    skip_harvest: true
+    skip_failed_breakout: true
+    skip_bank_turning_profit: false
+
+  # THE PROTECTION WATCHDOG (bot/protect.py). About once a minute, halted or
+  # not, every open position is checked for a stop-loss AND a take-profit on
+  # the exchange, and whatever is missing is put back. Added after 2026-09-19:
+  # an STGUSDT stop was refused (-2021) after its entry had already filled,
+  # the halt path reported "Nothing is open", and 71 STG sat with no stop for
+  # four hours while the bot only logged "NOT tracking".
+  #
+  # Which levels it places, in order:
+  #   1. the ones the trade was opened with, if the market still allows them
+  #   2. none -- CLOSE at market -- if price is already past the planned stop:
+  #      the trade is over by its own rule, and a wider stop would be a risk
+  #      it was never sized for
+  #   3. otherwise, rebuilt from the symbol's current behaviour: stop.atr_mult
+  #      ATRs from the mark, take-profit target.atr_mult ATRs away (pulled in
+  #      to target.choppy_atr_mult when the market is choppy)
+  protect:
+    watch:
+      enabled: true
+      # Take over a position the bot is not tracking (a lost fill, a manual
+      # trade): track it, protect it and let the supervisor manage it,
+      # instead of only warning every minute.
+      adopt_untracked: true
+    stop:
+      atr_mult: 3.0          # = params.trend.atr_stop_mult, the strategy's own distance
+      fallback_pct: 3.0      # used when the symbol's bars cannot be read
+      min_gap_pct: 0.5       # never nearer the mark than this; nearer is the STG -2021
+    target:
+      atr_mult: 3.0          # = params.trend.atr_target_mult
+      # Below this efficiency ratio (= params.regime.range_below) the market
+      # is ranging and a trend-sized target will not arrive; aim nearer.
+      choppy_below_efficiency: 0.20
+      choppy_atr_mult: 1.5
+      min_gap_pct: 0.3
+    failure:
+      # A stop still refused after this many attempts (one a minute): close
+      # at market. A position that cannot be protected is not held. 0 = only
+      # alert, never close.
+      close_after_attempts: 3
+    entry:
+      enabled: true
+      # Skip an entry when the price has moved since the signal so that less
+      # than this fraction of the planned entry-to-stop distance is left. STG
+      # had 0.19 left (fill 0.1523, stop 0.1513, planned from 0.1566).
+      min_stop_room_frac: 0.5
+
+  # THE SUPERVISOR'S REPORT CARD (bot/journal.py). Every closed trade is
+  # written to data/trades.csv. After every supervisor exit the bot keeps
+  # watching that coin and records whether holding would have hit the
+  # ORIGINAL stop or target first (data/supervisor_review.csv), with a
+  # running "exits vs holding" total in Telegram. On 2026-09-18 that was
+  # roughly even: +$1.02 saved on losers, -$1.15 given up on winners -- one
+  # day is not enough to tune on; a week of this is.
+  monitor:
+    report_minutes: 60       # open-positions report while anything is open; 0 = off
+    review_exits: true
+    review_hours: 24         # score at the last price if neither level is reached
+
+# THE BIGGER PICTURE (bot/context.py). The strategy and the supervisor read
+# 15m bars; this reads a slower chart's trend: up when the last close is above
+# its sma_bars average and that average is rising over slope_bars, down the
+# other way, flat otherwise. Read from closed bars only, cached 5 minutes.
+# Used by supervise.patience above and by the entry filter here.
+context:
+  trend:
+    interval: 4h             # 1h replayed as almost useless: 49 of 53 breakouts already agree with it
+    sma_bars: 20
+    slope_bars: 5
+  entry:
+    # Refuse a trade against the 4h trend; a flat or unreadable trend never
+    # blocks. Replay: 4 of 53 past trades were against it (-4.0R held to
+    # stop/target). ON for the demo from 2026-09-19, with patience above.
+    block_against_trend: true
+    # Stay off a coin for this many minutes after its last trade closed; 0 =
+    # off. Replay of 85 signals (2026-09-05 to 09-19): re-buying a coin within
+    # 2h of closing it won 2 of 10 for -6.8R, mostly right after a win --
+    # chasing a move already taken (KAVA, HEI, AKE, XLM). 120 took the replay
+    # from +10.8R to +17.7R; 60 to 480 all helped. ON for the demo from
+    # 2026-09-19, to test it on fresh trades before the 2026-09-25 go-live.
+    coin_cooldown_minutes: 120
+
+# GAINER MINING. When a USDT perpetual becomes #1 on the 24h gainer board,
+# buy it with a take-profit that nets exit.target_usd and a stop exit.stop_pct
+# below. When another coin takes #1, open that too, and judge every other
+# gainer position by exit.on_new_leader. Alerts: new leader, open, keep/close,
+# each milestone, and an hourly board + positions. The "likely next gainer" is
+# an extrapolation of forecast.slope_minutes, not a prediction. Not backtested.
+#
+# Settings are grouped by what they act on:
+#   board     what is watched
+#   entry     when a leader is bought, and how much
+#   exit      when a position is sold
+#   alerts    what is announced beyond each trade
+#   forecast  how the board's recent motion is measured
+#
+# From Telegram: /gainer lists them, /gainer <name> <value> changes one
+# (size, confirm, rising, minrise, cooldown, target, onleader, hold).
+# The startup log prints the settings in force.
+gainer:
+  enabled: true             # LIVE from 2026-09-25
+  # true is PAPER: nothing is sent, fills and exits are simulated.
+  dry_run: false
+
+  board:
+    poll_seconds: 30
+    top_n: 10
+    # 24h quote volume floor. A $300k coin can top the board on one order.
+    min_quote_volume: 10000000
+    # Pick the leader once an hour, at the top of the hour; stops, the ladder
+    # and the time limit still run on every poll. Every 2-year replay read
+    # the board hourly, so this is the tested behaviour (2026-09-25).
+    leader_check_minutes: 5     # 2026-09-25: 6-month replay, every 5 min beat hourly for every ladder
+    # change_24h: biggest 24h % (live). climb: biggest rise over
+    # climb_minutes -- replayed 2026-09-30, lost in every variant.
+    rank_by: change_24h
+    climb_minutes: 60
+    climb_volume_surge_x: 0     # 0 = off
+
+  entry:
+    # true: trade the #1 found at first boot. The last leader is saved in
+    # data/gainer.json, so a restart does not re-buy a leader already traded.
+    trade_on_start: false
+
+    # THE SWAP GUARDS. On 2026-09-15 AINUSDT and POWERUSDT, both fading after a
+    # 50-95% day, swapped first place 7 times in 77 minutes. Every swap sold one
+    # at a small loss and bought the other: -$0.03, -$0.12, -$0.19, -$0.07 in a
+    # row, with no stop or target ever reached. These four settings (with
+    # exit.min_hold_minutes) stop that.
+    #
+    # A new #1 must hold first place this long before it counts. It was 2 polls
+    # (1 minute), and those swaps were 2-5 minutes apart.
+    confirm_minutes: 0
+    # Buy a leader only while its 24h % is still climbing. Every swap above
+    # bought a leader reported as fading (-0.7 to -1.1 %/min): it reached #1
+    # because the other coin fell faster. A fading leader is watched while it
+    # stays #1 and bought if it starts rising again.
+    buy_only_if_rising: false
+    # The climb that counts as rising, in 24h % points per minute over
+    # forecast.slope_minutes. 0.05 matches the board's "holding" band, so a
+    # flat leader is not bought either.
+    min_rise_pct_per_min: 0.05
+    # A coin sold for any reason is not bought again as a new leader for this
+    # long; 0 turns it off. This is what breaks an A-B-A-B loop. Re-entry on a
+    # new high below is exempt: it has its own trigger.
+    rebuy_cooldown_minutes: 180
+
+    # After a stop or take-profit on the coin that is still #1, buy it again
+    # once it trades above the 24h high recorded at that close (one attempt).
+    reentry_on_new_high: false
+
+    # LIVE since 2026-09-15 by request ("set those parameters as your wish and
+    # deploy and go live"), sized for $9.23 of equity:
+    #   $6.00 notional  clears the $5 minimum after per-lot rounding
+    #   2 positions     two stop-outs ~$0.62, inside the 10% daily loss limit
+    #                   ($0.92) and clear of the $8.00 equity floor
+    notional_usdt: 6.0
+    # 2026-09-24: each trade is 10% of the traded equity, up to 5 at once,
+    # so the whole book is at most 50% of equity. Replayed over 2 years
+    # (hourly board, $50 + $50/month): +37%, above deposits in 20 of 24
+    # months, worst drop 27%. notional_usdt is ignored while this is > 0.
+    notional_pct_of_equity: 20.0   # 2026-10-07: 20% per trade (was 10, briefly 15), with squeeze
+    # Chosen 2026-09-24 for a $50 start (+$50/month): 10% of $50 is under the
+    # exchange minimum after rounding, so trades are never smaller than $6.
+    # Replay: +39.3% over 2 years, same as without the minimum.
+    min_notional_usdt: 6.0
+    max_positions: 5
+
+  exit:
+    # 2026-09-15, by request ("2$ is bit large. what about .25$"): $0.25 is
+    # about +4.3% on $6.00, reachable inside a leader's run; $2.00 needed +34%
+    # and never filled. Against the 5% stop that is a payoff under 1:1, so it
+    # needs a win rate above ~55%.
+    target_usd: 0
+    # 2026-09-25: take profit once a trade is +95% above entry. Best in both
+    # periods on real 1-minute data with lock 10/10 (+$51 over 2 years hourly;
+    # +$162 over the last 6 months checking every 5 minutes).
+    target_pct: 95
+    # ~$0.31 with fees per stop-out on $6.00, ~3.4% of equity.
+    stop_pct: 30.0
+    # Round-trip cost estimate, % of notional. Added to the take-profit so the
+    # target is net, and subtracted before calling a position profitable.
+    fee_pct: 0.15
+    # When another coin takes #1, what happens to the positions already held:
+    #   close_if_losing  sell the ones not in profit (net of fee_pct)
+    #   keep             leave every one to its own stop and take-profit
+    on_new_leader: keep
+    # A position younger than this is never sold because of a new leader; its
+    # stop still protects it. The swaps above sold positions 2-5 minutes old,
+    # before the trade had any chance to reach its target.
+    min_hold_minutes: 15
+    # The hybrid ladder, chosen 2026-09-24: no take-profit; the stop goes to
+    # entry at +10%, then sits one 20% step below each new step (+40 -> +20,
+    # +60 -> +40, ...). A position that never reaches +10% is closed after 72h
+    # so one drifting coin cannot hold a slot for weeks.
+    ladder_enabled: true
+    ladder_first_pct: 10.0
+    ladder_step_pct: 10.0       # lock 10/10: entry at +10%, then 10% steps
+    unarmed_max_hours: 48     # 2026-09-30 setting A (was 72)
+    # lock (live): stop to entry at the first step, then a step behind.
+    # trail: the stop rises one step per step gained, keeping its distance.
+    ladder_mode: lock
+    # fixed (live): stop_pct. atr: atr_stop_mult x the coin's 12h ATR %.
+    stop_mode: fixed
+    atr_stop_mult: 3.0
+    atr_stop_min_pct: 10.0
+    atr_stop_max_pct: 40.0
+    # Sell part of the position once it is this % above entry. 0 = off.
+    partial_take_pct: 0
+    partial_fraction: 0.5
+
+  alerts:
+    milestones_usd: [1.0, 1.5, 2.0]
+    status_minutes: 60
+
+  forecast:
+    history_minutes: 60
+    slope_minutes: 10
+    predict_minutes: 15
+    # |slope| below this (24h % points per minute) reads as "holding".
+    trend_eps: 0.05
+
+  # Bank part of every winning gainer trade: move pct of its profit from the
+  # USD-M futures wallet to the Funding wallet, where it is no longer traded.
+  # Requested 2026-09-24. Replayed over 2 years of the hybrid ladder, 25% per
+  # winning trade left $1,009 in Funding out of $1,786 total. Live only:
+  # testnet and paper report what would have moved. The API key needs
+  # "Permits Universal Transfer" (Binance requires an IP-restricted key).
+  sweep:
+    enabled: true
+    pct: 25.0
+    min_transfer_usdt: 1.0     # smaller amounts wait for the next win
+    # Keep profits compounding until equity reaches this, then start the
+    # 25% transfers. 0 = transfer from the first win (live).
+    start_when_equity_usdt: 0
+    # Principal recovery, requested 2026-09-24: when the trading balance
+    # reaches 2.5x everything deposited, move the deposits to Funding and keep
+    # trading the remaining 1.5x. Deposits are transfers INTO the futures
+    # wallet from deposits_since on, read from Binance; the rule stays idle
+    # until that date is set. Money waiting to move (a failed transfer, or a
+    # sweep under min_transfer_usdt) is set aside: the bot sizes and risks
+    # trades on the balance WITHOUT it.
+    principal_enabled: true
+    principal_trigger_x: 2.5
+    deposits_since: "2026-09-25"   # the day the $50 was deposited
+    deposits_override_usdt: 0.0
 
 # Multiple positions at once. Concurrency is DERIVED, not chosen: fix the
 # portfolio risk you can accept and per-trade risk shrinks as slots are added,
 # so the count scales with equity instead of being tuned for one account size.
 #   run.py scan --equity <n>   shows the capacity and what would fill it
+# SQUEEZE MODE (bot/squeeze.py). Buy the coins whose shorts are most crowded:
+# shortly after each 00/08/16 UTC funding settlement, the most negative
+# funding rates (scaled to 8 hours) at or below entry.funding_at_most_pct.
+# Each long gets an exchange-side stop and no take-profit, and is closed
+# after exit.max_hold_hours. Shorts pay longs while it is held.
+# Replayed on 2 years of live data (every USDT perpetual, delisted included,
+# 0.2% cost): -0.10%, 72h, 20% stop gave +1.29% per trade over 2,272
+# trades, positive in both years. Added 2026-09-25; not live.
+#
+#   board     what is watched
+#   entry     when a coin is bought, and how much
+#   exit      when a position is sold
+#   alerts    what is announced beyond each trade
+#   sweep     25% of each win to the Funding wallet (same rules as gainer)
+
+  # Trader-style checks on a new leader. A skipped leader is not bought
+  # later. All off (0 / null) -- replayed 2026-09-30 on 2 years:
+  # listed >= 3 days + BTC 24h >= -2% beat live in both years.
+  filters:
+    max_rsi_1h: 0               # skip when 1h RSI(14) is above this
+    min_listing_age_days: 0     # skip coins listed fewer days ago
+    btc_min_change_24h_pct: -2  # skip while BTC 24h < -2%; setting A 2026-09-30
+    btc_max_drop_1h_pct: 0      # skip while BTC fell more than this in 1h
+    min_price: 0.001            # skip coins under $0.001; setting A 2026-09-30
+    # Skip a vertical pump: more than this share (0-1) of the 24h rise made
+    # in the last 4 hours. 2026-10-05: every value 0.6-0.9 beat setting A in
+    # both years (0.8: +$1,827 vs +$1,416); the only check that held up when
+    # chosen on year 1 and judged on year 2. 0 = off.
+    max_rise_share_4h: 0.8
+
+  # How big each trade is. fixed (live) = entry.notional_pct_of_equity.
+  sizing:
+    mode: fixed                 # fixed | volatility | conviction
+    volatility_target_atr_pct: 3.0
+    min_pct: 5.0
+    max_pct: 15.0
+    conviction_high_pct: 15.0
+    conviction_low_pct: 7.5
+    conviction_max_rsi_1h: 85
+    conviction_min_listing_age_days: 3
+    conviction_btc_min_change_24h_pct: -2
+
+  # When no new gainer trade is opened (open trades are never touched).
+  # All off (0).
+  limits:
+    max_new_trades_per_day: 0
+    pause_after_losses: 0
+    pause_hours: 24
+    max_exposure_pct: 40        # 2 gainer trades at 20% (2026-10-07; was 20 with 10% trades)
+    daily_loss_limit_pct: 0
+    drawdown_pause_pct: 20      # no new trades 20% below the high; setting A 2026-09-30
+
+
+# MANUAL TRADES: positions that belong to the user, not the bot. On these
+# symbols the bot never adopts, protects, supervises or closes a position,
+# and no strategy opens one. Their stop-loss and take-profit are set by hand
+# on Binance. Remove a symbol once its trade has closed.
+#   2026-09-30: the four gainer trades open at the switch to setting A,
+#   separated by request with hand-set levels (SL under support, TP under
+#   resistance): HBAR 0.0995 / 0.1195, MARSCOIN 0.1305 / 0.1545,
+#   CELO 0.0948 / 0.1030, 0G 0.2990 / 0.3580.
+manual_trades:
+  # 2026-10-05: all four closed (-$3.52 together); list emptied.
+  symbols: []
+
+squeeze:
+  enabled: true             # 2026-10-07: on, alongside the gainer (max 2 positions)
+  dry_run: false
+
+  board:
+    check_minutes_after_funding: 2
+    act_within_minutes: 30      # a restart later in the 8h does not re-buy the round
+    min_quote_volume: 20000000
+    poll_seconds: 60
+
+  entry:
+    funding_at_most_pct: -0.10  # percent per 8 hours
+    max_new_per_round: 3
+    max_positions: 2         # 2026-10-07 (was 5): the tested setting
+    notional_pct_of_equity: 10.0
+    min_notional_usdt: 6.0
+
+  exit:
+    stop_pct: 20.0
+    max_hold_hours: 72
+    fee_pct: 0.15
+
+  alerts:
+    status_minutes: 60
+
+  sweep:
+    enabled: true
+    pct: 25.0
+    min_transfer_usdt: 1.0
+    principal_enabled: false
+
 portfolio:
-  # At $2.45 the derived slot count is 1 -- the $5 exchange minimum is 2.0x
-  # this account, so a second concurrent position cannot be funded. Portfolio
-  # mode is kept on so the SCANNER picks the symbol rather than trading the
-  # BTCUSDT above, whose $50 minimum is unreachable here.
-  enabled: true
+  # At $12 the derived slot count is still 1: splitting a 3.5% budget over two
+  # positions asks for $3.00 each, under the $5 exchange minimum, so allocate()
+  # trims back to one. Portfolio mode is kept on so the SCANNER picks the
+  # symbol rather than trading the BTCUSDT above, whose $50 minimum (and
+  # ETHUSDT's $22) is still out of reach on this account.
+  enabled: false           # breakout scanner off with the breakout strategy (2026-09-25)
   max_concurrent: auto    # auto, or a fixed number
-  # 6.0 refused real signals: a live PUMPUSDT breakout needed $5.00 but 6% only
-  # funded $4.17, so the risk gate skipped it (bot/risk.py size_position:
-  # "correct size is $X but the cheapest legal order is $5.00 ... Skipping").
-  # By request (risk of loss accepted): raised so the $5 exchange floor clears
-  # even on a wider (~7%) stop. The max_leverage cap above still bounds
-  # worst-case notional regardless of how high this is set.
-  single_position_cap_pct: 20.0
-  portfolio_risk_pct: 20.0  # with 1 eligible slot this is the binding term
-  # Was 0.025. That is not the stop the scanner actually produces: the real
-  # signals here stop ~7% away (PUMPUSDT needed 7.2%). allocate() sized from
-  # 0.025 and asked for $19.60 notional -- 8x equity -- so the 3x leverage
-  # ceiling ($7.35) refused every scan for five hours on 2026-09-07. Matching
-  # the real stop asks for $7.00: above the $5 floor, under the ceiling.
+  # THE number that sets trade size in portfolio mode, and the one that was
+  # 20.0. At $12 over the representative 7% stop below:
+  #     $12 x 3.5% = $0.42 risked  ->  $6.00 notional  ->  0.50x actual leverage
+  # $6.00 clears the $5 exchange minimum with room for equity to drift down to
+  # $10.00, which is exactly where min_equity_usdt now halts. Keep this equal
+  # to risk.risk_per_trade_pct -- see the note there.
+  #
+  # $100 basis (2026-09-19): 0.5% = $0.50 per position. Keep equal to
+  # risk.risk_per_trade_pct.
+  #
+  # Back to 0.5 on 2026-09-20 with risk.risk_per_trade_pct, which this must
+  # stay equal to -- see the note there for why the raise was reverted.
+  single_position_cap_pct: 0.5
+  # Equal to the single-position cap on purpose: one position at a time, so
+  # the most a correlated selloff takes in one event is 3.5%, not a multiple
+  # of it. Raise this one alone if you later want concurrency.
+  #
+  # $100 basis: 2.0% = $2.00 with every position at its stop at once, i.e.
+  # four positions of 0.5%. On 2026-09-18 ten correlated longs opened in one
+  # hour at 3.75% combined; this caps what one market-wide drop can take.
+  #
+  # Back to 2.0 on 2026-09-20 with the risk revert. allocate() sizes each
+  # position at min(single_position_cap_pct, this / eligible) and trims to
+  # hard_cap (4 below), so a budget of 2.0 against a 0.5% cap gives exactly
+  # 4 x 0.50% = 2.00% total -- the allocation as it stood before the raise.
+  #
+  # Read the consequence plainly: four correlated longs at their stops in one
+  # market-wide drop now takes 8% of equity in a single event, four times
+  # what the 2026-09-18 note above was written to prevent. That is the cost
+  # of the 2.0% decision, and it is why the equity floor is the last guard.
+  portfolio_risk_pct: 2.0
+  # Left at the MEASURED stop distance, not lowered to flatter the sizing.
+  # Real signals here stop ~7% away (PUMPUSDT needed 7.2%); the earlier 0.025
+  # was fiction and made allocate() ask for 8x equity. Lowering it would shrink
+  # the apparent risk per trade while the actual stop stayed where it is.
   stop_distance: 0.07
-  hard_cap: 40
+  # At most four open at once ($100 basis). With 2.0 / 0.5 above the
+  # allocator gives 4 x 0.5% from $71 of equity up; the floor stops it at $80.
+  hard_cap: 4
 
 # Universe scanning: which coins are even considered.
 universe:
   max_symbols: 100
   min_quote_volume: 20000000
+  # THE bottleneck, measured 2026-09-08: of 97 liquid perps, 59 clear the
+  # ATR >= 0.6% filter aggressive mode forces, but only THREE clear ER 0.30.
+  # With 3 candidates and a ~2.3% per-bar chance of a breakout, the bot got
+  # one entry roughly every 3.6 hours. Passing symbols by threshold:
+  #     0.30 -> 3    0.25 -> 4    0.20 -> 7    0.15 -> 13    0.10 -> 25
+  # 0.20 is aggressive mode's own intended default -- it sets it with
+  # setdefault(), so this key being present here is what was overriding it.
+  # Back to 0.30 on 2026-09-14 with params.regime.trend_above below; the two
+  # move together. See the note on params.
   min_efficiency: 0.30
   min_atr_pct: 0.25
   rescan_seconds: 300
+
+  # WHICH VENUE'S LIQUIDITY COUNTS. Testnet reports synthetic 24h volume --
+  # test bots churn it -- so min_quote_volume above measures nothing there.
+  # Checked 2026-09-20: the scanner ranked XRPUSDT at $124,551M (real: $1,295M)
+  # and TAGUSDT at $1,902M (real: $5.8M). 54 of the 100 selected symbols were
+  # below the $20M floor on real volume, and only 46 would have appeared in the
+  # live universe at all -- so the rehearsal was measuring the strategy on
+  # coins the live bot would never choose, and paying microcap slippage to do
+  # it (AKEUSDT's stop at 0.0611 filled near 0.0580).
+  #
+  # With this on, the floor and the ranking read the live exchange while orders
+  # still go to the venue in `mode`. Both are no-ops in live mode, where the
+  # trading venue already is the live one -- which is the point: the rehearsal
+  # now picks the same universe the go-live run will.
+  rank_by_live_volume: true
+  # Testnet keeps delisted contracts in TRADING status long after the real
+  # venue has settled them. On 2026-09-20 that was FXSUSDT, RDNTUSDT and
+  # SLERFUSDT -- tradable here, gone there.
+  require_listed_live: true
+  # Compute signals on LIVE candles too; orders still go to the venue in
+  # `mode`. Testnet's own candles gave 26 breakout bars from 2026-09-22 to
+  # 09-24 that the live market never printed. No-op in live mode.
+  signal_bars_from_live: true
 
 # Telegram control. Outbound-only: the bot long-polls Telegram, so the host
 # needs no inbound port and nothing opened in a cloud security list. Commands
@@ -185,21 +805,69 @@ alerts:
 params:
   regime:
     window: 30
+    # Lowered with universe.min_efficiency, and it has to move WITH it: a
+    # symbol admitted by the scanner at ER 0.22 was then called "unclear"
+    # here and routed to null, so loosening the scanner alone bought nothing.
+    # Measured over 14 symbols x 3 days of 15m bars, trend-only routing:
+    #     0.35 -> 28.5 signals/day     0.25 -> 48.6 signals/day
+    # The extra entries sit in the ER 0.25-0.35 band, where trend_atr's
+    # measured edge is thinner than in the 0.35+ band it was fitted on.
+    #
+    # 2026-09-14: restored to 0.35 / confirm_bars 3 / channel 20 after the
+    # loosened settings lost in backtest on the 30 coins this bot trades
+    # ($10 each, 3.75% risk, 3x, 15m, two back-to-back ~15-day windows):
+    #     loosened (0.25, ch 6)       -28.06 / -11.52   8,10 of 30 coins up
+    #     original (0.35, ch 20)       +7.62 /  +6.38  17,18 of 30 coins up
+    #     original + recent ER filter +10.25 /  +8.36  18,18 of 30, DD ~18-25%
+    # LITUSDT on 2026-09-14 is the trade this refuses: ER 0.50 over 30 bars
+    # only because the window still held a pump from 7h earlier, a 6-bar high
+    # broken under the real 20-bar high. No scanner or supervisor in the test.
     trend_above: 0.35      # efficiency ratio above this = trending
     range_below: 0.20      # below this = ranging
     # Default 3 makes every restart cold-start at UNCLEAR and sit out ~15+
     # minutes before the first trending confirmation. 1 = trade on the first
     # trending reading instead of waiting out the hysteresis window.
-    confirm_bars: 1        # hysteresis: bars a new regime must persist
+    confirm_bars: 3        # hysteresis: bars a new regime must persist
     min_atr_pct: 0.15
   trend:
     # Default 20 (5h on 15m bars) waits for a rare breakout. 8 (2h) fires
     # far more often at the cost of more false breakouts / whipsaw losses.
-    channel: 8
+    # Measured: under trend-only routing this is a weak lever -- 8 -> 4 moved
+    # signals only 28.5 -> 34.9/day, because the regime gate above, not the
+    # channel, is what actually withholds entries. 6 takes the cheap part of
+    # that and leaves the whipsaw of 3-4 alone.
+    channel: 20
+    # The trend must be CURRENT: ER over the last 20 bars (5h), not just the
+    # 30-bar regime window, which can still be counting an old move.
+    recent_er_window: 20
+    min_recent_er: 0.25
     atr_period: 14
-    atr_stop_mult: 2.0
-    atr_target_mult: 3.0
-    min_atr_pct: 0.15
+    # 2026-09-22, at the user's request ("C longs only"): replayed over the
+    # 80 top-volume coins x 78 days (2026-07-05 to 09-22), 4 slots, $100 at
+    # 0.5% risk, 0.15% round-trip cost, halves split at 2026-08-20:
+    #                                 win   R/trade  1st / 2nd half  max DD
+    #   old (2/3 ATR, both sides)     40%   -0.113   -0.154 / -0.062   53%
+    #   these settings                57%   +0.099   +0.048 / +0.134  7.6%
+    # Still +0.063R at double the cost. Shorts lost in both halves under
+    # every exit tried (-0.19R here); breakouts under 0.8% ATR lose to costs,
+    # because the round trip is a bigger share of a small ATR; breakouts with
+    # little lead over the 50-bar EMA lost the most. The wider stop is where
+    # the win rate comes from: 2 ATR sat inside normal noise. The 2nd half
+    # was an alt rally (median coin +42%), the 1st flat (+2%).
+    # 2026-09-24: target 3.0 -> 4.5 ATR. Replayed over the top 80 coins x
+    # 186 days (2026-03 to 09-24), per-coin regime, 0.15% cost:
+    #                 win   R/trade   R by month (Mar..Sep)
+    #   3 / 3 ATR     54%   +0.042    -10 -22 +21 +11 +14 +18 +30
+    #   3 / 4.5 ATR   46%   +0.105    -5 -19 +40 +17 +17 +50 +46
+    #   3 / 6 ATR     39%   +0.123    -8 -35 +25 +13  +8 +85 +73
+    # 4.5 beat 3 in every month; 6 earned more in total but only through two
+    # rally months, and lost more in the weak ones.
+    atr_stop_mult: 3.0
+    atr_target_mult: 4.5
+    min_atr_pct: 0.8         # ATR(14) as % of price; was 0.15
+    allow_shorts: false
+    min_ema_lead_pct: 3.0    # close at least 3% beyond its 50-bar EMA
+    lead_ema_period: 50
   revert:
     window: 20
     z_entry: 2.0
@@ -208,6 +876,6 @@ params:
   # routes to it -- see tools/regime_edge.py. Override at runtime with
   # /strategy in Telegram or the dashboard selector.
   routes:
-    trending: trend_atr
+    trending: null            # breakout strategy OFF from 2026-09-25 (gainer only); was trend_atr
     ranging: null
     unclear: null

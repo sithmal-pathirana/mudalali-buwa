@@ -202,6 +202,7 @@ class TestARestingEntryHoldsItsSlot(unittest.TestCase):
             for s in pending}
         e.scanner = type("S", (), {
             "due": lambda s: False,
+            "stale": lambda s: False,
             "last": ScanResult(ranked=[
                 Candidate(symbol="ARBUSDT", price=1.0, quote_volume=1e7,
                           efficiency=0.5, atr_pct=1.0, min_notional=5.0,
@@ -217,7 +218,7 @@ class TestARestingEntryHoldsItsSlot(unittest.TestCase):
             "symbol": sym,
             "min_affordable_notional": lambda s, px: 5.0})()
         e.placed = []
-        e.place = lambda sig, notional, note, symbol=None: e.placed.append(symbol)
+        e.place = lambda sig, notional, note, symbol=None, atr_pct=0.0: e.placed.append(symbol)
         e.stream = None
         return e
 
@@ -291,7 +292,7 @@ class TestAlertsNameTheSymbolTheyAreAbout(unittest.TestCase):
         e.cfg.dry_run = False
         e.book["ENAUSDT"] = ActivePosition(
             "ENAUSDT", "BUY", 0.1873, 0.1818, 0.1954, 100.0,
-            entry_order_id="d-1", tag="d-1")
+            entry_order_id="d-1", tag="d-1", filled=True)
         e._tick_guard = lambda: False
         e.on_tick(Tick(symbol="ENAUSDT", mark_price=0.1828, event_time=1))
         self.assertIn((Event.APPROACH_SL, "ENAUSDT"), e.sent_kw)

@@ -34,8 +34,12 @@ class Event(Enum):
     TARGET_REACHED = "daily target reached"
     TARGET_RAISED = "daily target raised"
     HALT = "HALTED"
+    #: A normal stop or restart with a position left open and protected. Not
+    #: a halt: titling it HALTED made every restart look like one (2026-10-07).
+    STOPPING = "stopping"
     DAILY_SUMMARY = "daily summary"
     SCAN = "scan"
+    GAINER = "gainer mining"
     ERROR = "error"
 
 
@@ -51,7 +55,7 @@ ICON = {
     Event.TP_HIT: "[ + ]", Event.SL_HIT: "[ - ]",
     Event.TARGET_REACHED: "[ = ]", Event.TARGET_RAISED: "[ ^ ]",
     Event.HALT: "[!!!]", Event.DAILY_SUMMARY: "[ i ]", Event.SCAN: "[ o ]",
-    Event.ERROR: "[ x ]",
+    Event.GAINER: "[ G ]", Event.ERROR: "[ x ]", Event.STOPPING: "[ . ]",
 }
 
 
@@ -120,7 +124,11 @@ class Notifier:
             telegram=TelegramChannel(cfg.telegram_token, cfg.telegram_chat_id),
             email=EmailChannel(cfg.smtp_host, cfg.smtp_port, cfg.smtp_user,
                                cfg.smtp_password, cfg.alert_email),
-            symbol=cfg.symbol,
+            # In portfolio mode cfg.symbol is only the bar-feed symbol, so an
+            # alert about the account ("HALTED", "daily summary") titled with
+            # it read as being about BTCUSDT.
+            symbol=("bot" if getattr(getattr(cfg, "portfolio", None), "enabled", False)
+                    else cfg.symbol),
         )
 
     @property

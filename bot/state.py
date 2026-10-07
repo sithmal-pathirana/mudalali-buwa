@@ -40,6 +40,15 @@ class State:
     schedule_start_date: str = ""      # ISO date of day 1, for the target schedule
     target_reached_today: bool = False
     strategy_override: str = ""        # "" = automatic regime routing
+    # risk.equity_cap_tracks_pnl: the REAL equity when the rehearsal began,
+    # and the cap it began under. Effective equity is cap + (actual - anchor),
+    # so a testnet rehearsal gains and loses like the account it rehearses.
+    cap_anchor_equity: float = 0.0
+    cap_anchor_cap: float = 0.0
+    # context.entry.coin_cooldown_minutes: when each coin's last FILLED
+    # position left the book (epoch ms). Here rather than in memory so a
+    # restart does not reopen the door the cooldown is holding shut.
+    last_exit_ms: dict = field(default_factory=dict)
 
     path: Path = field(default=STATE_PATH, repr=False)
 
@@ -126,8 +135,10 @@ def reconcile(api, symbol: str) -> dict:
                          "price": o["price"]} for o in orders],
         "open_order_ids": {o["clientOrderId"] for o in orders},
     }
-    log.info("reconciled: equity=%.2f position=%s open_orders=%d",
-             equity, snapshot["position_amt"], len(orders))
+    # Name the symbol: this reads ONE symbol, and an unlabelled "position=0.0"
+    # read as "the account is flat" while other symbols held positions.
+    log.info("reconciled: equity=%.2f %s position=%s open_orders=%d",
+             equity, symbol, snapshot["position_amt"], len(orders))
     return snapshot
 
 

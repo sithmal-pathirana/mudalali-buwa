@@ -184,3 +184,36 @@ class TestPortfolioConfig(unittest.TestCase):
         cfg = Config.load()
         sc = ScanConfig(**cfg.universe)
         self.assertGreaterEqual(sc.max_symbols, 100)
+
+
+class TestSignalBarsFromLive(unittest.TestCase):
+    """Rehearsal signals come from live candles; orders stay on testnet."""
+
+    class _Venue:
+        def __init__(self, testnet, close):
+            self.testnet, self.close, self.calls = testnet, close, 0
+
+        def klines(self, symbol, interval, limit=200):
+            self.calls += 1
+            return [[i * 900000, self.close, self.close + 1, self.close - 1,
+                     self.close, 1.0] for i in range(limit)]
+
+    def _scan(self, flag):
+        trading, live = self._Venue(True, 100.0), self._Venue(False, 200.0)
+        s = Scanner(trading, ScanConfig(signal_bars_from_live=flag))
+        s._ref = live
+        s.universe = lambda: [{"symbol": "XUSDT", "price": 1.0,
+                               "quote_volume": 100e6}]
+        res = s.scan()
+        bars = (res.ranked or res.rejected)[0].bars
+        return trading, live, bars
+
+    def test_on_reads_the_live_venue(self):
+        trading, live, bars = self._scan(True)
+        self.assertEqual((trading.calls, live.calls), (0, 1))
+        self.assertEqual(bars[-1].close, 200.0)
+
+    def test_off_reads_the_trading_venue(self):
+        trading, live, bars = self._scan(False)
+        self.assertEqual((trading.calls, live.calls), (1, 0))
+        self.assertEqual(bars[-1].close, 100.0)
