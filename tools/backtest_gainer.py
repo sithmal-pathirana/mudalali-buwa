@@ -166,7 +166,20 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  #                   | btc_down (only while BTC 24h < losers_btc_below %)
                  "with_losers": 0, "losers_max_positions": 1, "losers_target_pct": 50.0,
                  "losers_mode": "always", "losers_switch_n": 5, "losers_btc_below": -2.0,
-                 "losers_min_price": 0.001}
+                 "losers_min_price": 0.001,
+                 # dd_counts_banked  1: limits.drawdown_pause_pct measures the balance
+                 #                   PLUS everything moved to Funding, so banking
+                 #                   profit (or the principal) is not a "drawdown"
+                 "dd_counts_banked": 0,
+                 # max_notional_usdt  cap every trade (gainer, squeeze, shorts) at this
+                 #                    many USDT, so a compounding account does not
+                 #                    place orders the thin coins could not fill. 0 = off
+                 "max_notional_usdt": 0.0,
+                 # realism, calibrated on the live trades of 2026-09-25..10-07:
+                 #   ladder_peak    high (old) | close: the ladder steps on 5-minute
+                 #                  closes, not on one-tick wicks the bot never sees
+                 #   stop_slip_pct  extra slippage on stop exits (fast drops fill worse)
+                 "ladder_peak": "high", "stop_slip_pct": 0.0}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -289,7 +302,7 @@ class Settings:
         that never arms, so its time limit is exit.max_hold_hours."""
         x = self.sq.exit
         return (round(cost, 8), float(x.stop_pct), 0.0, True, 1e9, 1e9, "lock",
-                float(x.max_hold_hours), "fixed", 3.0, 10.0, 40.0, 0.0, 0.5, "keep")
+                float(x.max_hold_hours), "fixed", 3.0, 10.0, 40.0, 0.0, 0.5, "keep") + self.realism()
 
     def losers_exit_key(self, cost: float) -> tuple:
         """The gainer's exits, mirrored for a short."""
@@ -297,7 +310,7 @@ class Settings:
         return (round(cost, 8), float(x.stop_pct), float(self.test["losers_target_pct"]),
                 x.ladder_enabled, float(x.ladder_first_pct), float(x.ladder_step_pct),
                 "lock", float(x.unarmed_max_hours), "fixed", 3.0, 10.0, 40.0, 0.0, 0.5,
-                "keep", "short")
+                "keep") + self.realism() + ("short",)
 
     def board_key(self) -> tuple:
         b = self.g.board
@@ -339,7 +352,11 @@ class Settings:
         tp_m, lad_m = float(self.test["atr_tp_mult"]), float(self.test["atr_ladder_mult"])
         if tp_m or lad_m:
             k += ("atr_dyn", tp_m, lad_m)
-        return k
+        return k + self.realism()
+
+    def realism(self) -> tuple:
+        peak, slip = str(self.test["ladder_peak"]), float(self.test["stop_slip_pct"] or 0)
+        return ("real", peak, slip) if (peak != "high" or slip) else ()
 
 
 def bars_for(minutes: float) -> int:
@@ -1102,7 +1119,7 @@ class Oracle:
         return f
 
     @staticmethod
-    def _outcome_short(d, t, ek, feat):
+    def _outcome_short(d, t, ek, feat, peak_on="high", slip=0.0):
         """(net return, exit time, reason) of a SHORT opened at the open of the bar at t:
         stop stop_pct above, take-profit target_pct below, and the ladder mirrored
         (stop to entry once the price is first_pct below it, then a step behind)."""
@@ -1117,7 +1134,7 @@ class Oracle:
         trough, t0 = e, T[j]
         for k in range(j, len(T)):
             if Hh[k] >= sl:
-                px = max(sl, O[k])
+                px = max(sl, O[k]) * (1 + slip / 100)
                 why = "stop" if sl > e else ("ladder stop at entry" if sl == e
                                              else "ladder stop in profit")
                 return 1 - px / e - cost, T[k] + B, why
@@ -1126,8 +1143,9 @@ class Oracle:
             close_t = T[k] + B
             if ladder_on and max_h > 0 and sl > e and close_t - t0 >= max_h * H:
                 return 1 - C[k] / e - cost, close_t, "time limit"
-            if ladder_on and L[k] < trough:
-                trough = L[k]
+            seen = L[k] if peak_on == "high" else C[k]
+            if ladder_on and seen < trough:
+                trough = seen
                 gain = round((1 - trough / e) * 100, 9)
                 if gain >= first:
                     level = e
@@ -1156,8 +1174,16 @@ class Oracle:
 
     def _outcome(self, sym, d, t, ek, feat, context):
         """(net return, exit time, reason) of a long opened at the open of the bar at t."""
+        peak_on, slip = "high", 0.0
         if ek[-1] == "short":
-            return self._outcome_short(d, t, ek, feat)
+            if "real" in ek:
+                i = ek.index("real")
+                peak_on, slip = ek[i + 1], ek[i + 2]
+            return self._outcome_short(d, t, ek, feat, peak_on, slip)
+        if "real" in ek:
+            i = ek.index("real")
+            peak_on, slip = ek[i + 1], ek[i + 2]
+            ek = ek[:i] + ek[i + 3:]
         (cost, stop_pct, target_pct, ladder_on, first, step, mode, max_h, stop_mode,
          atr_mult, atr_min, atr_max, part_pct, part_frac, on_new) = ek[:15]
         if "atr_dyn" in ek:
@@ -1190,7 +1216,7 @@ class Oracle:
             c = bisect.bisect_right(changes, (t, "￿"))
         for k in range(j, len(T)):
             if L[k] <= sl:
-                px = min(sl, O[k])
+                px = min(sl, O[k]) * (1 - slip / 100)
                 why = "stop" if sl < e else ("ladder stop at entry" if sl == e else "ladder stop in profit")
                 return banked + left * (px / e - 1) - cost, T[k] + B, why
             if part and left == 1.0 and Hh[k] >= part:
@@ -1201,8 +1227,9 @@ class Oracle:
             close_t = T[k] + B
             if ladder_on and max_h > 0 and sl < e and close_t - t0 >= max_h * H:
                 return banked + left * (C[k] / e - 1) - cost, close_t, "time limit"
-            if ladder_on and Hh[k] > peak:
-                peak = Hh[k]
+            seen = Hh[k] if peak_on == "high" else C[k]
+            if ladder_on and seen > peak:
+                peak = seen
                 lv = ladder_stop(e, peak, first, step, mode=mode, init_stop=init)
                 if lv is not None and lv > sl:
                     sl = lv
@@ -1326,6 +1353,10 @@ class Account:
         def equity():
             return bal - pending
 
+        def dd_equity():
+            """What the drawdown pause measures (see test.dd_counts_banked)."""
+            return equity() + ((swept + principal_out) if s.test["dd_counts_banked"] else 0.0)
+
         def close(sym):
             nonlocal bal, pending, withdrawn, loss_streak, pause_until, swept, principal_out
             nonlocal income_month
@@ -1404,7 +1435,9 @@ class Account:
                                or f["btc24"] >= sz.conviction_btc_min_change_24h_pct))
                 share = sz.conviction_high_pct if strong else sz.conviction_low_pct
             pct = max(0.0, equity()) * share / 100
-            return max(pct, en.min_notional_usdt) if pct > 0 else 0.0
+            n = max(pct, en.min_notional_usdt) if pct > 0 else 0.0
+            cap = float(s.test["max_notional_usdt"] or 0)
+            return min(n, cap) if cap > 0 else n
 
         def filter_reason(f):
             if fl.min_price > 0 and f["price"] < fl.min_price:
@@ -1493,7 +1526,7 @@ class Account:
         def open_(sym, t):
             nonlocal peak
             eq = equity()
-            peak = max(peak, eq)
+            peak = max(peak, dd_equity())
             day = utc_day(t)
             day_start.setdefault(day, eq)
             if len(gainer_held()) >= en.max_positions and policy == "refuse":
@@ -1519,7 +1552,7 @@ class Account:
             if lm.daily_loss_limit_pct > 0 and day_real.get(day, 0.0) \
                     < -day_start[day] * lm.daily_loss_limit_pct / 100:
                 return skip("limit: daily_loss_limit_pct")
-            if lm.drawdown_pause_pct > 0 and eq < peak * (1 - lm.drawdown_pause_pct / 100):
+            if lm.drawdown_pause_pct > 0 and dd_equity() < peak * (1 - lm.drawdown_pause_pct / 100):
                 return skip("limit: drawdown_pause_pct")
             if n < MIN_ORDER_USDT:
                 return skip("under the $5 exchange minimum")
@@ -1550,12 +1583,14 @@ class Account:
             """Squeeze mode's buy, sharing the account with the gainer."""
             nonlocal peak
             eq = equity()
-            peak = max(peak, eq)
+            peak = max(peak, dd_equity())
             if sym in held:
                 return skip("squeeze: already held")
             if sum(1 for p in held.values() if p.get("s") == "squeeze") >= sqe.max_positions:
                 return skip("squeeze: max_positions full")
             n = max(max(0.0, eq) * sqe.notional_pct_of_equity / 100, sqe.min_notional_usdt)
+            if float(tst["max_notional_usdt"] or 0) > 0:
+                n = min(n, float(tst["max_notional_usdt"]))
             if n < MIN_ORDER_USDT or eq < risk.min_equity_usdt:
                 return skip("squeeze: equity floor")
             if sum(p["n"] for p in held.values()) + n > eq * risk.max_leverage + 1e-9:
@@ -1578,7 +1613,7 @@ class Account:
             """The second front: short a new 24h #1 loser."""
             nonlocal peak
             eq = equity()
-            peak = max(peak, eq)
+            peak = max(peak, dd_equity())
             mode = tst["losers_mode"]
             if mode == "gainers_losing":
                 recent = gainer_pnls[-int(tst["losers_switch_n"]):]
@@ -1603,6 +1638,8 @@ class Account:
                                        or f["btc24"] >= float(tst["losers_btc_below"])):
                 return skip("short: BTC not falling")
             n = max(max(0.0, eq) * en.notional_pct_of_equity / 100, en.min_notional_usdt)
+            if float(tst["max_notional_usdt"] or 0) > 0:
+                n = min(n, float(tst["max_notional_usdt"]))
             if n < MIN_ORDER_USDT or eq < risk.min_equity_usdt:
                 return skip("short: equity floor")
             if sum(p["n"] for p in held.values()) + n > eq * risk.max_leverage + 1e-9:
@@ -1734,11 +1771,33 @@ def fmt(ms: int) -> str:
 
 
 # ==================================================================== runs
+#: --periods name=YYYY-MM-DD:YYYY-MM-DD,... : extra accounts replayed beside the
+#: standard four (each starts empty with the same deposit schedule)
+EXTRA_PERIODS: dict = {}
+
+
 def periods(m: Market) -> dict:
     lo, hi = m.t_lo, m.t_hi
     mid = lo + 365 * D
-    return {"2y": (lo, hi), "year1": (lo, mid), "year2": (mid, hi),
-            "last6m": (hi - 180 * D, hi)}
+    out = {"2y": (lo, hi), "year1": (lo, mid), "year2": (mid, hi),
+           "last6m": (hi - 180 * D, hi)}
+    for name, (a, b) in EXTRA_PERIODS.items():
+        a, b = max(a, lo), min(b, hi)
+        if a < b:
+            out[name] = (a, b)
+    return out
+
+
+def parse_periods(text: str) -> dict:
+    out = {}
+    for part in filter(None, (x.strip() for x in text.split(","))):
+        name, span = part.split("=", 1)
+        a, b = span.split("~") if "~" in span else span.split(":")
+        ms = lambda d: int(dt.datetime.strptime(
+            d, "%Y-%m-%dT%H:%M" if "T" in d else "%Y-%m-%d").replace(
+            tzinfo=dt.timezone.utc).timestamp() * 1000)
+        out[name] = (ms(a), ms(b))
+    return out
 
 
 def replay(runs: list, market: Market, oracle: Oracle, cost: float, deposits, log,
@@ -2055,6 +2114,8 @@ def main(argv=None) -> int:
                         help="added to exit.fee_pct as the round-trip cost (default 0.05)")
     common.add_argument("--report-rows", type=int, default=150,
                         help="rows per table in report.md (every run is in results.csv)")
+    common.add_argument("--periods", default="",
+                        help="extra accounts: name=YYYY-MM-DD:YYYY-MM-DD or name=YYYY-MM-DDTHH:MM~YYYY-MM-DDTHH:MM, comma-separated (each starts empty)")
     common.add_argument("--keep-trades", action="store_true",
                         help="keep every run's trade list in results.json (big)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2097,6 +2158,7 @@ def main(argv=None) -> int:
         log(f"merged {len(doc['runs'])} runs into {args.out}/report.md")
         return 0
 
+    EXTRA_PERIODS.update(parse_periods(args.periods))
     base_raw = yaml.safe_load(Path(args.config).read_text()) or {}
     grid = yaml.safe_load(Path(args.grid).read_text()) if getattr(args, "grid", None) else {}
     space = yaml.safe_load(Path(args.space).read_text()) if args.cmd == "search" else {}
