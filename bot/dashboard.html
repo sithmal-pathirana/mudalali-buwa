@@ -204,7 +204,12 @@
     // ---- banner
     var b = el("banner"); b.innerHTML = "";
     if (s.halted) {
-      b.innerHTML = '<div class="banner halt">HALTED — ' + (s.halt_reason||"") + '</div>';
+      // halt_reason carries exchange error text and the free-text note from a
+      // POST, so it is text, never markup.
+      var hb = document.createElement("div");
+      hb.className = "banner halt";
+      hb.textContent = "HALTED — " + (s.halt_reason||"");
+      b.appendChild(hb);
     } else if (s.target_reached) {
       b.innerHTML = '<div class="banner done">Daily target banked. ' +
                     (s.stop_when_reached ? "No further trades today." : "Still trading.") + '</div>';
