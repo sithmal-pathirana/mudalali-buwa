@@ -26,6 +26,7 @@ and takes effect on the next restart. The control surfaces say so explicitly.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import shutil
 from dataclasses import dataclass
@@ -224,6 +225,11 @@ def parse_value(setting: Setting, text: str):
         value = float(raw)
     except ValueError:
         raise ValueError(f"{setting.key} must be a number, not {raw!r}") from None
+    # float() accepts "nan" and "inf". NaN fails every comparison, so it slid
+    # past both range checks below; inf crashed int() with an OverflowError the
+    # Telegram handler does not catch.
+    if not math.isfinite(value):
+        raise ValueError(f"{setting.key} must be a finite number, not {raw!r}")
     if setting.kind == "int":
         if value != int(value):
             raise ValueError(f"{setting.key} must be a whole number, not {raw!r}")

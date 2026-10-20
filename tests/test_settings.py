@@ -194,6 +194,15 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_value(EDITABLE["risk.risk_per_trade_pct"], "lots")
 
+    def test_nan_and_infinity_are_refused(self):
+        """NaN compares false against both bounds, so it passed the range
+        check; inf raised OverflowError instead of ValueError."""
+        for key in ("risk.risk_per_trade_pct", "risk.max_leverage",
+                    "gainer.exit.target_usd"):
+            for text in ("nan", "NaN", "inf", "-inf", "1e400"):
+                with self.assertRaises(ValueError, msg=f"{key} {text}"):
+                    parse_value(EDITABLE[key], text)
+
     def test_empty_is_refused(self):
         with self.assertRaises(ValueError):
             parse_value(EDITABLE["risk.max_leverage"], "   ")
