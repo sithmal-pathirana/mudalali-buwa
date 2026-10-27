@@ -1068,6 +1068,17 @@ class TraderSettings(unittest.TestCase):
         e.equity = 80.0
         self.assertTrue(m.open("BBBUSDT", 1.0, 40))
 
+    def test_drawdown_shrink_sizing(self):
+        m, e = self.fresh(entry=dict(notional_pct_of_equity=20, min_notional_usdt=6),
+                          limits=dict(drawdown_shrink_pct=15, drawdown_shrink_factor=0.25))
+        m.peak_equity = 1000.0
+        e.equity = 900.0                                     # 10% down: full size
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 180.0)
+        e.equity = 800.0                                     # 20% down: a quarter
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 40.0)
+        e.equity = 100.0                                     # never under the minimum
+        self.assertAlmostEqual(m.trade_notional("BBBUSDT"), 6.0)
+
     # ---- sizing
     def test_volatility_sizing(self):
         m, e = self.fresh(entry=dict(notional_pct_of_equity=10),

@@ -564,7 +564,7 @@ gainer:
   # testnet and paper report what would have moved. The API key needs
   # "Permits Universal Transfer" (Binance requires an IP-restricted key).
   sweep:
-    enabled: true
+    enabled: false   # 2026-10-09: off by request, profits compound
     pct: 25.0
     min_transfer_usdt: 1.0     # smaller amounts wait for the next win
     # Keep profits compounding until equity reaches this, then start the
@@ -577,7 +577,7 @@ gainer:
     # until that date is set. Money waiting to move (a failed transfer, or a
     # sweep under min_transfer_usdt) is set aside: the bot sizes and risks
     # trades on the balance WITHOUT it.
-    principal_enabled: true
+    principal_enabled: false   # 2026-10-09: off by request, profits compound
     principal_trigger_x: 2.5
     deposits_since: "2026-09-25"   # the day the $50 was deposited
     deposits_override_usdt: 0.0
@@ -637,6 +637,8 @@ gainer:
     max_exposure_pct: 40        # 2 gainer trades at 20% (2026-10-07; was 20 with 10% trades)
     daily_loss_limit_pct: 0
     drawdown_pause_pct: 20      # no new trades 20% below the high; setting A 2026-09-30
+    drawdown_shrink_pct: 0      # trades at drawdown_shrink_factor size this far below the high; 0 = off
+    drawdown_shrink_factor: 0.33
 
 
 # MANUAL TRADES: positions that belong to the user, not the bot. On these
@@ -662,7 +664,7 @@ squeeze:
     poll_seconds: 60
 
   entry:
-    funding_at_most_pct: -0.10  # percent per 8 hours
+    funding_at_most_pct: -1.5   # percent per 8 hours; 2026-10-11 (was -0.10): replay robust band -1..-2
     max_new_per_round: 3
     max_positions: 2         # 2026-10-07 (was 5): the tested setting
     notional_pct_of_equity: 10.0
@@ -677,7 +679,7 @@ squeeze:
     status_minutes: 60
 
   sweep:
-    enabled: true
+    enabled: false   # 2026-10-09: off by request, profits compound
     pct: 25.0
     min_transfer_usdt: 1.0
     principal_enabled: false

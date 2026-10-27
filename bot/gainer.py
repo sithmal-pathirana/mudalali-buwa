@@ -286,6 +286,11 @@ class GainerLimitsConfig:
     daily_loss_limit_pct: float = 0.0
     #: Stop opening while equity is more than this % below its highest point. 0 = off.
     drawdown_pause_pct: float = 0.0
+    #: While equity is more than this % below its highest point, new trades are
+    #: drawdown_shrink_factor of their usual size (never under entry.min_notional_usdt).
+    #: 0 = off.
+    drawdown_shrink_pct: float = 0.0
+    drawdown_shrink_factor: float = 0.33
 
 
 @dataclass
@@ -1227,7 +1232,16 @@ class GainerMiner:
                            or self._btc_24h >= sz.conviction_btc_min_change_24h_pct))
             share = sz.conviction_high_pct if strong else sz.conviction_low_pct
         pct = max(0.0, self.engine.equity) * share / 100.0
-        return max(pct, en.min_notional_usdt) if pct > 0 else 0.0
+        return max(pct * self.drawdown_factor(), en.min_notional_usdt) if pct > 0 else 0.0
+
+    def drawdown_factor(self) -> float:
+        """limits.drawdown_shrink_pct: smaller trades while equity is well below its high."""
+        lm = getattr(self.cfg, "limits", None)
+        cut = getattr(lm, "drawdown_shrink_pct", 0.0) if lm else 0.0
+        eq = float(getattr(self.engine, "equity", 0.0) or 0.0)
+        if cut > 0 and self.peak_equity > 0 and eq < self.peak_equity * (1 - cut / 100.0):
+            return lm.drawdown_shrink_factor
+        return 1.0
 
     def stop_pct_for(self, symbol: str) -> float:
         """exit.stop_mode: the fixed stop_pct, or a multiple of the coin's ATR."""
@@ -1345,7 +1359,10 @@ class GainerMiner:
                     f"(${entry * qty:,.2f})\n{tp_line}\n"
                     f"SL {stop:,.6g} (-{stop_pct:.1f}%, about {loss:+.2f} USDT)" + ladder
                     + (f"\nPartial: sell {ex.partial_fraction:.0%} at {partial_price:,.6g} "
-                       f"(+{ex.partial_take_pct:g}%)" if partial_price else ""),
+                       f"(+{ex.partial_take_pct:g}%)" if partial_price else "")
+                    + (f"\nSmaller size: equity is more than "
+                       f"{self.cfg.limits.drawdown_shrink_pct:g}% below its high "
+                       f"${self.peak_equity:,.2f}" if self.drawdown_factor() < 1 else ""),
                     symbol=symbol, event=Event.TRADE_OPEN)
         return True
 
