@@ -1,0 +1,58 @@
+# /etc/systemd/system/trading-shadow.service
+#
+# Read-only recorder for the shadow tests (tools/shadow_logger.py). It never
+# places orders: its client refuses every request but GET. Separate from the
+# bot, so a crash or restart here never touches trading.
+#
+#   sudo cp deploy/trading-shadow.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now trading-shadow
+#   journalctl -u trading-shadow -f
+
+[Unit]
+Description=Trading bot shadow logger (read-only)
+After=network-online.target time-sync.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/trading-bot/tools/shadow_logger.py
+Restart=on-failure
+RestartSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/data/shadow
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Smaller than the bot, and yields to it.
+MemoryMax=300M
+CPUQuota=20%
+TasksMax=32
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-shadow
+
+[Install]
+WantedBy=multi-user.target
