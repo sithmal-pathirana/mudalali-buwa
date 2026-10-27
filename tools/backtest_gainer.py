@@ -91,6 +91,8 @@ FEATS_VERSION = 4               # bump when the measurements at a leader change
 #:     replace_oldest  sell the position held longest, buy the new leader
 #:     replace_worst   sell the position doing worst right now, buy it
 #:     replace_losing  as replace_worst, but only if that position is losing
+#:     replace_stale   as replace_worst, but only a GAINER position that never
+#:                     armed its ladder (price under exit.ladder_first_pct)
 #:   replace_min_hold_hours: a position younger than this is never sold for room.
 #:   Pump-and-dump checks on a new leader (skip it when the check fails; 0 = off):
 #:   max_volume_surge_x       24h volume over its normal day (avg of the 7 days before)
@@ -179,7 +181,93 @@ TEST_DEFAULTS = {"when_full": "refuse", "replace_min_hold_hours": 0.0,
                  #   ladder_peak    high (old) | close: the ladder steps on 5-minute
                  #                  closes, not on one-tick wicks the bot never sees
                  #   stop_slip_pct  extra slippage on stop exits (fast drops fill worse)
-                 "ladder_peak": "high", "stop_slip_pct": 0.0}
+                 "ladder_peak": "high", "stop_slip_pct": 0.0,
+                 # drawdown sizing: while the balance is more than dd_size_cut_pct
+                 # below its high, every new trade is dd_size_factor of its size
+                 "dd_size_cut_pct": 0.0, "dd_size_factor": 0.5,
+                 # slots that grow with the balance: one more gainer slot per
+                 # slots_per_usdt of balance (at least the configured max_positions,
+                 # at most slots_max). slots_mode split: the exposure cap stays and is
+                 # shared by the slots; add: each trade keeps its size and the cap
+                 # grows with the slots
+                 "slots_per_usdt": 0.0, "slots_max": 10, "slots_mode": "split",
+                 # overflow: a new #1 that arrives while the gainer's slots or cap are
+                 # full is still bought, at overflow_pct of the balance (0 = the
+                 # minimum order, entry.min_notional_usdt), up to overflow_max at once
+                 "overflow": 0, "overflow_pct": 0.0, "overflow_max": 50,
+                 # armed_free  1: a gainer position whose price is at least
+                 #             exit.ladder_first_pct above entry (its stop is at or
+                 #             past entry) no longer takes a slot or counts against
+                 #             limits.max_exposure_pct; max_leverage still counts it
+                 # dd_rebase_days  after this many days refused by the drawdown pause,
+                 #                 the high it measures from resets to the balance now
+                 "armed_free": 0, "dd_rebase_days": 0.0,
+                 # retry_full_hours  a leader refused because the slots or the cap
+                 #                   were full is tried again at the first check
+                 #                   after any position closes, while it is still #1
+                 #                   and within this many hours (0 = off, the bot)
+                 # retry_max_rise_pct  ... but not when it has risen more than this
+                 #                   since it was refused (0 = no limit)
+                 "retry_full_hours": 0.0, "retry_max_rise_pct": 0.0,
+                 # accounting fixes (2026-10-09 audit), all off = the old replay:
+                 #   marked_equity   1: equity (sizing, caps, drawdown pause, month
+                 #                   ends) includes open positions at their mark,
+                 #                   as the live bot's marginBalance does
+                 #   hard_cutoff     1: positions still open at a period's end are
+                 #                   booked at their mark then, not at their later exit
+                 #   funding_scaled  1: each funding payment is on the position's value
+                 #                   at that settlement (price / entry), not on entry
+                 "marked_equity": 0, "hard_cutoff": 0, "funding_scaled": 0,
+                 # event_stops  1 (with signal events): the events file's stop_pct
+                 #              column is each trade's stop, instead of exit.stop_pct
+                 # risk_pct     with event_stops: a trade is at most risk_pct of
+                 #              equity / its stop distance (still capped by the
+                 #              usual % per trade and floored at the minimum order)
+                 "event_stops": 0, "risk_pct": 0.0,
+                 # no_gainer  1: the gainer never buys (squeeze or shorts alone)
+                 "no_gainer": 0,
+                 # sq_rank  how squeeze orders the eligible coins of a round before
+                 #          taking max_new_per_round of them:
+                 #   funding  most negative funding first (the bot)
+                 #   ret1h    strongest 1h price return before the check first
+                 #   absorb   coins with net taker SELLING over that hour (flow
+                 #            data) while price held (return >= 0) first, by
+                 #            return; the rest in funding order
+                 "sq_rank": "funding",
+                 # tp_spot_only  1: the gainer's take-profit (exit.target_pct) is
+                 #               used only on coins whose Binance spot market
+                 #               traded in the 24h before entry; futures-only
+                 #               coins get no take-profit (ladder and stops only)
+                 "tp_spot_only": 0,
+                 # squeeze ladder: lock ladder on squeeze positions (first step,
+                 # then step size, in %; 0 = none, the bot). The squeeze's
+                 # max_hold_hours still closes every position, armed or not
+                 "sq_ladder_first": 0.0, "sq_ladder_step": 0.0,
+                 # sq_ladder_on  which squeeze coins get that ladder: all | spot
+                 #               (spot market traded in the 24h before entry) |
+                 #               futures_only
+                 "sq_ladder_on": "all",
+                 # giant override: a "giant" squeeze signal = funding per 8h <=
+                 # giant_funding_pct AND hourly funding interval AND OI quantity up
+                 # >= giant_oi_pct over 24h (snapshot >= 15 min old; metrics_all).
+                 # It may open up to giant_extra squeeze positions beyond
+                 # squeeze max_positions (normal squeeze size, leverage ceiling
+                 # still applies). giant_hourly 1: checked at every hourly
+                 # settlement, 0: only at the squeeze's 00/08/16 rounds
+                 "giant_extra": 0, "giant_funding_pct": -3.0, "giant_oi_pct": 50.0,
+                 "giant_hourly": 0,
+                 # skip_days  no new GAINER entries on these weekdays ("6" = Sunday,
+                 #            "5,6" = weekend; 0 = Monday), in local time
+                 #            UTC + skip_tz_hours (5.5 = Sri Lanka)
+                 "skip_days": "", "skip_tz_hours": 0.0,
+                 # pyramiding: add pyramid_frac of the first size when the trade is
+                 # up pyramid_at percent (e.g. "20,40"); every part shares the
+                 # ladder stop. Returns stay relative to the first size.
+                 "pyramid_at": "", "pyramid_frac": 0.5,
+                 # re-entry: after the ladder sells in profit, buy again when the
+                 # coin breaks that trade's high within reentry_hours (up to
+                 # reentry_max times). The slot stays taken while it waits.
+                 "reentry_hours": 0.0, "reentry_max": 1}
 #: test setting -> (feature, skip when the feature is ABOVE the limit?)
 PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_volume_surge_x", "vol_surge", False),
@@ -205,7 +293,7 @@ PUMP_CHECKS = [("max_volume_surge_x", "vol_surge", True),
                ("min_spot_buy_share_1h", "spot_buy_1h", False),
                ("max_spot_lead", "spot_lead", True),
                ("min_spot_surge_x", "spot_surge", False)]
-WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing")
+WHEN_FULL = ("refuse", "replace_oldest", "replace_worst", "replace_losing", "replace_stale")
 
 B = 300_000                     # one 5-minute bar, ms
 DAY_BARS = 288
@@ -301,6 +389,12 @@ class Settings:
         """Squeeze exits in the gainer outcome format: stop, no target, a ladder
         that never arms, so its time limit is exit.max_hold_hours."""
         x = self.sq.exit
+        first, step = float(self.test["sq_ladder_first"] or 0), float(self.test["sq_ladder_step"] or 0)
+        if first > 0 and step > 0:
+            on = str(self.test["sq_ladder_on"])
+            pre = ("sqspot", on) if on != "all" else ()
+            return pre + ("hardtime", round(cost, 8), float(x.stop_pct), 0.0, True, first, step, "lock",
+                    float(x.max_hold_hours), "fixed", 3.0, 10.0, 40.0, 0.0, 0.5, "keep") + self.realism()
         return (round(cost, 8), float(x.stop_pct), 0.0, True, 1e9, 1e9, "lock",
                 float(x.max_hold_hours), "fixed", 3.0, 10.0, 40.0, 0.0, 0.5, "keep") + self.realism()
 
@@ -350,8 +444,16 @@ class Settings:
         if ex.on_new_leader == "close_if_losing":
             k += (float(ex.min_hold_minutes), float(ex.fee_pct)) + self.stream_key()
         tp_m, lad_m = float(self.test["atr_tp_mult"]), float(self.test["atr_ladder_mult"])
+        pyr = tuple(float(x) for x in str(self.test["pyramid_at"] or "").split(",") if x.strip())
+        if pyr or float(self.test["reentry_hours"] or 0):
+            k += ("pyr", pyr, float(self.test["pyramid_frac"]),
+                  float(self.test["reentry_hours"] or 0), int(self.test["reentry_max"]))
         if tp_m or lad_m:
             k += ("atr_dyn", tp_m, lad_m)
+        if self.test["event_stops"]:
+            k = ("evstop", str(self.test["events_file"])) + k
+        if self.test["tp_spot_only"]:
+            k = ("tpspot",) + k
         return k + self.realism()
 
     def realism(self) -> tuple:
@@ -479,12 +581,14 @@ class Market:
             total -= R[k] / 100 * gap / 8.0          # R is % per 8h; one payment covers gap
         return total
 
-    def squeeze_events(self, sq) -> list:
+    def squeeze_events(self, sq, rank: str = "funding") -> list:
         """Squeeze mode's buys: after each 00/08/16 UTC settlement, the most
         negative per-8h rates at or below funding_at_most_pct with enough 24h
         volume, at most max_new_per_round. [(t, symbol, end)]"""
         key = ("squeeze", float(sq.entry.funding_at_most_pct), int(sq.entry.max_new_per_round),
                float(sq.board.min_quote_volume), float(sq.board.check_minutes_after_funding))
+        if rank != "funding":
+            key += ("rank", rank)
         path = self._cache_path("stream", key)
         if path.exists():
             with open(path, "rb") as f:
@@ -507,22 +611,101 @@ class Market:
             for r, sym in rows:
                 need.setdefault(sym, []).append(st)
         vol: dict = {}
+        hour: dict = {}                    # (sym, st) -> (1h return, 1h taker imbalance)
         span = DAY_BARS * B
+        wait = int(sq.board.check_minutes_after_funding * 60_000)
         for sym, sts in need.items():
             if sym not in self.index["first"]:
                 continue
-            T, _O, _H, _L, _C, Q = self.load(sym)
+            T, _O, _H, _L, C, Q = self.load(sym)
+            fl = self.flow(sym) if rank == "absorb" else None
             for st in sts:
                 i = bisect.bisect_left(T, st) - 1
                 if i >= DAY_BARS and T[i] + B == st and T[i] - T[i - DAY_BARS] == span:
                     vol[(sym, st)] = sum(Q[i - DAY_BARS + 1:i + 1])
-        wait = int(sq.board.check_minutes_after_funding * 60_000)
+                if rank == "funding":
+                    continue
+                t = ((st + wait + B - 1) // B) * B             # the check: bars closed by t
+                k = bisect.bisect_left(T, t) - 1
+                if k < 12 or T[k] + B != t or T[k] - T[k - 12] != 12 * B or C[k - 12] <= 0:
+                    continue
+                ret = C[k] / C[k - 12] - 1
+                imb = None
+                if fl:
+                    FT, _N, TB = fl
+                    a, b = bisect.bisect_left(FT, T[k - 11]), bisect.bisect_right(FT, T[k])
+                    q = sum(Q[k - 11:k + 1])
+                    if b - a == 12 and q > 0:
+                        imb = (2 * sum(TB[a:b]) - q) / q
+                hour[(sym, st)] = (ret, imb)
+
+        def order(st, rows):
+            by_fund = sorted(rows)
+            if rank == "ret1h":
+                return sorted(by_fund, key=lambda x: -hour[(x[1], st)][0]
+                              if (x[1], st) in hour else float("inf"))
+            if rank == "absorb":
+                def held_up(x):
+                    h = hour.get((x[1], st))
+                    return h is not None and h[1] is not None and h[1] < 0 and h[0] >= 0
+                first = sorted((x for x in by_fund if held_up(x)),
+                               key=lambda x: -hour[(x[1], st)][0])
+                return first + [x for x in by_fund if not held_up(x)]
+            return by_fund
+
         for st, rows in sorted(rounds.items()):
-            ok = sorted((r, sym) for r, sym in rows
-                        if vol.get((sym, st), 0.0) >= sq.board.min_quote_volume)
+            ok = order(st, [(r, sym) for r, sym in rows
+                            if vol.get((sym, st), 0.0) >= sq.board.min_quote_volume])
             t = ((st + wait + B - 1) // B) * B                 # the next 5-minute close
             for r, sym in ok[:max(0, sq.entry.max_new_per_round)]:
                 out.append((t, sym, t + B))
+        with open(path, "wb") as f:
+            pickle.dump(out, f)
+        return out
+
+    def giant_events(self, sq, fund_max, oi_min, hourly) -> list:
+        """Giant squeeze signals [(t, symbol)]: funding per 8h <= fund_max at an
+        hourly settlement, OI quantity up >= oi_min % over 24h, 24h volume >=
+        the squeeze minimum; t = the squeeze's check after that settlement."""
+        key = ("giant", float(fund_max), float(oi_min), int(hourly),
+               float(sq.board.min_quote_volume), float(sq.board.check_minutes_after_funding))
+        path = self._cache_path("stream", key)
+        if path.exists():
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        self.log("finding giant squeeze signals (once) ...")
+        p8, wait, out = 8 * H, int(sq.board.check_minutes_after_funding * 60_000), []
+        for sym in self.symbols:
+            fu = self.funding(sym)
+            if not fu or sym not in self.index["first"]:
+                continue
+            FT, FR = fu
+            cand = [k for k in range(1, len(FT)) if FR[k] <= fund_max
+                    and round((FT[k] - FT[k - 1]) / H) == 1 and self.t_lo <= FT[k] < self.t_hi
+                    and (hourly or abs(FT[k] - round(FT[k] / p8) * p8) < 5 * 60_000)]
+            if not cand:
+                continue
+            mp = self.dir.parent / "metrics_all" / f"{sym}.pkl"
+            if not mp.exists():
+                continue
+            rows = pickle.load(open(mp, "rb"))["rows"]
+            OT = sorted(k for k, v in rows.items() if v and v[0])
+            T, _O, _H, _L, _C, Q = self.load(sym)
+
+            def oi(ts):
+                i = bisect.bisect_right(OT, ts) - 1
+                return rows[OT[i]][0] if i >= 0 and ts - OT[i] <= 2 * H else None
+            for k in cand:
+                st = FT[k]
+                t = ((st + wait + B - 1) // B) * B
+                a, b = oi(t - 15 * 60_000), oi(t - 15 * 60_000 - 24 * H)
+                if not a or not b or (a / b - 1) * 100 < oi_min:
+                    continue
+                i = bisect.bisect_left(T, t) - 1
+                if i < DAY_BARS or sum(Q[i - DAY_BARS + 1:i + 1]) < sq.board.min_quote_volume:
+                    continue
+                out.append((t, sym))
+        out.sort()
         with open(path, "wb") as f:
             pickle.dump(out, f)
         return out
@@ -804,8 +987,9 @@ class Market:
                 t = int(r["t"]) + int(delay * 60_000)
                 t = ((t + period - 1) // period) * period          # the next check
                 if self.t_lo <= t < self.t_hi and r["symbol"] in self.index["first"]:
-                    out.append((t, r["symbol"], t + period))
-            out.sort()
+                    out.append((t, float(r.get("rank") or 0), r["symbol"], t + period))
+            out.sort()                                  # same check: best rank first
+            out = [(t, sym, end) for t, _rk, sym, end in out]
             self._streams[key] = out
             return out
         if key[0] == "topn":
@@ -1184,6 +1368,24 @@ class Oracle:
             i = ek.index("real")
             peak_on, slip = ek[i + 1], ek[i + 2]
             ek = ek[:i] + ek[i + 3:]
+        ladder_on_spot = None
+        if ek and ek[0] == "sqspot":
+            ladder_on_spot, ek = ek[1], ek[2:]
+        hard_time = False
+        if ek and ek[0] == "hardtime":
+            hard_time, ek = True, ek[1:]
+        tp_spot = False
+        if ek and ek[0] == "tpspot":
+            tp_spot, ek = True, ek[1:]
+        ev_stop = None
+        if ek and ek[0] == "evstop":
+            ev_stop = load_event_stops(ek[1]).get((sym, t))
+            ek = ek[2:]
+        pyr, pyr_frac, re_h, re_max = (), 0.0, 0.0, 0
+        if "pyr" in ek:
+            i = ek.index("pyr")
+            pyr, pyr_frac, re_h, re_max = ek[i + 1:i + 5]
+            ek = ek[:i] + ek[i + 5:]
         (cost, stop_pct, target_pct, ladder_on, first, step, mode, max_h, stop_mode,
          atr_mult, atr_min, atr_max, part_pct, part_frac, on_new) = ek[:15]
         if "atr_dyn" in ek:
@@ -1201,32 +1403,93 @@ class Oracle:
             return False
         if stop_mode == "atr" and feat.get("atr"):
             stop_pct = min(atr_max, max(atr_min, atr_mult * feat["atr"]))
-        e = O[j]
+        if ev_stop:
+            stop_pct = ev_stop
+        if tp_spot and not self._has_spot(sym, t):
+            target_pct = 0.0
+        if hard_time:
+            max_h = -max_h                       # _leg: the time limit applies even when armed
+        if ladder_on_spot is not None and \
+                self._has_spot(sym, t) != (ladder_on_spot == "spot"):
+            first = step = 1e9                   # this coin keeps no ladder
+        changes = ()
+        if on_new == "close_if_losing":
+            min_hold, fee = ek[15] * 60_000, ek[16]
+            changes = context["changes"][ek[17:]]
+        total, legs, k0, e = 0.0, 0, j, O[j]
+        while True:
+            r, t_out, why, k_out, top = self._leg(sym, d, k0, e, t, stop_pct, target_pct, ladder_on,
+                                                  first, step, mode, max_h, part_pct, part_frac,
+                                                  cost, peak_on, slip, pyr, pyr_frac, changes,
+                                                  ek, on_new)
+            total += r
+            legs += 1
+            if not (re_h and legs <= re_max and why == "ladder stop in profit"):
+                return total, t_out, why if legs == 1 else f"{why} (after re-entry)"
+            # wait for a break of the leg's high
+            k = k_out + 1
+            while k < len(T) and T[k] < t_out - B + re_h * H and Hh[k] <= top:
+                k += 1
+            if k >= len(T) or Hh[k] <= top:
+                return total, t_out, why if legs == 1 else f"{why} (after re-entry)"
+            k0, e = k, max(top, O[k]) * (1 + slip / 100)   # bought as it breaks out
+
+    def _has_spot(self, sym, t) -> bool:
+        """Did the coin's Binance spot market trade in the 24h before t?"""
+        memo = self.__dict__.setdefault("_spot_memo", {})
+        if sym not in memo:
+            memo.clear()                         # fill() goes coin by coin
+            memo[sym] = self.m.spot(sym)
+        sp = memo[sym]
+        if sp in ("missing", None):
+            return False
+        _n, sT, sQ, _sB = sp
+        a, b = bisect.bisect_left(sT, t - DAY_BARS * B), bisect.bisect_left(sT, t)
+        return any(q > 0 for q in sQ[a:b])
+
+    @staticmethod
+    def _leg(sym, d, j, e, t, stop_pct, target_pct, ladder_on, first, step, mode, max_h,
+             part_pct, part_frac, cost, peak_on, slip, pyr, pyr_frac, changes, ek, on_new):
+        """One trade from bar j at price e: (return per first size, exit time, reason,
+        exit bar, highest price seen)."""
+        T, O, Hh, L, C, _Q = d
+        hard = max_h < 0
+        max_h = abs(max_h)
         init = e * (1 - stop_pct / 100)
         sl = init
         tp = e * (1 + target_pct / 100) if target_pct > 0 else 0.0
         part = e * (1 + part_pct / 100) if part_pct > 0 else 0.0
         banked, left = 0.0, 1.0
-        peak = e
+        adds = [[e * (1 + a / 100), None] for a in pyr]     # [trigger, fill price]
+        peak, top = e, e
         t0 = T[j]
-        changes = ()
-        if on_new == "close_if_losing":
+        if changes:
             min_hold, fee = ek[15] * 60_000, ek[16]
-            changes = context["changes"][ek[17:]]
-            c = bisect.bisect_right(changes, (t, "￿"))
+            c = bisect.bisect_right(changes, (t, "\uffff"))
+
+        def value(px):
+            v = banked + left * (px / e - 1) - cost
+            for trig, fill in adds:
+                if fill:
+                    v += pyr_frac * (px / fill - 1 - cost)
+            return v
         for k in range(j, len(T)):
+            top = max(top, Hh[k])
             if L[k] <= sl:
                 px = min(sl, O[k]) * (1 - slip / 100)
                 why = "stop" if sl < e else ("ladder stop at entry" if sl == e else "ladder stop in profit")
-                return banked + left * (px / e - 1) - cost, T[k] + B, why
+                return value(px), T[k] + B, why, k, top
+            for a in adds:
+                if a[1] is None and Hh[k] >= a[0]:
+                    a[1] = max(a[0], O[k])
             if part and left == 1.0 and Hh[k] >= part:
                 banked = part_frac * (max(part, O[k]) / e - 1)
                 left = 1.0 - part_frac
             if tp and Hh[k] >= tp:
-                return banked + left * (max(tp, O[k]) / e - 1) - cost, T[k] + B, "take-profit"
+                return value(max(tp, O[k])), T[k] + B, "take-profit", k, top
             close_t = T[k] + B
-            if ladder_on and max_h > 0 and sl < e and close_t - t0 >= max_h * H:
-                return banked + left * (C[k] / e - 1) - cost, close_t, "time limit"
+            if ladder_on and max_h > 0 and (sl < e or hard) and close_t - t0 >= max_h * H:
+                return value(C[k]), close_t, "time limit", k, top
             seen = Hh[k] if peak_on == "high" else C[k]
             if ladder_on and seen > peak:
                 peak = seen
@@ -1239,13 +1502,27 @@ class Oracle:
                     c += 1
                     if new != sym and ct - t0 >= min_hold and ct == close_t \
                             and C[k] <= e * (1 + fee / 100):
-                        return (banked + left * (C[k] / e - 1) - cost, close_t,
-                                "new leader, not profitable")
-        return banked + left * (C[-1] / e - 1) - cost, T[-1] + B, "end of data"
+                        return value(C[k]), close_t, "new leader, not profitable", k, top
+        return value(C[-1]), T[-1] + B, "end of data", len(T) - 1, top
 
 
 # ================================================================= account
 _SCORES: dict = {}
+_EVSTOPS: dict = {}
+
+
+def load_event_stops(path: str) -> dict:
+    """{(symbol, check time): stop %} from an events file's stop_pct column, keyed
+    by the check time the events stream buys at (delay 0, 5-minute checks)."""
+    if path not in _EVSTOPS:
+        import csv
+        out = {}
+        for r in csv.DictReader(open(path)):
+            if r.get("stop_pct"):
+                t = ((int(r["t"]) + B - 1) // B) * B
+                out[(r["symbol"], t)] = float(r["stop_pct"])
+        _EVSTOPS[path] = out
+    return _EVSTOPS[path]
 
 
 def load_scores(path: str) -> dict:
@@ -1316,9 +1593,14 @@ class Account:
         self.context = context
         self.complete = True
         self.ml = load_scores(s.test["ml_scores"]) if s.test["ml_scores"] else None
-        self.sq_events = ([e for e in oracle.m.squeeze_events(s.sq) if lo <= e[0] < hi]
+        self.sq_events = ([e for e in oracle.m.squeeze_events(s.sq, str(s.test["sq_rank"])) if lo <= e[0] < hi]
                           if s.test["with_squeeze"] else [])
         self.sq_ek = s.squeeze_exit_key(cost)
+        self.giants = []
+        if s.test["with_squeeze"] and int(s.test["giant_extra"] or 0) > 0:
+            self.giants = [e for e in oracle.m.giant_events(
+                s.sq, float(s.test["giant_funding_pct"]), float(s.test["giant_oi_pct"]),
+                int(s.test["giant_hourly"])) if lo <= e[0] < hi]
         self.lo_events = ([e for e in oracle.m.loser_events(
             s.g.board.min_quote_volume, s.check_ms(), s.g.entry.confirm_minutes * 60_000)
             if lo <= e[0] < hi] if s.test["with_losers"] else [])
@@ -1347,11 +1629,91 @@ class Account:
         skips, exits = {}, {}
         next_month = self.lo + MONTH
 
+        decisions = []
+        dd_paused_since = {}
+
+        last_skip = [""]
+        FULL = ("max_positions full", "limit: max_exposure_pct", "risk: max_leverage ceiling")
+
         def skip(why):
+            last_skip[0] = why
             skips[why] = skips.get(why, 0) + 1
+            if self.keep_trades and self._evt and not why.startswith(("squeeze", "short")):
+                decisions.append((self._evt[0], self._evt[1], why))
+
+        tst = s.test
+        marked = bool(tst["marked_equity"])
+        clock = [self.lo]                         # the time equity is marked at
+
+        def unrealised():
+            """Open positions at their mark (test.marked_equity), as the live
+            bot's marginBalance counts them. 0 in the old replay."""
+            if not marked:
+                return 0.0
+            u, now = 0.0, clock[0]
+            for k, p in held.items():
+                if now <= p["t"]:
+                    continue
+                m = self.o.mark(k, p["t"], min(now, p["x"]))
+                if m is None:
+                    self.complete = False
+                    continue
+                u += p["n"] * ((1 - m) if p.get("s") == "short" else (m - 1))
+            return u
 
         def equity():
-            return bal - pending
+            return bal - pending + unrealised()
+
+        def fund(sym, t0, t1):
+            """Funding a long received between t0 and t1, as a fraction of its
+            entry notional (test.funding_scaled: on each settlement's value)."""
+            if not tst["funding_scaled"]:
+                return self.o.m.funding_paid(sym, t0, t1)
+            fu = self.o.m.funding(sym)
+            if not fu:
+                return 0.0
+            T, R = fu
+            a, b = bisect.bisect_right(T, t0), bisect.bisect_right(T, t1)
+            total = 0.0
+            for k in range(a, b):
+                gap = (T[k] - T[k - 1]) / H if k else 8.0
+                gap = min(8.0, max(1.0, round(gap))) if gap > 0 else 8.0
+                m = self.o.mark(sym, t0, T[k]) if T[k] > t0 else 1.0
+                if m is None:
+                    self.complete = False
+                    m = 1.0
+                total -= R[k] / 100 * gap / 8.0 * m
+            return total
+
+        # continuous drawdown, sampled at every decision and month end: profit
+        # in dollars, and a time-weighted index that deposits do not move
+        ddc = dict(W=None, dep=None, idx=1.0, idx_peak=1.0, mdd_pct=0.0,
+                   P_peak=None, mdd_usd=0.0)
+
+        curve, pause_log = [], []
+
+        def sample():
+            u = unrealised()
+            W = bal + u + income_total + income_month
+            if self.keep_trades:
+                curve.append((clock[0], round(bal, 2), round(u, 2), dep, round(W, 2)))
+            P = W - dep
+            if ddc["P_peak"] is None or P > ddc["P_peak"]:
+                ddc["P_peak"] = P
+            ddc["mdd_usd"] = max(ddc["mdd_usd"], ddc["P_peak"] - P)
+            if ddc["W"] and ddc["W"] > 0:
+                ddc["idx"] *= max(0.0, W - (dep - ddc["dep"])) / ddc["W"]
+            ddc["W"], ddc["dep"] = W, dep
+            ddc["idx_peak"] = max(ddc["idx_peak"], ddc["idx"])
+            ddc["mdd_pct"] = max(ddc["mdd_pct"], 1 - ddc["idx"] / ddc["idx_peak"])
+
+        def dd_scale():
+            cut, factor = float(s.test["dd_size_cut_pct"] or 0), float(s.test["dd_size_factor"])
+            if not cut:                                   # the bot's own setting
+                cut, factor = lm.drawdown_shrink_pct, lm.drawdown_shrink_factor
+            if cut > 0 and peak > 0 and dd_equity() < peak * (1 - cut / 100):
+                return factor
+            return 1.0
 
         def dd_equity():
             """What the drawdown pause measures (see test.dd_counts_banked)."""
@@ -1361,6 +1723,7 @@ class Account:
             nonlocal bal, pending, withdrawn, loss_streak, pause_until, swept, principal_out
             nonlocal income_month
             p = held.pop(sym)
+            clock[0] = max(clock[0], p["x"])
             pnl = p["r"] * p["n"]
             bal += pnl
             if p.get("s") not in ("squeeze", "short"):
@@ -1372,7 +1735,9 @@ class Account:
             day_real[day] = day_real.get(day, 0.0) + pnl
             exits[p["why"]] = exits.get(p["why"], 0) + 1
             trades.append(dict(sym=sym, t=p["t"], x=p["x"], n=round(p["n"], 2),
-                               ret=round(p["r"] * 100, 2), pnl=round(pnl, 2), why=p["why"]))
+                               ret=round(p["r"] * 100, 2), pnl=round(pnl, 2), why=p["why"],
+                               funding_pct=round(p.get("f", 0.0) * 100, 3),
+                               kind=p.get("s") or "gainer"))
             if pnl < 0:
                 loss_streak += 1
                 if lm.pause_after_losses > 0 and loss_streak >= lm.pause_after_losses:
@@ -1400,16 +1765,19 @@ class Account:
 
         def month_end(t):
             nonlocal next_month, bal, dep, income_month, income_total
+            clock[0] = max(clock[0], t)
             income_total += income_month
+            u = unrealised()
             months.append(dict(month=len(months) + 1, end=fmt(t), deposited=dep,
                                to_funding=round(income_month, 2),
                                funding_so_far=round(income_total, 2),
-                               futures_balance=round(bal, 2),
-                               profit_so_far=round(income_total + bal - dep, 2)))
+                               futures_balance=round(bal + u, 2),
+                               profit_so_far=round(income_total + bal + u - dep, 2)))
             income_month = 0.0
             bal += self.monthly_dep
             dep += self.monthly_dep
             next_month += MONTH
+            sample()
 
         def advance(u):
             while True:
@@ -1424,7 +1792,7 @@ class Account:
         def notional_for(f):
             if en.notional_pct_of_equity <= 0:
                 return en.notional_usdt
-            share = en.notional_pct_of_equity
+            share = gslots()[1]
             if sz.mode == "volatility" and f.get("atr"):
                 share = min(sz.max_pct, max(sz.min_pct, share * sz.volatility_target_atr_pct / f["atr"]))
             elif sz.mode == "conviction":
@@ -1435,7 +1803,7 @@ class Account:
                                or f["btc24"] >= sz.conviction_btc_min_change_24h_pct))
                 share = sz.conviction_high_pct if strong else sz.conviction_low_pct
             pct = max(0.0, equity()) * share / 100
-            n = max(pct, en.min_notional_usdt) if pct > 0 else 0.0
+            n = max(pct * dd_scale(), en.min_notional_usdt) if pct > 0 else 0.0
             cap = float(s.test["max_notional_usdt"] or 0)
             return min(n, cap) if cap > 0 else n
 
@@ -1476,14 +1844,69 @@ class Account:
         policy = s.test["when_full"]
         min_hold = float(s.test["replace_min_hold_hours"]) * H
 
+        def gslots():
+            """(max positions, % per trade, exposure cap %) for the balance now."""
+            per = float(s.test["slots_per_usdt"] or 0)
+            base_n, pct, cap = en.max_positions, en.notional_pct_of_equity, lm.max_exposure_pct
+            if per <= 0 or cap <= 0 or pct <= 0:
+                return base_n, pct, cap
+            base_slots = max(1, int(round(cap / pct)))       # 2 at 20% / 40%
+            n = min(int(s.test["slots_max"]), base_slots + int(max(0.0, equity()) // per))
+            if s.test["slots_mode"] == "add":
+                return max(base_n, n), pct, pct * n
+            return max(base_n, n), cap / n, cap
+
         def gainer_held():
-            return [p for p in held.values() if p.get("s") not in ("squeeze", "short")]
+            """The gainer's MAIN positions (overflow ones do not take a slot, and
+            with test.armed_free neither do armed ones)."""
+            main = [(k, p) for k, p in held.items()
+                    if p.get("s") not in ("squeeze", "short", "overflow")]
+            if not (s.test["armed_free"] and self._evt):
+                return [p for _, p in main]
+            t, arm, out = self._evt[0], 1 + ex.ladder_first_pct / 100, []
+            for k, p in main:
+                m = self.o.mark(k, p["t"], t) if t > p["t"] else 1.0
+                if m is None:
+                    self.complete = False
+                elif m >= arm:
+                    continue
+                out.append(p)
+            return out
+
+        def ov_open(sym, t, f, why_full):
+            """test.overflow: buy the leader anyway, small, outside the slots."""
+            if not s.test["overflow"]:
+                return skip(why_full)
+            if sum(1 for p in held.values() if p.get("s") == "overflow") >= int(s.test["overflow_max"]):
+                return skip("overflow: max reached")
+            eq = equity()
+            pct = float(s.test["overflow_pct"] or 0)
+            n = max(max(0.0, eq) * pct / 100 * dd_scale(), en.min_notional_usdt)
+            cap = float(s.test["max_notional_usdt"] or 0)
+            if cap > 0:
+                n = min(n, cap)
+            if lm.drawdown_pause_pct > 0 and dd_equity() < peak * (1 - lm.drawdown_pause_pct / 100):
+                return skip("overflow: drawdown pause")
+            if n < MIN_ORDER_USDT or eq < risk.min_equity_usdt:
+                return skip("overflow: equity floor")
+            if sum(p["n"] for p in held.values()) + n > eq * risk.max_leverage + 1e-9:
+                return skip("overflow: max_leverage ceiling")
+            out = self.o.outcome(self.ek, sym, t)
+            if out is None:
+                self.complete = False
+                return
+            if out is False:
+                return skip("no candle data at entry")
+            r, x, why = out
+            if s.test["include_funding"]:
+                r += fund(sym, t, x)
+            held[sym] = dict(t=t, x=x, r=r, n=n, why="overflow " + why, s="overflow")
 
         def full(n):
             used = sum(p["n"] for p in gainer_held())
             eq = equity()
-            return (len(gainer_held()) >= en.max_positions
-                    or (lm.max_exposure_pct > 0 and used + n > eq * lm.max_exposure_pct / 100 + 1e-9)
+            return (len(gainer_held()) >= gslots()[0]
+                    or (lm.max_exposure_pct > 0 and used + n > eq * gslots()[2] / 100 + 1e-9)
                     or sum(p["n"] for p in held.values()) + n > eq * risk.max_leverage + 1e-9)
 
         def victim(t):
@@ -1500,6 +1923,12 @@ class Account:
                     self.complete = False
                     return "miss"
                 marks[k] = m
+            if policy == "replace_stale":
+                arm = 1 + ex.ladder_first_pct / 100
+                pool = [k for k in pool if held[k].get("s") not in ("squeeze", "short", "overflow")
+                        and marks[k] < arm]
+                if not pool:
+                    return None
             worst = min(pool, key=lambda k: marks[k])
             if policy == "replace_losing" and marks[worst] - 1 - self.cost >= 0:
                 return None
@@ -1523,13 +1952,22 @@ class Account:
                 close(v)
             return "ok"
 
+        skip_days = {int(x) for x in str(tst["skip_days"] or "").split(",") if x.strip()}
+
         def open_(sym, t):
             nonlocal peak
+            clock[0] = max(clock[0], t)
+            if skip_days:
+                wd = dt.datetime.fromtimestamp(t / 1000 + float(tst["skip_tz_hours"]) * 3600,
+                                               dt.timezone.utc).weekday()
+                if wd in skip_days:
+                    return skip("test: skip_days")
             eq = equity()
             peak = max(peak, dd_equity())
             day = utc_day(t)
             day_start.setdefault(day, eq)
-            if len(gainer_held()) >= en.max_positions and policy == "refuse":
+            if len(gainer_held()) >= gslots()[0] and policy == "refuse" \
+                    and not s.test["overflow"]:
                 return skip("max_positions full")
             f = self._feat(sym, t)
             if f is None:
@@ -1538,8 +1976,8 @@ class Account:
                 return skip("no candle data at entry")
             if policy != "refuse" and make_room(t, f) == "miss":
                 return
-            if len(gainer_held()) >= en.max_positions:
-                return skip("max_positions full")
+            if len(gainer_held()) >= gslots()[0]:
+                return ov_open(sym, t, f, "max_positions full")
             eq = equity()
             n = notional_for(f)
             if lm.max_new_trades_per_day > 0 and day_opens.get(day, 0) >= lm.max_new_trades_per_day:
@@ -1547,13 +1985,23 @@ class Account:
             if t < pause_until:
                 return skip("limit: pause_after_losses")
             if lm.max_exposure_pct > 0 and sum(p["n"] for p in gainer_held()) + n \
-                    > eq * lm.max_exposure_pct / 100 + 1e-9:
-                return skip("limit: max_exposure_pct")
+                    > eq * gslots()[2] / 100 + 1e-9:
+                return ov_open(sym, t, f, "limit: max_exposure_pct")
             if lm.daily_loss_limit_pct > 0 and day_real.get(day, 0.0) \
                     < -day_start[day] * lm.daily_loss_limit_pct / 100:
                 return skip("limit: daily_loss_limit_pct")
             if lm.drawdown_pause_pct > 0 and dd_equity() < peak * (1 - lm.drawdown_pause_pct / 100):
-                return skip("limit: drawdown_pause_pct")
+                rebase = float(s.test["dd_rebase_days"] or 0)
+                if 0 not in dd_paused_since:
+                    pause_log.append((t, "pause on", round(peak, 2), round(dd_equity(), 2)))
+                since = dd_paused_since.setdefault(0, t)
+                if not rebase or t - since < rebase * 86_400_000:
+                    return skip("limit: drawdown_pause_pct")
+                pause_log.append((t, "reset", round(peak, 2), round(dd_equity(), 2)))
+                peak = dd_equity()
+            elif 0 in dd_paused_since:
+                pause_log.append((t, "pause off", round(peak, 2), round(dd_equity(), 2)))
+            dd_paused_since.clear()
             if n < MIN_ORDER_USDT:
                 return skip("under the $5 exchange minimum")
             if eq < risk.min_equity_usdt:
@@ -1572,23 +2020,30 @@ class Account:
             if out is False:
                 return skip("no candle data at entry")
             r, x, why = out
-            if s.test["include_funding"]:
-                r += self.o.m.funding_paid(sym, t, x)
-            held[sym] = dict(t=t, x=x, r=r, n=n, why=why)
+            fr = fund(sym, t, x) if s.test["include_funding"] else 0.0
+            r += fr
+            held[sym] = dict(t=t, x=x, r=r, n=n, why=why, f=fr)
             day_opens[day] = day_opens.get(day, 0) + 1
 
         sqe = s.sq.entry
 
-        def sq_open(sym, t):
+        def sq_open(sym, t, giant=False):
             """Squeeze mode's buy, sharing the account with the gainer."""
             nonlocal peak
+            clock[0] = max(clock[0], t)
             eq = equity()
             peak = max(peak, dd_equity())
             if sym in held:
                 return skip("squeeze: already held")
-            if sum(1 for p in held.values() if p.get("s") == "squeeze") >= sqe.max_positions:
-                return skip("squeeze: max_positions full")
-            n = max(max(0.0, eq) * sqe.notional_pct_of_equity / 100, sqe.min_notional_usdt)
+            n_sq = sum(1 for p in held.values() if p.get("s") == "squeeze")
+            n_extra = sum(1 for p in held.values() if p.get("s") == "squeeze" and p.get("giant_extra"))
+            extra = False
+            if n_sq >= sqe.max_positions:
+                if not (giant and n_extra < int(tst["giant_extra"] or 0)):
+                    return skip("squeeze: max_positions full")
+                extra = True
+            n = max(max(0.0, eq) * sqe.notional_pct_of_equity / 100 * dd_scale(),
+                    sqe.min_notional_usdt)
             if float(tst["max_notional_usdt"] or 0) > 0:
                 n = min(n, float(tst["max_notional_usdt"]))
             if n < MIN_ORDER_USDT or eq < risk.min_equity_usdt:
@@ -1603,15 +2058,20 @@ class Account:
             if out is False:
                 return skip("squeeze: no candle data")
             r, x, why = out
-            if s.test["include_funding"]:
-                r += self.o.m.funding_paid(sym, t, x)
-            held[sym] = dict(t=t, x=x, r=r, n=n, why="squeeze " + why, s="squeeze")
+            fr = fund(sym, t, x) if s.test["include_funding"] else 0.0
+            r += fr
+            held[sym] = dict(t=t, x=x, r=r, n=n, why="squeeze " + why, s="squeeze", f=fr,
+                             giant_extra=extra)
+            if giant:
+                skips["giant: opened" + (" as an extra slot" if extra else "")] = \
+                    skips.get("giant: opened" + (" as an extra slot" if extra else ""), 0) + 1
 
         tst = s.test
 
         def lo_open(sym, t):
             """The second front: short a new 24h #1 loser."""
             nonlocal peak
+            clock[0] = max(clock[0], t)
             eq = equity()
             peak = max(peak, dd_equity())
             mode = tst["losers_mode"]
@@ -1663,13 +2123,17 @@ class Account:
                 advance(lt)
                 lo_open(lsym, lt)
 
-        sq_queue = list(self.sq_events)
+        giant_set = set(self.giants)
+        # the squeeze's own order within a round (most negative funding first),
+        # then giant signals
+        sq_queue = sorted([(e[0], 0, n, e[1]) for n, e in enumerate(self.sq_events)]
+                          + [(t, 1, n, sym) for n, (t, sym) in enumerate(self.giants)])
 
         def run_squeeze_until(t):
             while sq_queue and sq_queue[0][0] <= t:
-                st, ssym, _e = sq_queue.pop(0)
+                st, _kind, _n, ssym = sq_queue.pop(0)
                 advance(st)
-                sq_open(ssym, st)
+                sq_open(ssym, st, (st, ssym) in giant_set)
 
         def blocker(sym, t):
             closed = closed_at.get(sym)
@@ -1705,11 +2169,55 @@ class Account:
                 return None
             return r
 
+        def retry_full(sym, t, until):
+            """test.retry_full_hours: buy a leader refused for lack of room once
+            a position closes, while it is still #1."""
+            hours = float(tst["retry_full_hours"] or 0)
+            if not hours or sym in held or last_skip[0] not in FULL:
+                return
+            limit = min(until, t + int(hours * H))
+            rise = float(tst["retry_max_rise_pct"] or 0)
+            while True:
+                nxt = min((p["x"] for p in held.values()), default=None)
+                if nxt is None:
+                    return
+                a = (nxt // period + 1) * period            # the first check after it
+                if a >= limit:
+                    return
+                run_squeeze_until(a)
+                run_losers_until(a)
+                advance(a)
+                if sym in held:
+                    return
+                if rise:
+                    m = self.o.mark(sym, t, a)
+                    if m is None:
+                        self.complete = False
+                        return
+                    if m > 1 + rise / 100:
+                        skip("retry: rose too far while waiting")
+                        return
+                self._evt = (a, sym)
+                last_skip[0] = ""
+                open_(sym, a)
+                if sym in held:
+                    skips["retry: bought after room freed"] = \
+                        skips.get("retry: bought after room freed", 0) + 1
+                    return
+                if last_skip[0] not in FULL:
+                    return
+
         evs = self.events
+        self._evt = None
         for n_ev, (t, sym, end) in enumerate(evs):
             run_squeeze_until(t)
             run_losers_until(t)
             advance(t)
+            clock[0] = max(clock[0], t)
+            sample()
+            if tst["no_gainer"]:
+                continue
+            self._evt = (t, sym)
             until = evs[n_ev + 1][0] if n_ev + 1 < len(evs) else self.hi
             if sym in held:
                 skip("already holding it")
@@ -1736,20 +2244,46 @@ class Account:
                 advance(r)
                 if sym in held:
                     continue
+                last_skip[0] = ""
                 open_(sym, r)
+                retry_full(sym, r, until)
             else:
+                last_skip[0] = ""
                 open_(sym, t)
+                retry_full(sym, t, until)
         run_squeeze_until(self.hi - 1)
         run_losers_until(self.hi - 1)
         advance(self.hi)
         while next_month <= self.hi:
             month_end(next_month)
+        clock[0] = max(clock[0], self.hi)
+        if tst["hard_cutoff"]:
+            for sym, p in held.items():         # still open: booked at the period's end
+                if p["x"] <= self.hi:
+                    continue
+                m = self.o.mark(sym, p["t"], self.hi) if self.hi > p["t"] else 1.0
+                if m is None:
+                    self.complete = False
+                    m = 1.0
+                r = ((1 - m) if p.get("s") == "short" else (m - 1)) - self.cost
+                fr = fund(sym, p["t"], self.hi) if tst["include_funding"] and p.get("s") != "short" else 0.0
+                p.update(r=r + fr, x=self.hi, f=fr, why="open at period end (marked)")
+        sample()
         for sym in sorted(held, key=lambda k: held[k]["x"]):
             close(sym)                          # still open: booked at their own exit
         income_total += income_month
         wins = [x for x in trades if x["pnl"] > 0]
         profits = [m["profit_so_far"] for m in months]
+        top = sorted((x["pnl"] for x in trades), reverse=True)
+        real = income_total + bal - dep
         return dict(
+            max_drawdown_usd=round(ddc["mdd_usd"], 2),
+            max_drawdown_pct=round(100 * ddc["mdd_pct"], 1),
+            time_weighted_return_pct=round(100 * (ddc["idx"] - 1), 1),
+            # simple subtraction of the best trades' P&L (ignores compounding)
+            profit_without_top1=round(real - sum(top[:1]), 2),
+            profit_without_top3=round(real - sum(top[:3]), 2),
+            profit_without_top5=round(real - sum(top[:5]), 2),
             real_profit=round(income_total + bal - dep, 2),
             deposited=dep, to_funding_total=round(income_total, 2),
             of_which_profit_sweeps=round(swept, 2), of_which_principal=round(principal_out, 2),
@@ -1763,7 +2297,9 @@ class Account:
             months=len(months), exit_reasons=exits, skipped=skips,
             best_trade=max(trades, key=lambda x: x["pnl"], default=None),
             worst_trade=min(trades, key=lambda x: x["pnl"], default=None),
-            monthly=months, **({"trade_list": trades} if self.keep_trades else {}))
+            monthly=months, **({"trade_list": trades, "skipped_leaders": decisions,
+                                "equity_curve": curve, "pause_log": pause_log}
+                               if self.keep_trades else {}))
 
 
 def fmt(ms: int) -> str:

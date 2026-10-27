@@ -97,6 +97,25 @@ class OutcomeTest(unittest.TestCase):
         # half sold at +50%; a +60% peak puts the ladder at +50%, where the rest goes
         self.assertAlmostEqual(r, 0.5 * 0.5 + 0.5 * 0.5)
 
+    def test_pyramid_adds_share_the_ladder_stop(self):
+        ek = bt.Settings(BASE, {"test.pyramid_at": "20", "test.pyramid_frac": 0.5}).exit_key(0.0)
+        r, _, why = self.outcome([1, 1, (1.0, 1.35, 1.0, 1.3), (1.3, 1.3, 1.0, 1.0)], ek)
+        # first part +20% at the ladder stop; the add bought at 1.2 leaves at 1.2
+        self.assertEqual(why, "ladder stop in profit")
+        self.assertAlmostEqual(r, 0.2)
+        r, _, _ = self.outcome([1, 1, (1.0, 1.55, 1.0, 1.5), (1.5, 1.5, 1.0, 1.0)], ek)
+        self.assertAlmostEqual(r, 0.4 + 0.5 * (1.4 / 1.2 - 1))
+
+    def test_reentry_buys_the_break_of_the_high(self):
+        ek = bt.Settings(BASE, {"test.reentry_hours": 6, "test.reentry_max": 1}).exit_key(0.0)
+        bars = [1, 1, (1.0, 1.35, 1.0, 1.3), (1.3, 1.3, 1.2, 1.2),     # out at +20%
+                (1.2, 1.4, 1.2, 1.4), (1.4, 1.4, 0.9, 0.9)]             # back in at 1.35
+        r, _, why = self.outcome(bars, ek)
+        self.assertEqual(why, "stop (after re-entry)")
+        self.assertAlmostEqual(r, 0.2 + (0.945 / 1.35 - 1))
+        r, _, why = self.outcome(bars[:4] + [1.2] * 80 + bars[4:], ek)   # too late
+        self.assertEqual(why, "ladder stop in profit")
+
 
 class ShortOutcomeTest(unittest.TestCase):
     ek = bt.Settings(BASE, {"test.losers_target_pct": 50}).losers_exit_key(0.0)
